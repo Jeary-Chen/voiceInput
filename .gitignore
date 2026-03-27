@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.wav
+*.log
+config.json
+launcher.log
+.env
+.env.*
+*.key
+*.pem
+*.secret
+
+# 内部文档、脚本、实验、参考代码
+_docs/
+_scripts/
+_experiments/
+_reference/
+
+# 未使用的静态资源
+src/ui/assets/
