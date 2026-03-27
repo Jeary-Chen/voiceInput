@@ -1,6 +1,7 @@
 import ctypes
 import ctypes.wintypes as wintypes
 import os
+from datetime import date
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence
@@ -54,8 +55,10 @@ class HotkeyThread(QThread):
     def __init__(self, hotkey_str: str):
         super().__init__()
         self._mod, self._vk = _parse_hotkey(hotkey_str)
+        self._thread_id: int = 0
 
     def run(self):
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
         user32 = ctypes.windll.user32
         if not user32.RegisterHotKey(None, self._HOTKEY_ID, self._mod, self._vk):
             logger.warning(f"Failed to register hotkey (mod=0x{self._mod:X}, vk=0x{self._vk:X})")
@@ -67,7 +70,8 @@ class HotkeyThread(QThread):
         user32.UnregisterHotKey(None, self._HOTKEY_ID)
 
     def stop_hotkey(self):
-        ctypes.windll.user32.PostThreadMessageW(int(self.currentThreadId()), 0x0012, 0, 0)
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)
 
 
 class _HotkeyDialog(QDialog):
@@ -354,6 +358,7 @@ class VoiceTray(QSystemTrayIcon):
         self._audio.set_enabled(config.play_sounds)
 
         self._key_warning = not config.api_key
+        self._mic_warning = False
         if self._key_warning:
             self.setIcon(icons.icon_key_invalid())
             self._update_tooltip("API Key 未配置，右键点击配置")
@@ -370,9 +375,11 @@ class VoiceTray(QSystemTrayIcon):
         engine.transcription_done.connect(self._on_done)
         engine.error_occurred.connect(self._on_error)
         engine.api_key_invalid.connect(self._on_key_invalid)
+        engine.mic_unavailable.connect(self._on_mic_unavailable)
 
         mini.request_record.connect(self._on_hotkey)
         mini.request_stop.connect(self._on_hotkey)
+        mini.request_cancel.connect(self._on_cancel)
         mini.request_history.connect(self._open_history)
 
         self._hotkey = HotkeyThread(config.hotkey)
@@ -385,19 +392,23 @@ class VoiceTray(QSystemTrayIcon):
         menu = QMenu()
         menu.setStyleSheet(MENU_STYLE)
 
-        self._act_record = QAction("●  开始录音", menu)
+        self._act_record = QAction("开始录音", menu)
         self._act_record.triggered.connect(self._on_hotkey)
         menu.addAction(self._act_record)
 
         menu.addSeparator()
 
-        act_history = QAction("📂  打开历史记录", menu)
+        act_history = QAction("打开历史记录", menu)
         act_history.triggered.connect(self._open_history)
         menu.addAction(act_history)
 
+        act_log = QAction("查看处理日志", menu)
+        act_log.triggered.connect(self._open_log)
+        menu.addAction(act_log)
+
         menu.addSeparator()
 
-        self._mode_menu = QMenu("📋  切换模式", menu)
+        self._mode_menu = QMenu("切换模式", menu)
         self._mode_menu.setStyleSheet(MENU_STYLE)
         for mode_id, mode_name in [("transcribe", "纯转录"), ("polish", "智能润色")]:
             act = QAction(mode_name, self._mode_menu)
@@ -407,7 +418,7 @@ class VoiceTray(QSystemTrayIcon):
             self._mode_menu.addAction(act)
         menu.addMenu(self._mode_menu)
 
-        self._device_menu = QMenu("🎤  输入设备", menu)
+        self._device_menu = QMenu("输入设备", menu)
         self._device_menu.setStyleSheet(MENU_STYLE)
         self._refresh_devices()
         menu.addMenu(self._device_menu)
@@ -415,17 +426,21 @@ class VoiceTray(QSystemTrayIcon):
         menu.addSeparator()
 
         hotkey_display = self._config.hotkey.replace("+", " + ").upper()
-        self._act_hotkey = QAction(f"⌨  快捷键: {hotkey_display}", menu)
+        self._act_hotkey = QAction(f"快捷键: {hotkey_display}", menu)
         self._act_hotkey.triggered.connect(self._configure_hotkey)
         menu.addAction(self._act_hotkey)
 
-        act_apikey = QAction("🔑  API Key", menu)
+        act_apikey = QAction("API Key", menu)
         act_apikey.triggered.connect(self._configure_apikey)
         menu.addAction(act_apikey)
 
+        act_reset_pos = QAction("重置指示器位置", menu)
+        act_reset_pos.triggered.connect(self._reset_mini_position)
+        menu.addAction(act_reset_pos)
+
         menu.addSeparator()
 
-        act_quit = QAction("✕  退出", menu)
+        act_quit = QAction("退出", menu)
         act_quit.triggered.connect(self._quit)
         menu.addAction(act_quit)
 
@@ -459,19 +474,24 @@ class VoiceTray(QSystemTrayIcon):
             act.setChecked(mode_name_map.get(act.text(), "") == mode_id)
 
     def _configure_hotkey(self):
-        dlg = _HotkeyDialog(self._config.hotkey)
-        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.hotkey:
-            return
-        new_key = dlg.hotkey
         self._hotkey.stop_hotkey()
         self._hotkey.wait(2000)
+
+        dlg = _HotkeyDialog(self._config.hotkey)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.hotkey:
+            self._hotkey = HotkeyThread(self._config.hotkey)
+            self._hotkey.triggered.connect(self._on_hotkey)
+            self._hotkey.start()
+            return
+
+        new_key = dlg.hotkey
         self._config.hotkey = new_key
         self._config.save()
         self._hotkey = HotkeyThread(new_key)
         self._hotkey.triggered.connect(self._on_hotkey)
         self._hotkey.start()
         display = new_key.replace("+", " + ").upper()
-        self._act_hotkey.setText(f"⌨  快捷键: {display}")
+        self._act_hotkey.setText(f"快捷键: {display}")
         logger.info(f"Hotkey changed to: {display}")
 
     def _configure_apikey(self):
@@ -491,6 +511,9 @@ class VoiceTray(QSystemTrayIcon):
         self._config.save()
         self._engine.recorder.set_device(idx)
         self._refresh_devices()
+        if self._mic_warning:
+            self._mic_warning = False
+            self._restore_idle_icon()
 
     # ── tray interaction ──
 
@@ -498,8 +521,18 @@ class VoiceTray(QSystemTrayIcon):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._on_hotkey()
 
+    def _on_cancel(self):
+        if self._engine.state == "recording":
+            self._audio.play_stop()
+            self._engine.cancel()
+
     def _on_hotkey(self):
+        if self._engine.state == "processing":
+            return
         if self._engine.state == "ready":
+            if not self._config.api_key:
+                self._configure_apikey()
+                return
             self._audio.play_start()
         elif self._engine.state == "recording":
             self._audio.play_stop()
@@ -512,17 +545,18 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_state(self, state: str):
         if state == "recording":
+            self._mic_warning = False
             self.setIcon(icons.icon_recording())
             self._update_tooltip("录音中")
-            self._act_record.setText("■  停止录音")
+            self._act_record.setText("停止录音")
         elif state == "processing":
             self.setIcon(icons.icon_processing())
             self._update_tooltip("识别中")
-            self._act_record.setText("⏳ 处理中...")
+            self._act_record.setText("处理中...")
             self._act_record.setEnabled(False)
         elif state == "ready":
             self._restore_idle_icon()
-            self._act_record.setText("●  开始录音")
+            self._act_record.setText("开始录音")
             self._act_record.setEnabled(True)
 
     def _on_done(self, text: str):
@@ -539,6 +573,15 @@ class VoiceTray(QSystemTrayIcon):
     def _on_key_invalid(self):
         self._key_warning = True
 
+    def _on_mic_unavailable(self):
+        self._mic_warning = True
+        self.showMessage(
+            "VoiceInput",
+            "无法打开麦克风，请检查设备连接或在右键菜单中切换输入设备",
+            QSystemTrayIcon.MessageIcon.Warning,
+            5000,
+        )
+
     def _set_key_warning(self, warning: bool):
         self._key_warning = warning
         self._restore_idle_icon()
@@ -547,13 +590,23 @@ class VoiceTray(QSystemTrayIcon):
         if self._key_warning:
             self.setIcon(icons.icon_key_invalid())
             self._update_tooltip("API Key 无效，右键点击配置")
+        elif self._mic_warning:
+            self.setIcon(icons.icon_key_invalid())
+            self._update_tooltip("麦克风不可用，右键切换输入设备")
         else:
             self.setIcon(icons.icon_idle())
             self._update_tooltip("就绪")
 
+    def _reset_mini_position(self):
+        self._mini.reset_position()
+
     def _open_history(self):
         path = Config.history_dir()
         os.startfile(str(path))
+
+    def _open_log(self):
+        from core.log import _LOG_DIR
+        os.startfile(str(_LOG_DIR))
 
     def _quit(self):
         if self._engine.state == "recording":

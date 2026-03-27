@@ -10,7 +10,7 @@ class VoiceRecorder:
     SAMPLE_RATE = 16000
     CHANNELS = 1
     BLOCK_SIZE = 3200        # frames per callback (~0.2s at 16kHz)
-    MAX_DURATION = 120       # 2 min hard cap
+    MAX_DURATION = 600       # 10 min hard cap
 
     def __init__(self, device_index: int | None = None):
         self._device_index = device_index

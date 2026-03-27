@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 dist/
 build/
+# PyInstaller 每次打包在 CWD 生成，勿提交（含绝对路径）
+VoiceInput.spec
 *.wav
 *.log
 config.json
@@ -18,6 +20,7 @@ _docs/
 _scripts/
 _experiments/
 _reference/
+_release/
 
 # 未使用的静态资源
 src/ui/assets/

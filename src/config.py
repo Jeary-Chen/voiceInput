@@ -35,6 +35,8 @@ class Config:
     save_history: bool = True
     save_audio: bool = False
 
+    mini_window_x: int | None = None
+
     @classmethod
     def load(cls) -> "Config":
         path = _config_path()

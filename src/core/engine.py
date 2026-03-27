@@ -13,8 +13,8 @@ from core.polisher import TextPolisher
 
 
 class _TranscribeWorker(QThread):
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
+    result_ready = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
 
     def __init__(self, asr: DashScopeASR, pcm_data: bytes, duration: float):
         super().__init__()
@@ -29,14 +29,14 @@ class _TranscribeWorker(QThread):
             text = self._asr.transcribe(self._pcm)
             elapsed = time.perf_counter() - t0
             logger.info(f"Transcription done in {elapsed:.1f}s")
-            self.finished.emit(text)
+            self.result_ready.emit(text)
         except Exception as e:
             logger.error(f"Transcription failed: {e}")
-            self.error.emit(str(e))
+            self.error_occurred.emit(str(e))
 
 
 class _PolishWorker(QThread):
-    finished = pyqtSignal(str)
+    result_ready = pyqtSignal(str)
 
     def __init__(self, polisher: TextPolisher, raw_text: str):
         super().__init__()
@@ -49,7 +49,7 @@ class _PolishWorker(QThread):
         result = self._polisher.polish(self._raw)
         elapsed = time.perf_counter() - t0
         logger.info(f"Polish done in {elapsed:.1f}s → {len(result)} chars")
-        self.finished.emit(result)
+        self.result_ready.emit(result)
 
 
 class VoiceEngine(QObject):
@@ -59,6 +59,7 @@ class VoiceEngine(QObject):
     transcription_done = pyqtSignal(str)   # final text
     error_occurred = pyqtSignal(str)
     api_key_invalid = pyqtSignal()         # 401 or missing key
+    mic_unavailable = pyqtSignal()         # no microphone or open failed
     _max_reached = pyqtSignal()            # thread-safe auto-stop trigger
 
     def __init__(self, config: Config):
@@ -110,11 +111,18 @@ class VoiceEngine(QObject):
     def _start_recording(self):
         logger.info("Recording started")
         self._record_t0 = time.monotonic()
+        try:
+            self.recorder.start(
+                on_audio_data=self._on_audio_chunk,
+                on_max_reached=self._on_max_reached,
+            )
+        except Exception as e:
+            logger.error(f"Failed to open microphone: {e}")
+            self.error_occurred.emit(f"无法打开麦克风: {e}")
+            self.mic_unavailable.emit()
+            self._set_state("ready")
+            return
         self._set_state("recording")
-        self.recorder.start(
-            on_audio_data=self._on_audio_chunk,
-            on_max_reached=self._on_max_reached,
-        )
 
     def _on_max_reached(self):
         self._max_reached.emit()
@@ -139,12 +147,22 @@ class VoiceEngine(QObject):
     def _start_batch_transcribe(self, pcm: bytes, duration: float):
         self._set_state("processing")
         self._worker = _TranscribeWorker(self.asr, pcm, duration)
-        self._worker.finished.connect(lambda t: self._finalize(t, pcm))
-        self._worker.error.connect(self._on_transcribe_error)
+        self._worker.result_ready.connect(lambda t: self._finalize(t, pcm))
+        self._worker.error_occurred.connect(self._on_transcribe_error)
+        self._worker.finished.connect(self._cleanup_worker)
         self._worker.start()
 
+    def _cleanup_worker(self):
+        if self._worker:
+            self._worker.deleteLater()
+            self._worker = None
+
+    def _cleanup_polish_worker(self):
+        if self._polish_worker:
+            self._polish_worker.deleteLater()
+            self._polish_worker = None
+
     def _finalize(self, text: str, pcm: bytes):
-        self._worker = None
         if not text:
             logger.warning("Empty transcription result")
             self.error_occurred.emit("识别结果为空")
@@ -155,13 +173,13 @@ class VoiceEngine(QObject):
             self._set_state("processing")
             self.live_text.emit(f"[原文] {text}")
             self._polish_worker = _PolishWorker(self.polisher, text)
-            self._polish_worker.finished.connect(lambda polished: self._inject_and_save(polished, pcm))
+            self._polish_worker.result_ready.connect(lambda polished: self._inject_and_save(polished, pcm))
+            self._polish_worker.finished.connect(self._cleanup_polish_worker)
             self._polish_worker.start()
         else:
             self._inject_and_save(text, pcm)
 
     def _inject_and_save(self, text: str, pcm: bytes):
-        self._polish_worker = None
         if self.config.paste_result:
             self.injector.inject(text, restore_clipboard=self.config.restore_clipboard)
             logger.info(f"Text pasted at cursor ({len(text)} chars)")
@@ -180,7 +198,6 @@ class VoiceEngine(QObject):
         self._set_state("ready")
 
     def _on_transcribe_error(self, msg: str):
-        self._worker = None
         logger.error(msg)
         self.error_occurred.emit(msg)
         if "API 401:" in msg:

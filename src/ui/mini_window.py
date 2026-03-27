@@ -7,9 +7,9 @@ Behavior:
   - Done:      if show-result is on, popup shows final text below
 """
 from PyQt6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, pyqtSignal,
+    Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, pyqtSignal,
 )
-from PyQt6.QtGui import QPainter, QColor, QPainterPath, QPen, QAction
+from PyQt6.QtGui import QPainter, QColor, QPainterPath, QPen, QAction, QFont
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QApplication, QMenu,
@@ -29,10 +29,113 @@ _BTN_STYLE = """
     QPushButton {{
         background: {bg}; color: {fg};
         border: none; border-radius: {r}px;
-        font-size: 13px;
+        font-size: 13px; outline: none;
+        padding: 0px; text-align: center;
     }}
     QPushButton:hover {{ background: {hover}; }}
 """
+
+
+class _RecStopButton(QWidget):
+    """Recording stop button. Click = stop recording. Long-press = cancel (discard)."""
+    clicked = pyqtSignal()
+    cancelled = pyqtSignal()
+
+    CLICK_THRESHOLD_MS = 200
+    HOLD_MS = 500
+    _TICK = 25
+    SIZE = 26
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setToolTip("点击停止 | 长按作废")
+        self._progress = 0.0
+        self._holding = False
+        self._completed = False
+        self._elapsed_ms = 0
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(self._TICK)
+        self._tick_timer.timeout.connect(self._tick)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._holding = True
+            self._completed = False
+            self._elapsed_ms = 0
+            self._progress = 0.0
+            self._tick_timer.start()
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._tick_timer.stop()
+            was_holding = self._holding
+            in_click_zone = self._elapsed_ms < self.CLICK_THRESHOLD_MS
+            self._holding = False
+            self._progress = 0.0
+            self._elapsed_ms = 0
+            self.update()
+            if not self._completed and was_holding and in_click_zone:
+                self.clicked.emit()
+
+    def _tick(self):
+        self._elapsed_ms += self._TICK
+        if self._elapsed_ms <= self.CLICK_THRESHOLD_MS:
+            return
+        hold_elapsed = self._elapsed_ms - self.CLICK_THRESHOLD_MS
+        self._progress = min(hold_elapsed / self.HOLD_MS, 1.0)
+        if self._progress >= 1.0:
+            self._tick_timer.stop()
+            self._progress = 0.0
+            self._holding = False
+            self._completed = True
+            self._elapsed_ms = 0
+            self.update()
+            self.cancelled.emit()
+            return
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s = self.SIZE
+        r = s / 2 - 1
+
+        bg_path = QPainterPath()
+        bg_path.addRoundedRect(QRectF(0, 0, s, s), s / 2, s / 2)
+        p.fillPath(bg_path, QColor(Theme.BG_BUTTON_HOVER if self._holding else Theme.BG_BUTTON))
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ff3b30"))
+        stop_s = 9
+        off = (s - stop_s) / 2
+        p.drawRoundedRect(QRectF(off, off, stop_s, stop_s), 2, 2)
+
+        if self._progress > 0:
+            pen = QPen(QColor("#ff3b30"), 2.5)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            margin = 1.5
+            arc_rect = QRectF(margin, margin, s - margin * 2, s - margin * 2)
+            start_angle = 90 * 16
+            span_angle = int(-self._progress * 360 * 16)
+            p.drawArc(arc_rect, start_angle, span_angle)
+
+        p.end()
+
+    def enterEvent(self, event):
+        self.update()
+
+    def leaveEvent(self, event):
+        if self._holding:
+            self._holding = False
+            self._tick_timer.stop()
+            self._progress = 0.0
+        self.update()
 
 
 class _ResultPopup(QWidget):
@@ -101,6 +204,7 @@ class _ResultPopup(QWidget):
 class MiniRecordingWindow(QWidget):
     request_record = pyqtSignal()
     request_stop = pyqtSignal()
+    request_cancel = pyqtSignal()
     request_history = pyqtSignal()
 
     def __init__(self, engine):
@@ -110,7 +214,7 @@ class MiniRecordingWindow(QWidget):
         self._drag_pos = None
         self._hovered = False
         self._show_result = False
-        self._anchor_x: int | None = None  # custom x after drag, None = center
+        self._anchor_x: int | None = engine.config.mini_window_x
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -147,36 +251,46 @@ class MiniRecordingWindow(QWidget):
 
         self._top_bar = QWidget()
         self._top_layout = QHBoxLayout(self._top_bar)
-        self._top_layout.setContentsMargins(5, 5, 5, 5)
+        self._top_layout.setContentsMargins(0, 5, 0, 5)
         self._top_layout.setSpacing(6)
+
+        self._top_layout.addStretch(1)
 
         self._waveform = WaveformWidget(compact=True)
         self._waveform.setFixedSize(70, 26)
         self._top_layout.addWidget(self._waveform)
 
-        # Button 1: record / stop
         self._btn_action = QPushButton("●")
         self._btn_action.setFixedSize(26, 26)
+        self._btn_action.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_action.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_action.clicked.connect(self._on_action_click)
         self._top_layout.addWidget(self._btn_action)
         self._style_action_record()
 
-        # Button 2: toggle polish
         self._btn_polish = QPushButton("✦")
         self._btn_polish.setFixedSize(26, 26)
+        self._btn_polish.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_polish.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_polish.clicked.connect(self._toggle_polish)
         self._top_layout.addWidget(self._btn_polish)
         self._update_polish_style()
 
-        # Button 3: toggle result display
         self._btn_show_result = QPushButton("◳")
         self._btn_show_result.setFixedSize(26, 26)
+        self._btn_show_result.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_show_result.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_show_result.clicked.connect(self._toggle_show_result)
         self._top_layout.addWidget(self._btn_show_result)
         self._update_show_result_style()
+
+        self._btn_rec_stop = _RecStopButton()
+        self._btn_rec_stop.clicked.connect(lambda: self.request_stop.emit())
+        self._btn_rec_stop.cancelled.connect(self._on_cancel)
+        self._top_layout.addWidget(self._btn_rec_stop)
+        self._btn_rec_stop.setVisible(False)
+
+        self._top_layout.addStretch(1)
 
         self._root.addWidget(self._top_bar)
 
@@ -236,18 +350,21 @@ class MiniRecordingWindow(QWidget):
             r=13, hover=Theme.BG_BUTTON_HOVER.name(),
         ))
 
+    def _on_cancel(self):
+        self.request_cancel.emit()
+
     def _on_action_click(self):
         if self._mode == "hover":
             self.request_record.emit()
-        elif self._mode == "recording":
-            self.request_stop.emit()
 
     def _set_widgets_for_mode(self, mode: str):
         is_idle = mode == "idle"
         is_hover = mode == "hover"
+        is_rec = mode == "recording"
 
         self._waveform.setVisible(mode in ("recording", "processing", "done"))
-        self._btn_action.setVisible(is_hover or mode == "recording")
+        self._btn_action.setVisible(is_hover)
+        self._btn_rec_stop.setVisible(is_rec)
         self._btn_polish.setVisible(is_hover)
         self._btn_show_result.setVisible(is_hover)
         self._dot_status.setVisible(mode in ("processing", "done"))
@@ -327,19 +444,17 @@ class MiniRecordingWindow(QWidget):
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_RECORDING.name()};")
 
         self._waveform.setVisible(True)
+        self._btn_action.setVisible(False)
         self._btn_polish.setVisible(False)
         self._btn_show_result.setVisible(False)
         self._dot_status.setVisible(False)
         self._top_bar.setVisible(True)
 
-        self._style_action_record()
-        self._btn_action.setToolTip("停止录音")
-
         if self._hovered:
-            self._btn_action.setVisible(True)
+            self._btn_rec_stop.setVisible(True)
             self._animate_to(REC_HOVER_W, REC_H, 280)
         else:
-            self._btn_action.setVisible(False)
+            self._btn_rec_stop.setVisible(False)
             self._animate_to(REC_W, REC_H, 280)
 
     def _apply_processing(self):
@@ -421,7 +536,7 @@ class MiniRecordingWindow(QWidget):
         if self._mode in ("idle", "shrinking"):
             self._apply_hover()
         elif self._mode == "recording":
-            self._btn_action.setVisible(True)
+            self._btn_rec_stop.setVisible(True)
             self._animate_to(REC_HOVER_W, REC_H, 150)
         self.update()
 
@@ -430,7 +545,7 @@ class MiniRecordingWindow(QWidget):
         if self._mode == "hover":
             self._hover_timer.start(300)
         elif self._mode == "recording":
-            self._btn_action.setVisible(False)
+            self._btn_rec_stop.setVisible(False)
             self._animate_to(REC_W, REC_H, 150)
         self.update()
 
@@ -448,17 +563,17 @@ class MiniRecordingWindow(QWidget):
             self._anchor_x = new_pos.x() + self.width() // 2
 
     def mouseReleaseEvent(self, event):
+        if self._drag_pos is not None and self._anchor_x is not None:
+            self._engine.config.mini_window_x = self._anchor_x
+            self._engine.config.save()
         self._drag_pos = None
 
+    def reset_position(self):
+        self._anchor_x = None
+        self._engine.config.mini_window_x = None
+        self._engine.config.save()
+        w, h = self._target_size
+        self._position_at(w, h)
+
     def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background:#2a2a2a; color:#fff; border:1px solid #444;
-                    padding:4px 0; }
-            QMenu::item { padding:6px 20px; }
-            QMenu::item:selected { background:#3a3a3a; }
-        """)
-        act_history = QAction("📂  历史记录", menu)
-        act_history.triggered.connect(lambda: self.request_history.emit())
-        menu.addAction(act_history)
-        menu.exec(event.globalPos())
+        event.accept()

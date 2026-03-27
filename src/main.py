@@ -13,18 +13,39 @@ for _pv in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
 os.environ["NO_PROXY"] = "*"
 
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from config import Config
-from core.log import logger
+from core.log import logger, install_qt_handler
 from core.engine import VoiceEngine
 from ui.mini_window import MiniRecordingWindow
 from ui.tray import VoiceTray
+
+_APP_KEY = "VoiceInput_SingleInstance_Lock"
+
+
+def _is_already_running() -> bool:
+    """Try connecting to an existing instance. Returns True if one is found."""
+    sock = QLocalSocket()
+    sock.connectToServer(_APP_KEY)
+    connected = sock.waitForConnected(500)
+    sock.close()
+    return connected
 
 
 def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("VoiceInput")
+    install_qt_handler()
+
+    if _is_already_running():
+        logger.warning("VoiceInput is already running, exiting.")
+        sys.exit(0)
+
+    server = QLocalServer()
+    server.removeServer(_APP_KEY)
+    server.listen(_APP_KEY)
 
     config = Config.load()
 

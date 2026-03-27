@@ -33,8 +33,11 @@ class HistoryEntry:
 
 
 class HistoryManager:
+    MAX_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+
     def __init__(self, config: Config):
         self._dir = Config.history_dir()
+        self._enforce_size_limit()
 
     def save_entry(self, text: str, duration: float, mode: str,
                    audio_data: Optional[bytes] = None) -> HistoryEntry:
@@ -60,6 +63,7 @@ class HistoryManager:
                 wf.setframerate(16000)
                 wf.writeframes(audio_data)
 
+        self._enforce_size_limit()
         return entry
 
     def get_entries(self, limit: int = 50, offset: int = 0) -> list[HistoryEntry]:
@@ -110,3 +114,18 @@ class HistoryManager:
     def folder_size_kb(self) -> int:
         total = sum(f.stat().st_size for f in self._dir.rglob("*") if f.is_file())
         return total // 1024
+
+    def _enforce_size_limit(self):
+        """Delete oldest entries until total size is under MAX_SIZE_BYTES."""
+        files = sorted(self._dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        total = sum(f.stat().st_size for f in self._dir.rglob("*") if f.is_file())
+        while total > self.MAX_SIZE_BYTES and files:
+            oldest = files.pop(0)
+            entry_id = oldest.stem
+            entry_size = oldest.stat().st_size
+            oldest.unlink()
+            wav = self._dir / f"{entry_id}.wav"
+            if wav.exists():
+                entry_size += wav.stat().st_size
+                wav.unlink()
+            total -= entry_size
