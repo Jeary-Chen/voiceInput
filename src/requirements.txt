@@ -6,3 +6,4 @@ openai>=1.0
 loguru>=0.7
 pynput>=1.7
 pyperclip>=1.8
+tzdata>=2024.1
