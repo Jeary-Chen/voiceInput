@@ -127,3 +127,7 @@ src/
 ## 📄 License
 
 项目遵循 [MIT](LICENSE)
+
+---
+
+感谢 [LINUX DO](https://linux.do/) 社区

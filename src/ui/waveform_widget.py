@@ -11,19 +11,28 @@ class WaveformWidget(QWidget):
     BAR_GAP = 2.5
     BAR_RADIUS = 1.5
     BAR_MIN_H = 2.0
-    FPS = 30
-    LERP = 0.25
+    FPS = 24
+    LERP_UP = 0.6
+    LERP_DOWN = 0.3
+    DECAY = 0.84
+    PROPAGATION_DAMPING = 0.55
 
     def __init__(self, parent=None, compact: bool = False):
         super().__init__(parent)
         self._compact = compact
         if compact:
-            self.BAR_COUNT = 24
+            self.BAR_COUNT = 20
             self.BAR_GAP = 2.0
+
         self._levels = np.zeros(self.BAR_COUNT)
         self._target = np.zeros(self.BAR_COUNT)
+        self._raw_target = np.zeros(self.BAR_COUNT)
         self._color = Theme.WAVEFORM_ACTIVE
         self._frozen = False
+
+        center = (self.BAR_COUNT - 1) / 2.0
+        distances = np.abs(np.arange(self.BAR_COUNT) - center) / max(center, 1.0)
+        self._propagation = 1.0 - distances * self.PROPAGATION_DAMPING
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -37,17 +46,14 @@ class WaveformWidget(QWidget):
         if n == 0:
             return
         chunk_size = max(1, n // self.BAR_COUNT)
-        target = np.zeros(self.BAR_COUNT)
-        for i in range(self.BAR_COUNT):
-            start = i * chunk_size
-            end = min(start + chunk_size, n)
-            if start < n:
-                seg = samples[start:end]
-                rms = np.sqrt(np.mean(seg ** 2))
-                peak = np.max(np.abs(seg))
-                target[i] = rms * 0.6 + peak * 0.4
-        scale = 3.5
-        self._target = np.clip(target * scale, 0.0, 1.0)
+        usable = chunk_size * self.BAR_COUNT
+        if usable > n:
+            samples = np.pad(samples, (0, usable - n))
+        matrix = samples[:usable].reshape(self.BAR_COUNT, chunk_size)
+        rms = np.sqrt(np.mean(matrix ** 2, axis=1))
+        peak = np.max(np.abs(matrix), axis=1)
+        raw = rms * 0.6 + peak * 0.4
+        self._raw_target = np.clip(np.sqrt(raw * 2.8), 0.0, 1.0)
 
     def freeze(self):
         self._frozen = True
@@ -56,19 +62,26 @@ class WaveformWidget(QWidget):
     def unfreeze(self):
         self._frozen = False
         self._color = Theme.WAVEFORM_ACTIVE
+        self._raw_target = np.zeros(self.BAR_COUNT)
         self._target = np.zeros(self.BAR_COUNT)
 
     def reset(self):
         self._levels = np.zeros(self.BAR_COUNT)
         self._target = np.zeros(self.BAR_COUNT)
+        self._raw_target = np.zeros(self.BAR_COUNT)
         self._frozen = False
         self._color = Theme.WAVEFORM_ACTIVE
         self.update()
 
     def _tick(self):
-        self._levels += (self._target - self._levels) * self.LERP
+        self._target += (self._raw_target - self._target) * self._propagation
+
+        diff = self._target - self._levels
+        lerp = np.where(diff > 0, self.LERP_UP, self.LERP_DOWN)
+        self._levels += diff * lerp
+
         if not self._frozen:
-            self._target *= 0.92
+            self._raw_target *= self.DECAY
         self.update()
 
     def paintEvent(self, event):
@@ -82,15 +95,16 @@ class WaveformWidget(QWidget):
         cy = h / 2.0
 
         color = QColor(self._color)
+        path = QPainterPath()
 
         for i in range(self.BAR_COUNT):
             x = i * (bar_w + self.BAR_GAP)
-            level = self._levels[i]
-            bar_h = max(self.BAR_MIN_H, level * h * 0.85)
+            bar_h = max(self.BAR_MIN_H, self._levels[i] * h * 0.85)
             half_h = bar_h / 2.0
-            rect = QRectF(x, cy - half_h, bar_w, bar_h)
-            path = QPainterPath()
-            path.addRoundedRect(rect, self.BAR_RADIUS, self.BAR_RADIUS)
-            p.fillPath(path, color)
+            path.addRoundedRect(
+                QRectF(x, cy - half_h, bar_w, bar_h),
+                self.BAR_RADIUS, self.BAR_RADIUS,
+            )
 
+        p.fillPath(path, color)
         p.end()

@@ -20,8 +20,8 @@ from ui.waveform_widget import WaveformWidget
 
 IDLE_W, IDLE_H = 48, 8
 HOVER_W, HOVER_H = 120, 36       # 3 buttons
-REC_W, REC_H = 90, 38            # waveform only
-REC_HOVER_W = 122                 # waveform + stop button on hover
+REC_W, REC_H = 80, 38             # waveform only (with padding)
+REC_HOVER_W = 110                  # waveform + stop button on hover
 RESULT_W = 340                    # result popup width
 RADIUS = 19
 
@@ -206,6 +206,7 @@ class MiniRecordingWindow(QWidget):
     request_stop = pyqtSignal()
     request_cancel = pyqtSignal()
     request_history = pyqtSignal()
+    mode_changed = pyqtSignal(str)
 
     def __init__(self, engine):
         super().__init__()
@@ -251,13 +252,13 @@ class MiniRecordingWindow(QWidget):
 
         self._top_bar = QWidget()
         self._top_layout = QHBoxLayout(self._top_bar)
-        self._top_layout.setContentsMargins(0, 5, 0, 5)
+        self._top_layout.setContentsMargins(6, 5, 6, 5)
         self._top_layout.setSpacing(6)
 
         self._top_layout.addStretch(1)
 
         self._waveform = WaveformWidget(compact=True)
-        self._waveform.setFixedSize(70, 26)
+        self._waveform.setFixedSize(56, 26)
         self._top_layout.addWidget(self._waveform)
 
         self._btn_action = QPushButton("●")
@@ -322,6 +323,11 @@ class MiniRecordingWindow(QWidget):
         cfg = self._engine.config
         cfg.mode = "transcribe" if cfg.mode == "polish" else "polish"
         cfg.save()
+        self._update_polish_style()
+        self.mode_changed.emit(cfg.mode)
+
+    def sync_mode(self):
+        """Refresh polish button style after external mode change."""
         self._update_polish_style()
 
     def _update_show_result_style(self):

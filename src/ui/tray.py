@@ -3,7 +3,7 @@ import ctypes.wintypes as wintypes
 import os
 from datetime import date
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtCore import Qt, QEvent, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence
 from PyQt6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication,
@@ -32,19 +32,41 @@ _VK_MAP.update({
     "printscreen": 0x2C, "pause": 0x13,
     ";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE,
     "/": 0xBF, "`": 0xC0, "[": 0xDB, "\\": 0xDC, "]": 0xDD, "'": 0xDE,
+    "alt": 0x12, "shift": 0x10, "ctrl": 0x11,
+    "lalt": 0xA4, "ralt": 0xA5,
+    "lshift": 0xA0, "rshift": 0xA1,
+    "lctrl": 0xA2, "rctrl": 0xA3,
 })
+
+_DISPLAY_NAMES = {
+    "lalt": "Left Alt", "ralt": "Right Alt",
+    "lshift": "Left Shift", "rshift": "Right Shift",
+    "lctrl": "Left Ctrl", "rctrl": "Right Ctrl",
+}
+
+
+def _hotkey_display(combo: str) -> str:
+    parts = combo.split("+")
+    return " + ".join(_DISPLAY_NAMES.get(p, p.upper()) for p in parts)
 
 
 def _parse_hotkey(s: str) -> tuple[int, int]:
     mod = 0
     vk = 0
-    for part in s.lower().split("+"):
-        part = part.strip()
+    parts = [p.strip() for p in s.lower().split("+")]
+    if len(parts) == 1 and parts[0] in _MOD_MAP and parts[0] in _VK_MAP:
+        return 0, _VK_MAP[parts[0]]
+    for part in parts:
         if part in _MOD_MAP:
             mod |= _MOD_MAP[part]
         elif part in _VK_MAP:
             vk = _VK_MAP[part]
     return mod, vk
+
+
+_MODIFIER_ONLY_KEYS = {
+    "alt", "lalt", "ralt", "shift", "lshift", "rshift", "ctrl", "lctrl", "rctrl",
+}
 
 
 class HotkeyThread(QThread):
@@ -74,6 +96,66 @@ class HotkeyThread(QThread):
             ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)
 
 
+class ModifierHotkeyThread(QThread):
+    """Detects a single modifier key tap via low-level keyboard hook (pynput)."""
+    triggered = pyqtSignal()
+
+    _PYNPUT_KEYS: dict[str, list] = {}
+
+    @classmethod
+    def _init_keys(cls):
+        if cls._PYNPUT_KEYS:
+            return
+        from pynput.keyboard import Key
+        cls._PYNPUT_KEYS = {
+            "lalt": [Key.alt_l], "ralt": [Key.alt_r, Key.alt_gr],
+            "alt": [Key.alt_l, Key.alt_r, Key.alt_gr],
+            "lshift": [Key.shift_l], "rshift": [Key.shift_r],
+            "shift": [Key.shift_l, Key.shift_r],
+            "lctrl": [Key.ctrl_l], "rctrl": [Key.ctrl_r],
+            "ctrl": [Key.ctrl_l, Key.ctrl_r],
+        }
+
+    def __init__(self, key_name: str):
+        super().__init__()
+        self._init_keys()
+        self._target_keys = set(self._PYNPUT_KEYS.get(key_name, []))
+        self._pressed = False
+        self._tainted = False
+        self._listener = None
+
+    def run(self):
+        from pynput.keyboard import Listener
+
+        def on_press(key):
+            if key in self._target_keys:
+                self._pressed = True
+                self._tainted = False
+            elif self._pressed:
+                self._tainted = True
+
+        def on_release(key):
+            if key in self._target_keys and self._pressed:
+                if not self._tainted:
+                    self.triggered.emit()
+                self._pressed = False
+                self._tainted = False
+
+        self._listener = Listener(on_press=on_press, on_release=on_release)
+        self._listener.start()
+        self._listener.join()
+
+    def stop_hotkey(self):
+        if self._listener:
+            self._listener.stop()
+
+
+def _create_hotkey(hotkey_str: str) -> HotkeyThread | ModifierHotkeyThread:
+    if hotkey_str.lower() in _MODIFIER_ONLY_KEYS:
+        return ModifierHotkeyThread(hotkey_str.lower())
+    return HotkeyThread(hotkey_str)
+
+
 class _HotkeyDialog(QDialog):
     """Captures a keyboard shortcut by pressing keys, with real-time conflict check."""
 
@@ -100,7 +182,7 @@ class _HotkeyDialog(QDialog):
         hint.setStyleSheet("font-size:13px;")
         layout.addWidget(hint)
 
-        self._key_display = QLabel(current.replace("+", " + ").upper())
+        self._key_display = QLabel(_hotkey_display(current))
         self._key_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._key_display.setFixedHeight(44)
         self._key_display.setStyleSheet("""
@@ -140,38 +222,92 @@ class _HotkeyDialog(QDialog):
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
+    _SOLO_MOD_NAMES = {
+        Qt.Key.Key_Alt: "alt",
+        Qt.Key.Key_Shift: "shift",
+        Qt.Key.Key_Control: "ctrl",
+    }
+
+    _QT_MOD_FOR_KEY = {
+        Qt.Key.Key_Alt: Qt.KeyboardModifier.AltModifier,
+        Qt.Key.Key_Shift: Qt.KeyboardModifier.ShiftModifier,
+        Qt.Key.Key_Control: Qt.KeyboardModifier.ControlModifier,
+    }
+
+    _LR_VK = {
+        Qt.Key.Key_Alt: [(0xA4, "lalt"), (0xA5, "ralt")],
+        Qt.Key.Key_Shift: [(0xA0, "lshift"), (0xA1, "rshift")],
+        Qt.Key.Key_Control: [(0xA2, "lctrl"), (0xA3, "rctrl")],
+    }
+
+    def _detect_lr_modifier(self, qt_key) -> str | None:
+        user32 = ctypes.windll.user32
+        for vk, name in self._LR_VK.get(qt_key, []):
+            if user32.GetKeyState(vk) & 0x8000:
+                return name
+        return None
+
+    def event(self, e):
+        if e.type() == QEvent.Type.ShortcutOverride:
+            e.accept()
+            return True
+        if e.type() == QEvent.Type.KeyRelease:
+            if e.key() in (Qt.Key.Key_Alt, Qt.Key.Key_Control,
+                           Qt.Key.Key_Shift, Qt.Key.Key_Meta):
+                e.accept()
+                return True
+        return super().event(e)
+
     def keyPressEvent(self, event):
+        event.accept()
         key = event.key()
         mods = event.modifiers()
 
-        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt,
-                   Qt.Key.Key_Meta, Qt.Key.Key_unknown):
+        if key == Qt.Key.Key_unknown:
+            return
+        if key == Qt.Key.Key_Meta:
             return
 
         if key == Qt.Key.Key_Escape and not (mods & ~Qt.KeyboardModifier.NoModifier):
             self.reject()
             return
 
-        parts = []
-        for qt_mod, name in self._QT_MOD_NAMES.items():
-            if mods & qt_mod:
-                parts.append(name)
+        if key in self._SOLO_MOD_NAMES:
+            own_mod = self._QT_MOD_FOR_KEY.get(key, Qt.KeyboardModifier.NoModifier)
+            other_parts = []
+            for qt_mod, name in self._QT_MOD_NAMES.items():
+                if qt_mod != own_mod and (mods & qt_mod):
+                    other_parts.append(name)
+            specific = self._detect_lr_modifier(key) or self._SOLO_MOD_NAMES[key]
+            if other_parts:
+                other_parts.append(specific)
+                combo = "+".join(other_parts)
+            else:
+                combo = specific
+        else:
+            parts = []
+            for qt_mod, name in self._QT_MOD_NAMES.items():
+                if mods & qt_mod:
+                    parts.append(name)
 
-        key_text = QKeySequence(key).toString().lower()
-        if not key_text:
-            return
+            key_text = QKeySequence(key).toString().lower()
+            if not key_text:
+                return
 
-        is_safe_single = key_text.startswith("f") and key_text[1:].isdigit()
-        if not parts and not is_safe_single:
-            self._status.setText("普通键需搭配修饰键 (Ctrl/Shift/Alt)，功能键可单独使用")
-            self._status.setStyleSheet("font-size:12px; color:#ff6b60;")
-            self._btn_ok.setEnabled(False)
-            return
+            is_safe_single = key_text.startswith("f") and key_text[1:].isdigit()
+            if not parts and not is_safe_single:
+                self._status.setText("普通键需搭配修饰键 (Ctrl/Shift/Alt)，功能键可单独使用")
+                self._status.setStyleSheet("font-size:12px; color:#ff6b60;")
+                self._btn_ok.setEnabled(False)
+                return
 
-        parts.append(key_text)
+            parts.append(key_text)
+            combo = "+".join(parts)
 
-        combo = "+".join(parts)
-        display = combo.replace("+", " + ").upper()
+        self._show_combo(combo)
+
+    def _show_combo(self, combo: str):
+        display = _hotkey_display(combo)
         self._key_display.setText(display)
         self._captured = combo
 
@@ -213,6 +349,8 @@ class _HotkeyDialog(QDialog):
 
 def _test_hotkey_register(hotkey_str: str) -> bool:
     """Try to register a global hotkey. Returns True if available."""
+    if hotkey_str.lower() in _MODIFIER_ONLY_KEYS:
+        return True
     mod, vk = _parse_hotkey(hotkey_str)
     if not vk:
         return False
@@ -381,8 +519,9 @@ class VoiceTray(QSystemTrayIcon):
         mini.request_stop.connect(self._on_hotkey)
         mini.request_cancel.connect(self._on_cancel)
         mini.request_history.connect(self._open_history)
+        mini.mode_changed.connect(self._on_mini_mode_changed)
 
-        self._hotkey = HotkeyThread(config.hotkey)
+        self._hotkey = _create_hotkey(config.hotkey)
         self._hotkey.triggered.connect(self._on_hotkey)
         self._hotkey.start()
 
@@ -425,7 +564,7 @@ class VoiceTray(QSystemTrayIcon):
 
         menu.addSeparator()
 
-        hotkey_display = self._config.hotkey.replace("+", " + ").upper()
+        hotkey_display = _hotkey_display(self._config.hotkey)
         self._act_hotkey = QAction(f"快捷键: {hotkey_display}", menu)
         self._act_hotkey.triggered.connect(self._configure_hotkey)
         menu.addAction(self._act_hotkey)
@@ -469,9 +608,16 @@ class VoiceTray(QSystemTrayIcon):
     def _set_mode(self, mode_id: str):
         self._config.mode = mode_id
         self._config.save()
+        self._sync_mode_menu()
+        self._mini.sync_mode()
+
+    def _on_mini_mode_changed(self, mode_id: str):
+        self._sync_mode_menu()
+
+    def _sync_mode_menu(self):
         for act in self._mode_menu.actions():
             mode_name_map = {"纯转录": "transcribe", "智能润色": "polish"}
-            act.setChecked(mode_name_map.get(act.text(), "") == mode_id)
+            act.setChecked(mode_name_map.get(act.text(), "") == self._config.mode)
 
     def _configure_hotkey(self):
         self._hotkey.stop_hotkey()
@@ -479,7 +625,7 @@ class VoiceTray(QSystemTrayIcon):
 
         dlg = _HotkeyDialog(self._config.hotkey)
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.hotkey:
-            self._hotkey = HotkeyThread(self._config.hotkey)
+            self._hotkey = _create_hotkey(self._config.hotkey)
             self._hotkey.triggered.connect(self._on_hotkey)
             self._hotkey.start()
             return
@@ -487,10 +633,10 @@ class VoiceTray(QSystemTrayIcon):
         new_key = dlg.hotkey
         self._config.hotkey = new_key
         self._config.save()
-        self._hotkey = HotkeyThread(new_key)
+        self._hotkey = _create_hotkey(new_key)
         self._hotkey.triggered.connect(self._on_hotkey)
         self._hotkey.start()
-        display = new_key.replace("+", " + ").upper()
+        display = _hotkey_display(new_key)
         self._act_hotkey.setText(f"快捷键: {display}")
         logger.info(f"Hotkey changed to: {display}")
 
