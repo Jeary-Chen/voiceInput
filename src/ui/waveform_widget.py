@@ -35,6 +35,7 @@ class WaveformWidget(QWidget):
         self._frozen = False
         self._peak_buf = np.zeros(self.AGC_WINDOW)
         self._peak_idx = 0
+        self._agc_primed = False
 
         center = (self.BAR_COUNT - 1) / 2.0
         distances = np.abs(np.arange(self.BAR_COUNT) - center) / max(center, 1.0)
@@ -62,7 +63,12 @@ class WaveformWidget(QWidget):
         peak = np.max(np.abs(matrix), axis=1)
         raw = np.sqrt(rms * 0.6 + peak * 0.4)
 
-        self._peak_buf[self._peak_idx] = float(np.mean(raw))
+        cur_mean = float(np.mean(raw))
+        if not self._agc_primed:
+            self._peak_buf[:] = cur_mean
+            self._agc_primed = True
+        else:
+            self._peak_buf[self._peak_idx] = cur_mean
         self._peak_idx = (self._peak_idx + 1) % self.AGC_WINDOW
         recent_avg = float(np.mean(self._peak_buf))
 
@@ -83,6 +89,7 @@ class WaveformWidget(QWidget):
         self._raw_target = np.zeros(self.BAR_COUNT)
         self._peak_buf = np.zeros(self.AGC_WINDOW)
         self._peak_idx = 0
+        self._agc_primed = False
 
     def reset(self):
         self._levels = np.zeros(self.BAR_COUNT)
@@ -91,6 +98,7 @@ class WaveformWidget(QWidget):
         self._color = Theme.WAVEFORM_ACTIVE
         self._peak_buf = np.zeros(self.AGC_WINDOW)
         self._peak_idx = 0
+        self._agc_primed = False
         self.update()
 
     def _tick(self):

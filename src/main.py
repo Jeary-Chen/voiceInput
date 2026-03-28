@@ -28,7 +28,7 @@ def _is_already_running() -> bool:
     """Try connecting to an existing instance. Returns True if one is found."""
     sock = QLocalSocket()
     sock.connectToServer(_APP_KEY)
-    connected = sock.waitForConnected(500)
+    connected = sock.waitForConnected(200)
     sock.close()
     return connected
 

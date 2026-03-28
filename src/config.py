@@ -14,7 +14,7 @@ def _config_path() -> Path:
 
 @dataclass
 class Config:
-    hotkey: str = "ctrl+shift+r"
+    hotkey: str = "lctrl+lshift+r"
     trigger_mode: str = "toggle"
     mode: str = "transcribe"
     custom_prompt: str = ""
@@ -54,6 +54,22 @@ class Config:
 
         if not cfg.api_key:
             cfg.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+
+        _VALID_KEYS = set("abcdefghijklmnopqrstuvwxyz")
+        _VALID_KEYS |= {str(i) for i in range(10)}
+        _VALID_KEYS |= {f"f{i}" for i in range(1, 25)}
+        _VALID_KEYS |= {
+            "lctrl", "rctrl", "lshift", "rshift", "lalt", "ralt",
+            "space", "enter", "tab", "escape", "backspace", "delete",
+            "insert", "home", "end", "pageup", "pagedown",
+            "up", "down", "left", "right",
+            "capslock", "numlock", "scrolllock", "printscreen", "pause",
+            ";", "=", ",", "-", ".", "/", "`", "[", "\\", "]", "'",
+            "mouse_left", "mouse_right", "mouse_middle",
+        }
+        parts = [p.strip().lower() for p in cfg.hotkey.split("+")]
+        if not parts or not all(p in _VALID_KEYS for p in parts):
+            cfg.hotkey = cls.hotkey
 
         cfg.save()
         return cfg

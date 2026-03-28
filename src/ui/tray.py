@@ -1,7 +1,5 @@
 import ctypes
-import ctypes.wintypes as wintypes
 import os
-from datetime import date
 
 from PyQt6.QtCore import Qt, QEvent, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence
@@ -19,176 +17,304 @@ from ui.sounds import AudioCues
 from ui import icons
 
 
-_MOD_MAP = {"ctrl": 0x0002, "shift": 0x0004, "alt": 0x0001}
-_VK_MAP = {chr(i).lower(): i for i in range(0x41, 0x5B)}  # a-z
-_VK_MAP.update({str(i): 0x30 + i for i in range(10)})  # 0-9
-_VK_MAP.update({f"f{i}": 0x70 + i - 1 for i in range(1, 25)})  # F1-F24
-_VK_MAP.update({
-    "space": 0x20, "enter": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
-    "backspace": 0x08, "delete": 0x2E, "insert": 0x2D, "home": 0x24,
-    "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
-    "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
-    "numlock": 0x90, "scrolllock": 0x91, "capslock": 0x14,
-    "printscreen": 0x2C, "pause": 0x13,
-    ";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE,
-    "/": 0xBF, "`": 0xC0, "[": 0xDB, "\\": 0xDC, "]": 0xDD, "'": 0xDE,
-    "alt": 0x12, "shift": 0x10, "ctrl": 0x11,
-    "lalt": 0xA4, "ralt": 0xA5,
-    "lshift": 0xA0, "rshift": 0xA1,
-    "lctrl": 0xA2, "rctrl": 0xA3,
+_MOD_KEYS = frozenset({
+    "ctrl", "shift", "alt",
+    "lctrl", "rctrl", "lshift", "rshift", "lalt", "ralt",
 })
 
-_DISPLAY_NAMES = {
-    "lalt": "Left Alt", "ralt": "Right Alt",
-    "lshift": "Left Shift", "rshift": "Right Shift",
-    "lctrl": "Left Ctrl", "rctrl": "Right Ctrl",
+_VK_TO_NAME: dict[int, str] = {}
+_NAME_TO_VK: dict[str, int] = {}
+
+
+def _build_vk_maps():
+    for i in range(0x41, 0x5B):
+        n = chr(i).lower()
+        _NAME_TO_VK[n] = i
+        _VK_TO_NAME[i] = n
+    for i in range(10):
+        _NAME_TO_VK[str(i)] = 0x30 + i
+        _VK_TO_NAME[0x30 + i] = str(i)
+    for i in range(1, 25):
+        _NAME_TO_VK[f"f{i}"] = 0x70 + i - 1
+        _VK_TO_NAME[0x70 + i - 1] = f"f{i}"
+    extras = {
+        "space": 0x20, "enter": 0x0D, "tab": 0x09, "escape": 0x1B,
+        "backspace": 0x08, "delete": 0x2E, "insert": 0x2D,
+        "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+        "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+        "capslock": 0x14, "numlock": 0x90, "scrolllock": 0x91,
+        "printscreen": 0x2C, "pause": 0x13,
+        ";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE,
+        "/": 0xBF, "`": 0xC0, "[": 0xDB, "\\": 0xDC, "]": 0xDD, "'": 0xDE,
+    }
+    for n, vk in extras.items():
+        _NAME_TO_VK[n] = vk
+        _VK_TO_NAME[vk] = n
+    _VK_TO_NAME[0xA0] = "lshift"
+    _VK_TO_NAME[0xA1] = "rshift"
+    _VK_TO_NAME[0xA2] = "lctrl"
+    _VK_TO_NAME[0xA3] = "rctrl"
+    _VK_TO_NAME[0xA4] = "lalt"
+    _VK_TO_NAME[0xA5] = "ralt"
+    _VK_TO_NAME.setdefault(0x10, "lshift")
+    _VK_TO_NAME.setdefault(0x11, "lctrl")
+    _VK_TO_NAME.setdefault(0x12, "lalt")
+    _NAME_TO_VK.update({
+        "lctrl": 0xA2, "rctrl": 0xA3,
+        "lshift": 0xA0, "rshift": 0xA1,
+        "lalt": 0xA4, "ralt": 0xA5,
+    })
+
+
+_build_vk_maps()
+
+_DISPLAY = {
+    "ctrl": "Ctrl", "shift": "Shift", "alt": "Alt",
+    "lctrl": "L-Ctrl", "rctrl": "R-Ctrl",
+    "lshift": "L-Shift", "rshift": "R-Shift",
+    "lalt": "L-Alt", "ralt": "R-Alt",
+    "mouse_left": "鼠标左键", "mouse_right": "鼠标右键",
+    "mouse_middle": "鼠标中键",
+    "space": "Space", "enter": "Enter", "tab": "Tab",
+    "escape": "Esc", "backspace": "Backspace", "delete": "Delete",
+    "insert": "Insert", "home": "Home", "end": "End",
+    "pageup": "PageUp", "pagedown": "PageDown",
+    "up": "↑", "down": "↓", "left": "←", "right": "→",
+    "capslock": "CapsLock", "numlock": "NumLock",
+    "scrolllock": "ScrollLock", "printscreen": "PrtSc", "pause": "Pause",
 }
+
+
+def _canonical(parts) -> str:
+    parts = list({p.strip().lower() for p in parts})
+    mods = sorted(p for p in parts if p in _MOD_KEYS)
+    others = sorted(p for p in parts if p not in _MOD_KEYS)
+    return "+".join(mods + others)
 
 
 def _hotkey_display(combo: str) -> str:
     parts = combo.split("+")
-    return " + ".join(_DISPLAY_NAMES.get(p, p.upper()) for p in parts)
+    return " + ".join(_DISPLAY.get(p, p.upper()) for p in parts)
 
 
-def _parse_hotkey(s: str) -> tuple[int, int]:
-    mod = 0
-    vk = 0
-    parts = [p.strip() for p in s.lower().split("+")]
-    if len(parts) == 1 and parts[0] in _MOD_MAP and parts[0] in _VK_MAP:
-        return 0, _VK_MAP[parts[0]]
-    for part in parts:
-        if part in _MOD_MAP:
-            mod |= _MOD_MAP[part]
-        elif part in _VK_MAP:
-            vk = _VK_MAP[part]
-    return mod, vk
+_PYN_KEYS: dict = {}
+_PYN_BUTTONS: dict = {}
 
 
-_MODIFIER_ONLY_KEYS = {
-    "alt", "lalt", "ralt", "shift", "lshift", "rshift", "ctrl", "lctrl", "rctrl",
-}
+def _init_pynput():
+    if _PYN_KEYS:
+        return
+    from pynput.keyboard import Key
+    from pynput.mouse import Button
+    _PYN_KEYS.update({
+        Key.ctrl_l: "lctrl", Key.ctrl_r: "rctrl",
+        Key.shift_l: "lshift", Key.shift_r: "rshift",
+        Key.alt_l: "lalt", Key.alt_r: "ralt", Key.alt_gr: "ralt",
+        Key.space: "space", Key.enter: "enter", Key.tab: "tab",
+        Key.esc: "escape", Key.backspace: "backspace", Key.delete: "delete",
+        Key.insert: "insert", Key.home: "home", Key.end: "end",
+        Key.page_up: "pageup", Key.page_down: "pagedown",
+        Key.up: "up", Key.down: "down", Key.left: "left", Key.right: "right",
+        Key.caps_lock: "capslock", Key.num_lock: "numlock",
+        Key.scroll_lock: "scrolllock",
+        Key.print_screen: "printscreen", Key.pause: "pause",
+    })
+    for i in range(1, 21):
+        fk = getattr(Key, f"f{i}", None)
+        if fk:
+            _PYN_KEYS[fk] = f"f{i}"
+    _PYN_BUTTONS.update({
+        Button.left: "mouse_left",
+        Button.right: "mouse_right",
+        Button.middle: "mouse_middle",
+    })
 
 
-class HotkeyThread(QThread):
+def _pyn_key(key) -> str | None:
+    from pynput.keyboard import KeyCode
+    _init_pynput()
+    if key in _PYN_KEYS:
+        return _PYN_KEYS[key]
+    if isinstance(key, KeyCode):
+        if key.char and key.char.isprintable():
+            return key.char.lower()
+        if key.vk:
+            return _VK_TO_NAME.get(key.vk)
+    return None
+
+
+def _pyn_btn(button) -> str | None:
+    _init_pynput()
+    return _PYN_BUTTONS.get(button)
+
+
+class ComboHotkeyThread(QThread):
+    """Global hotkey — order-independent combo detection with key suppression."""
     triggered = pyqtSignal()
-
-    _HOTKEY_ID = 1
 
     def __init__(self, hotkey_str: str):
         super().__init__()
-        self._mod, self._vk = _parse_hotkey(hotkey_str)
-        self._thread_id: int = 0
+        parts = [p.strip().lower() for p in hotkey_str.split("+")]
+        self._combo = frozenset(parts)
+        self._kb_keys = frozenset(p for p in parts if not p.startswith("mouse_"))
+        self._mouse_keys = frozenset(p for p in parts if p.startswith("mouse_"))
+        self._pressed: set[str] = set()
+        self._active = False
+        self._kb_listener = None
+        self._mouse_listener = None
 
     def run(self):
-        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
-        user32 = ctypes.windll.user32
-        if not user32.RegisterHotKey(None, self._HOTKEY_ID, self._mod, self._vk):
-            logger.warning(f"Failed to register hotkey (mod=0x{self._mod:X}, vk=0x{self._vk:X})")
-            return
-        msg = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-            if msg.message == 0x0312 and msg.wParam == self._HOTKEY_ID:
-                self.triggered.emit()
-        user32.UnregisterHotKey(None, self._HOTKEY_ID)
+        from pynput.keyboard import Listener as KBL
+        from pynput.mouse import Listener as ML
 
-    def stop_hotkey(self):
-        if self._thread_id:
-            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)
-
-
-class ModifierHotkeyThread(QThread):
-    """Detects a single modifier key tap via low-level keyboard hook (pynput)."""
-    triggered = pyqtSignal()
-
-    _PYNPUT_KEYS: dict[str, list] = {}
-
-    @classmethod
-    def _init_keys(cls):
-        if cls._PYNPUT_KEYS:
-            return
-        from pynput.keyboard import Key
-        cls._PYNPUT_KEYS = {
-            "lalt": [Key.alt_l], "ralt": [Key.alt_r, Key.alt_gr],
-            "alt": [Key.alt_l, Key.alt_r, Key.alt_gr],
-            "lshift": [Key.shift_l], "rshift": [Key.shift_r],
-            "shift": [Key.shift_l, Key.shift_r],
-            "lctrl": [Key.ctrl_l], "rctrl": [Key.ctrl_r],
-            "ctrl": [Key.ctrl_l, Key.ctrl_r],
-        }
-
-    def __init__(self, key_name: str):
-        super().__init__()
-        self._init_keys()
-        self._target_keys = set(self._PYNPUT_KEYS.get(key_name, []))
-        self._pressed = False
-        self._tainted = False
-        self._listener = None
-
-    def run(self):
-        from pynput.keyboard import Listener
-
-        def on_press(key):
-            if key in self._target_keys:
-                self._pressed = True
-                self._tainted = False
-            elif self._pressed:
-                self._tainted = True
-
-        def on_release(key):
-            if key in self._target_keys and self._pressed:
-                if not self._tainted:
+        def kb_filter(msg, data):
+            name = _VK_TO_NAME.get(data.vkCode)
+            if not name:
+                return
+            if msg in (0x0100, 0x0104):
+                was_new = name not in self._pressed
+                self._pressed.add(name)
+                if was_new and self._pressed >= self._combo and not self._active:
+                    self._active = True
                     self.triggered.emit()
-                self._pressed = False
-                self._tainted = False
+                    if name in self._kb_keys:
+                        self._kb_listener.suppress_event()
+            elif msg in (0x0101, 0x0105):
+                self._pressed.discard(name)
+                if name in self._kb_keys:
+                    self._active = False
 
-        self._listener = Listener(on_press=on_press, on_release=on_release)
-        self._listener.start()
-        self._listener.join()
+        def on_click(x, y, button, pressed):
+            name = _pyn_btn(button)
+            if not name:
+                return
+            if pressed:
+                self._pressed.add(name)
+                if self._pressed >= self._combo and not self._active:
+                    self._active = True
+                    self.triggered.emit()
+            else:
+                self._pressed.discard(name)
+                if name in self._mouse_keys:
+                    self._active = False
+
+        self._kb_listener = KBL(win32_event_filter=kb_filter)
+
+        if self._mouse_keys:
+            self._mouse_listener = ML(on_click=on_click)
+            self._mouse_listener.start()
+
+        self._kb_listener.start()
+        self._kb_listener.join()
 
     def stop_hotkey(self):
-        if self._listener:
-            self._listener.stop()
+        if self._kb_listener:
+            self._kb_listener.stop()
+        if self._mouse_listener:
+            self._mouse_listener.stop()
 
 
-def _create_hotkey(hotkey_str: str) -> HotkeyThread | ModifierHotkeyThread:
-    if hotkey_str.lower() in _MODIFIER_ONLY_KEYS:
-        return ModifierHotkeyThread(hotkey_str.lower())
-    return HotkeyThread(hotkey_str)
+_QT_KEY_NAMES = {
+    Qt.Key.Key_Space: "space", Qt.Key.Key_Return: "enter",
+    Qt.Key.Key_Enter: "enter", Qt.Key.Key_Tab: "tab",
+    Qt.Key.Key_Escape: "escape", Qt.Key.Key_Backspace: "backspace",
+    Qt.Key.Key_Delete: "delete", Qt.Key.Key_Insert: "insert",
+    Qt.Key.Key_Home: "home", Qt.Key.Key_End: "end",
+    Qt.Key.Key_PageUp: "pageup", Qt.Key.Key_PageDown: "pagedown",
+    Qt.Key.Key_Up: "up", Qt.Key.Key_Down: "down",
+    Qt.Key.Key_Left: "left", Qt.Key.Key_Right: "right",
+    Qt.Key.Key_CapsLock: "capslock", Qt.Key.Key_NumLock: "numlock",
+    Qt.Key.Key_ScrollLock: "scrolllock",
+    Qt.Key.Key_Print: "printscreen", Qt.Key.Key_Pause: "pause",
+}
+
+_QT_BTN_NAMES = {
+    Qt.MouseButton.LeftButton: "mouse_left",
+    Qt.MouseButton.RightButton: "mouse_right",
+    Qt.MouseButton.MiddleButton: "mouse_middle",
+}
+
+
+def _qt_key(key_code: int) -> str | None:
+    if key_code in _QT_KEY_NAMES:
+        return _QT_KEY_NAMES[key_code]
+    text = QKeySequence(key_code).toString().lower()
+    return text if text else None
+
+
+_LR_MOD_MAP = {
+    Qt.Key.Key_Shift: [(0xA0, "lshift"), (0xA1, "rshift")],
+    Qt.Key.Key_Control: [(0xA2, "lctrl"), (0xA3, "rctrl")],
+    Qt.Key.Key_Alt: [(0xA4, "lalt"), (0xA5, "ralt")],
+}
+
+
+def _lr_mod_press(qt_key: int) -> str | None:
+    pairs = _LR_MOD_MAP.get(qt_key)
+    if not pairs:
+        return None
+    user32 = ctypes.windll.user32
+    for vk, name in pairs:
+        if user32.GetKeyState(vk) & 0x8000:
+            return name
+    return None
+
+
+def _lr_mod_release(qt_key: int, pressed: set) -> None:
+    pairs = _LR_MOD_MAP.get(qt_key)
+    if not pairs:
+        return
+    user32 = ctypes.windll.user32
+    for vk, name in pairs:
+        if name in pressed and not (user32.GetKeyState(vk) & 0x8000):
+            pressed.discard(name)
 
 
 class _HotkeyDialog(QDialog):
-    """Captures a keyboard shortcut by pressing keys, with real-time conflict check."""
+    """Captures a key/mouse combo — order-independent, with conflict check."""
 
-    _QT_MOD_NAMES = {
-        Qt.KeyboardModifier.ControlModifier: "ctrl",
-        Qt.KeyboardModifier.ShiftModifier: "shift",
-        Qt.KeyboardModifier.AltModifier: "alt",
-    }
+    _STYLE_DEFAULT = """
+        background:#2a2a2a; color:#fff; border:1px solid #555;
+        border-radius:8px; font-size:18px; font-weight:bold;
+    """
+    _STYLE_OK = """
+        background:#1a3a1a; color:#34c759; border:1px solid #34c759;
+        border-radius:8px; font-size:18px; font-weight:bold;
+    """
+    _STYLE_ERR = """
+        background:#3a1a1a; color:#ff3b30; border:1px solid #ff3b30;
+        border-radius:8px; font-size:18px; font-weight:bold;
+    """
 
     def __init__(self, current: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置快捷键")
-        self.setFixedSize(360, 170)
+        self.setFixedSize(360, 180)
         self.setStyleSheet("background:#1e1e1e; color:#fff;")
+        self._current = _canonical(current.split("+"))
         self._result: str | None = None
-        self._current = current
         self._captured: str | None = None
         self._available = False
+
+        self._pressed: set[str] = set()
+        self._best: set[str] = set()
+
+        self._settle = QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(150)
+        self._settle.timeout.connect(self._finalize)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        hint = QLabel("按下新的快捷键组合：")
+        hint = QLabel("同时按下新的快捷键组合（支持鼠标按键）：")
         hint.setStyleSheet("font-size:13px;")
         layout.addWidget(hint)
 
-        self._key_display = QLabel(_hotkey_display(current))
+        self._key_display = QLabel(_hotkey_display(self._current))
         self._key_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._key_display.setFixedHeight(44)
-        self._key_display.setStyleSheet("""
-            background:#2a2a2a; color:#fff; border:1px solid #555;
-            border-radius:8px; font-size:18px; font-weight:bold;
-        """)
+        self._key_display.setStyleSheet(self._STYLE_DEFAULT)
         layout.addWidget(self._key_display)
 
         self._status = QLabel("")
@@ -201,6 +327,7 @@ class _HotkeyDialog(QDialog):
         self._btn_ok = QPushButton("保存")
         self._btn_ok.setFixedWidth(80)
         self._btn_ok.setEnabled(False)
+        self._btn_ok.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_ok.setStyleSheet("""
             QPushButton { background:#007aff; color:#fff; border:none;
                           border-radius:6px; padding:6px; font-size:13px; }
@@ -211,6 +338,7 @@ class _HotkeyDialog(QDialog):
         btn_row.addWidget(self._btn_ok)
         btn_cancel = QPushButton("取消")
         btn_cancel.setFixedWidth(80)
+        btn_cancel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_cancel.setStyleSheet("""
             QPushButton { background:transparent; color:#999; border:1px solid #444;
                           border-radius:6px; padding:6px; font-size:13px; }
@@ -222,94 +350,92 @@ class _HotkeyDialog(QDialog):
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-    _SOLO_MOD_NAMES = {
-        Qt.Key.Key_Alt: "alt",
-        Qt.Key.Key_Shift: "shift",
-        Qt.Key.Key_Control: "ctrl",
-    }
-
-    _QT_MOD_FOR_KEY = {
-        Qt.Key.Key_Alt: Qt.KeyboardModifier.AltModifier,
-        Qt.Key.Key_Shift: Qt.KeyboardModifier.ShiftModifier,
-        Qt.Key.Key_Control: Qt.KeyboardModifier.ControlModifier,
-    }
-
-    _LR_VK = {
-        Qt.Key.Key_Alt: [(0xA4, "lalt"), (0xA5, "ralt")],
-        Qt.Key.Key_Shift: [(0xA0, "lshift"), (0xA1, "rshift")],
-        Qt.Key.Key_Control: [(0xA2, "lctrl"), (0xA3, "rctrl")],
-    }
-
-    def _detect_lr_modifier(self, qt_key) -> str | None:
-        user32 = ctypes.windll.user32
-        for vk, name in self._LR_VK.get(qt_key, []):
-            if user32.GetKeyState(vk) & 0x8000:
-                return name
-        return None
-
     def event(self, e):
         if e.type() == QEvent.Type.ShortcutOverride:
             e.accept()
             return True
-        if e.type() == QEvent.Type.KeyRelease:
-            if e.key() in (Qt.Key.Key_Alt, Qt.Key.Key_Control,
-                           Qt.Key.Key_Shift, Qt.Key.Key_Meta):
-                e.accept()
-                return True
         return super().event(e)
 
     def keyPressEvent(self, event):
+        if event.isAutoRepeat():
+            return
         event.accept()
         key = event.key()
-        mods = event.modifiers()
-
-        if key == Qt.Key.Key_unknown:
+        if key in (Qt.Key.Key_unknown, Qt.Key.Key_Meta):
             return
-        if key == Qt.Key.Key_Meta:
+        name = _lr_mod_press(key) or _qt_key(key)
+        if not name:
             return
-
-        if key == Qt.Key.Key_Escape and not (mods & ~Qt.KeyboardModifier.NoModifier):
+        if name == "escape" and not self._pressed:
             self.reject()
             return
+        self._settle.stop()
+        self._pressed.add(name)
+        if len(self._pressed) >= len(self._best):
+            self._best = set(self._pressed)
+            self._show_best()
 
-        if key in self._SOLO_MOD_NAMES:
-            own_mod = self._QT_MOD_FOR_KEY.get(key, Qt.KeyboardModifier.NoModifier)
-            other_parts = []
-            for qt_mod, name in self._QT_MOD_NAMES.items():
-                if qt_mod != own_mod and (mods & qt_mod):
-                    other_parts.append(name)
-            specific = self._detect_lr_modifier(key) or self._SOLO_MOD_NAMES[key]
-            if other_parts:
-                other_parts.append(specific)
-                combo = "+".join(other_parts)
-            else:
-                combo = specific
+    def keyReleaseEvent(self, event):
+        if event.isAutoRepeat():
+            return
+        event.accept()
+        key = event.key()
+        if key in (Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt):
+            _lr_mod_release(key, self._pressed)
         else:
-            parts = []
-            for qt_mod, name in self._QT_MOD_NAMES.items():
-                if mods & qt_mod:
-                    parts.append(name)
+            name = _qt_key(key)
+            if name:
+                self._pressed.discard(name)
+        if not self._pressed:
+            self._settle.start()
 
-            key_text = QKeySequence(key).toString().lower()
-            if not key_text:
-                return
+    def mousePressEvent(self, event):
+        name = _QT_BTN_NAMES.get(event.button())
+        if not name:
+            return
+        event.accept()
+        self._settle.stop()
+        self._pressed.add(name)
+        if len(self._pressed) >= len(self._best):
+            self._best = set(self._pressed)
+            self._show_best()
 
-            is_safe_single = key_text.startswith("f") and key_text[1:].isdigit()
-            if not parts and not is_safe_single:
-                self._status.setText("普通键需搭配修饰键 (Ctrl/Shift/Alt)，功能键可单独使用")
+    def mouseReleaseEvent(self, event):
+        name = _QT_BTN_NAMES.get(event.button())
+        if name:
+            self._pressed.discard(name)
+        if not self._pressed:
+            self._settle.start()
+
+    def _show_best(self):
+        if self._best:
+            combo = _canonical(self._best)
+            self._key_display.setText(_hotkey_display(combo))
+            self._key_display.setStyleSheet(self._STYLE_DEFAULT)
+            self._status.setText("")
+            self._btn_ok.setEnabled(False)
+            self._available = False
+
+    def _finalize(self):
+        if not self._best:
+            return
+        combo = _canonical(self._best)
+        self._captured = combo
+        self._best = set()
+        self._validate(combo)
+
+    def _validate(self, combo: str):
+        parts = combo.split("+")
+
+        if len(parts) == 1:
+            p = parts[0]
+            is_fkey = p.startswith("f") and p[1:].isdigit()
+            if not (p in _MOD_KEYS or is_fkey or p.startswith("mouse_")):
+                self._key_display.setStyleSheet(self._STYLE_ERR)
+                self._status.setText("单个普通键容易误触，请搭配其他键")
                 self._status.setStyleSheet("font-size:12px; color:#ff6b60;")
                 self._btn_ok.setEnabled(False)
                 return
-
-            parts.append(key_text)
-            combo = "+".join(parts)
-
-        self._show_combo(combo)
-
-    def _show_combo(self, combo: str):
-        display = _hotkey_display(combo)
-        self._key_display.setText(display)
-        self._captured = combo
 
         if combo == self._current:
             self._status.setText("与当前快捷键相同")
@@ -317,25 +443,20 @@ class _HotkeyDialog(QDialog):
             self._btn_ok.setEnabled(False)
             return
 
-        available = _test_hotkey_register(combo)
-        if available:
-            self._key_display.setStyleSheet("""
-                background:#1a3a1a; color:#34c759; border:1px solid #34c759;
-                border-radius:8px; font-size:18px; font-weight:bold;
-            """)
-            self._status.setText("✓ 快捷键可用")
-            self._status.setStyleSheet("font-size:12px; color:#34c759;")
-            self._btn_ok.setEnabled(True)
-            self._available = True
-        else:
-            self._key_display.setStyleSheet("""
-                background:#3a1a1a; color:#ff3b30; border:1px solid #ff3b30;
-                border-radius:8px; font-size:18px; font-weight:bold;
-            """)
+        conflict = _test_system_conflict(combo)
+        if conflict is False:
+            self._key_display.setStyleSheet(self._STYLE_ERR)
             self._status.setText("✕ 已被系统或其他程序占用")
             self._status.setStyleSheet("font-size:12px; color:#ff3b30;")
             self._btn_ok.setEnabled(False)
             self._available = False
+            return
+
+        self._key_display.setStyleSheet(self._STYLE_OK)
+        self._status.setText("✓ 快捷键可用")
+        self._status.setStyleSheet("font-size:12px; color:#34c759;")
+        self._btn_ok.setEnabled(True)
+        self._available = True
 
     def _do_accept(self):
         if self._captured and self._available:
@@ -347,18 +468,31 @@ class _HotkeyDialog(QDialog):
         return self._result
 
 
-def _test_hotkey_register(hotkey_str: str) -> bool:
-    """Try to register a global hotkey. Returns True if available."""
-    if hotkey_str.lower() in _MODIFIER_ONLY_KEYS:
-        return True
-    mod, vk = _parse_hotkey(hotkey_str)
+_MOD_FLAGS = {
+    "ctrl": 0x0002, "lctrl": 0x0002, "rctrl": 0x0002,
+    "shift": 0x0004, "lshift": 0x0004, "rshift": 0x0004,
+    "alt": 0x0001, "lalt": 0x0001, "ralt": 0x0001,
+}
+
+
+def _test_system_conflict(combo: str) -> bool | None:
+    """True=available, False=system occupied, None=can't test (non-standard combo)."""
+    parts = combo.split("+")
+    mods = [p for p in parts if p in _MOD_KEYS]
+    non_mods = [p for p in parts if p not in _MOD_KEYS]
+    if len(non_mods) != 1 or non_mods[0].startswith("mouse_"):
+        return None
+    vk = _NAME_TO_VK.get(non_mods[0], 0)
     if not vk:
-        return False
+        return None
+    mod = 0
+    for m in mods:
+        mod |= _MOD_FLAGS.get(m, 0)
     user32 = ctypes.windll.user32
-    test_id = 0x7FFF
-    ok = user32.RegisterHotKey(None, test_id, mod, vk)
+    tid = 0x7FFF
+    ok = user32.RegisterHotKey(None, tid, mod, vk)
     if ok:
-        user32.UnregisterHotKey(None, test_id)
+        user32.UnregisterHotKey(None, tid)
     return bool(ok)
 
 
@@ -383,6 +517,7 @@ class _ApiKeyDialog(QDialog):
         hint_row.addStretch()
         btn_open = QPushButton("获取 ↗")
         btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_open.setStyleSheet("""
             QPushButton { background:transparent; color:#007aff; border:none;
                           font-size:12px; }
@@ -408,6 +543,7 @@ class _ApiKeyDialog(QDialog):
 
         self._toggle_vis = QPushButton("显示")
         self._toggle_vis.setFixedWidth(50)
+        self._toggle_vis.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._toggle_vis.setStyleSheet("""
             QPushButton { background:transparent; color:#999; border:none;
                           font-size:12px; }
@@ -421,6 +557,7 @@ class _ApiKeyDialog(QDialog):
 
         btn_ok = QPushButton("保存")
         btn_ok.setFixedWidth(80)
+        btn_ok.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_ok.setStyleSheet("""
             QPushButton { background:#007aff; color:#fff; border:none;
                           border-radius:6px; padding:6px; font-size:13px; }
@@ -431,6 +568,7 @@ class _ApiKeyDialog(QDialog):
 
         btn_cancel = QPushButton("取消")
         btn_cancel.setFixedWidth(80)
+        btn_cancel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_cancel.setStyleSheet("""
             QPushButton { background:transparent; color:#999; border:1px solid #444;
                           border-radius:6px; padding:6px; font-size:13px; }
@@ -521,7 +659,7 @@ class VoiceTray(QSystemTrayIcon):
         mini.request_history.connect(self._open_history)
         mini.mode_changed.connect(self._on_mini_mode_changed)
 
-        self._hotkey = _create_hotkey(config.hotkey)
+        self._hotkey = ComboHotkeyThread(config.hotkey)
         self._hotkey.triggered.connect(self._on_hotkey)
         self._hotkey.start()
 
@@ -625,7 +763,7 @@ class VoiceTray(QSystemTrayIcon):
 
         dlg = _HotkeyDialog(self._config.hotkey)
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.hotkey:
-            self._hotkey = _create_hotkey(self._config.hotkey)
+            self._hotkey = ComboHotkeyThread(self._config.hotkey)
             self._hotkey.triggered.connect(self._on_hotkey)
             self._hotkey.start()
             return
@@ -633,7 +771,7 @@ class VoiceTray(QSystemTrayIcon):
         new_key = dlg.hotkey
         self._config.hotkey = new_key
         self._config.save()
-        self._hotkey = _create_hotkey(new_key)
+        self._hotkey = ComboHotkeyThread(new_key)
         self._hotkey.triggered.connect(self._on_hotkey)
         self._hotkey.start()
         display = _hotkey_display(new_key)
