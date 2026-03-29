@@ -604,20 +604,6 @@ class _ApiKeyDialog(QDialog):
         return self._result
 
 
-class _DeviceRefreshWorker(QThread):
-    """Enumerate audio devices off the main thread."""
-    done = pyqtSignal(str, list)  # default_device_name, device_list
-
-    def run(self):
-        from core.recorder import VoiceRecorder
-        try:
-            default_name = VoiceRecorder.get_default_device_name()
-            devices = VoiceRecorder.list_devices()
-        except Exception:
-            default_name = "Unknown"
-            devices = []
-        self.done.emit(default_name, devices)
-
 
 MENU_STYLE = """
     QMenu {
@@ -686,6 +672,15 @@ class VoiceTray(QSystemTrayIcon):
         self._hotkey.triggered.connect(self._on_hotkey)
         self._hotkey.start()
 
+        from core.device_watcher import AudioDeviceWatcher
+        self._device_watcher = AudioDeviceWatcher()
+        self._device_change_timer = QTimer()
+        self._device_change_timer.setSingleShot(True)
+        self._device_change_timer.setInterval(500)
+        self._device_change_timer.timeout.connect(self._refresh_devices)
+        self._device_watcher.signals.changed.connect(self._device_change_timer.start)
+        self._device_watcher.start()
+
         self.show()
 
     def _build_menu(self):
@@ -738,8 +733,6 @@ class VoiceTray(QSystemTrayIcon):
         self._device_menu.setStyleSheet(MENU_STYLE)
         self._cached_default_name = ""
         self._cached_devices: list[dict] = []
-        self._device_refresh_worker: _DeviceRefreshWorker | None = None
-        self._device_menu.aboutToShow.connect(self._on_device_menu_show)
         menu.addMenu(self._device_menu)
 
         self._act_save_audio = QAction("保存录音文件", menu)
@@ -769,7 +762,7 @@ class VoiceTray(QSystemTrayIcon):
         act_quit.triggered.connect(self._quit)
         menu.addAction(act_quit)
 
-        menu.aboutToShow.connect(self._async_refresh_devices)
+        menu.aboutToShow.connect(self._refresh_devices)
         self.setContextMenu(menu)
 
         self._sync_refresh_devices()
@@ -784,44 +777,61 @@ class VoiceTray(QSystemTrayIcon):
             self._cached_devices = []
         self._rebuild_device_menu()
 
-    def _async_refresh_devices(self):
-        if self._device_refresh_worker is not None:
+    def _refresh_devices(self):
+        """Release recorder's PyAudio so PortAudio re-scans, then enumerate.
+
+        PortAudio caches the device list per-process as long as any context
+        is alive.  Temporarily releasing the recorder's PyAudio forces
+        Pa_Initialize to re-scan the OS device tree on next call.
+        """
+        need_reopen = (self._engine.state != "recording"
+                       and self._engine.recorder._pa is not None)
+        if need_reopen:
+            self._engine.recorder._release_pa()
+        from core.recorder import VoiceRecorder
+        try:
+            self._cached_default_name = VoiceRecorder.get_default_device_name()
+            self._cached_devices = VoiceRecorder.list_devices()
+            logger.debug(f"[Tray] Device refresh: "
+                         f"default='{self._cached_default_name}', "
+                         f"{len(self._cached_devices)} device(s)")
+        except Exception:
+            self._cached_default_name = "Unknown"
+            self._cached_devices = []
+        if need_reopen:
+            self._engine.recorder.prepare()
+        self._auto_fallback_if_device_gone()
+        self._rebuild_device_menu()
+
+    def _auto_fallback_if_device_gone(self):
+        """If the selected device is no longer present, switch to system default.
+
+        Device indices are unstable across PyAudio re-init, so we match by
+        name.  If the same-named device still exists but its index changed,
+        we silently update the stored index.
+        """
+        if self._config.mic_index is None:
             return
-        w = _DeviceRefreshWorker()
-        w.done.connect(self._on_devices_refreshed)
-        w.finished.connect(self._on_device_worker_finished)
-        self._device_refresh_worker = w
-        w.start()
-
-    def _on_device_worker_finished(self):
-        if self._device_refresh_worker:
-            self._device_refresh_worker.deleteLater()
-            self._device_refresh_worker = None
-
-    def _on_devices_refreshed(self, default_name: str, devices: list):
-        self._cached_default_name = default_name
-        self._cached_devices = devices
-        logger.debug(f"[Tray] Device refresh (async): default='{default_name}', "
-                     f"{len(devices)} device(s)")
-        self._rebuild_device_menu()
-
-    def _on_device_menu_show(self):
-        """Synchronous refresh when device submenu opens — guarantees fresh data."""
-        if self._device_refresh_worker is not None:
-            self._device_refresh_worker.wait(2000)
-            self._on_device_worker_finished()
-        else:
-            from core.recorder import VoiceRecorder
-            try:
-                self._cached_default_name = VoiceRecorder.get_default_device_name()
-                self._cached_devices = VoiceRecorder.list_devices()
-                logger.debug(f"[Tray] Device refresh (sync): "
-                             f"default='{self._cached_default_name}', "
-                             f"{len(self._cached_devices)} device(s)")
-            except Exception:
-                self._cached_default_name = "Unknown"
-                self._cached_devices = []
-        self._rebuild_device_menu()
+        saved_name = self._config.mic_name
+        match = next((d for d in self._cached_devices if d["name"] == saved_name), None)
+        if match is not None:
+            if match["index"] != self._config.mic_index:
+                old_idx = self._config.mic_index
+                self._config.mic_index = match["index"]
+                self._config.save()
+                if self._engine.state != "recording":
+                    self._engine.recorder.set_device(match["index"])
+                logger.info(f"[Tray] Device '{saved_name}' index changed "
+                            f"{old_idx} → {match['index']}")
+            return
+        old = self._config.mic_index
+        self._config.mic_index = None
+        self._config.mic_name = ""
+        self._config.save()
+        if self._engine.state != "recording":
+            self._engine.recorder.set_device(None)
+        logger.info(f"[Tray] Selected device '{saved_name}' (index={old}) gone, "
+                    f"switched to system default")
 
     def _rebuild_device_menu(self):
         self._device_menu.clear()
@@ -843,7 +853,8 @@ class VoiceTray(QSystemTrayIcon):
         for dev in self._cached_devices:
             act = QAction(dev["name"], self._device_menu)
             act.setCheckable(True)
-            act.setChecked(self._config.mic_index == dev["index"])
+            act.setChecked(self._config.mic_name == dev["name"]
+                           and self._config.mic_index is not None)
             act.triggered.connect(
                 lambda checked, idx=dev["index"], name=dev["name"]: self._set_device(idx, name))
             self._device_menu.addAction(act)
@@ -1037,6 +1048,7 @@ class VoiceTray(QSystemTrayIcon):
         logger.info("[Tray] Quit requested")
         if self._engine.state == "recording":
             self._engine.cancel()
+        self._device_watcher.stop()
         self._engine.recorder.release()
         self._hotkey.stop_hotkey()
         self._hotkey.wait(2000)
