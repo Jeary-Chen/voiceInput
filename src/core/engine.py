@@ -1,7 +1,7 @@
 """Core voice engine — coordinates recording, ASR, and text injection."""
 import time
 
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer
 
 from config import Config
 from core.log import logger
@@ -10,6 +10,8 @@ from core.asr import DashScopeASR
 from core.injector import TextInjector
 from core.history import HistoryManager
 from core.polisher import TextPolisher
+
+_TAG = "[Engine]"
 
 
 class _TranscribeWorker(QThread):
@@ -24,14 +26,14 @@ class _TranscribeWorker(QThread):
 
     def run(self):
         try:
-            logger.info(f"Transcribing {self._duration:.1f}s audio (model: {self._asr.model})")
+            logger.info(f"[ASR] Transcribing {self._duration:.1f}s audio (model: {self._asr.model})")
             t0 = time.perf_counter()
             text = self._asr.transcribe(self._pcm)
             elapsed = time.perf_counter() - t0
-            logger.info(f"Transcription done in {elapsed:.1f}s")
+            logger.info(f"[ASR] Transcription done in {elapsed:.1f}s → {len(text)} chars")
             self.result_ready.emit(text)
         except Exception as e:
-            logger.error(f"Transcription failed: {e}")
+            logger.error(f"[ASR] Transcription failed: {e}")
             self.error_occurred.emit(str(e))
 
 
@@ -44,11 +46,11 @@ class _PolishWorker(QThread):
         self._raw = raw_text
 
     def run(self):
-        logger.info(f"Polishing text ({len(self._raw)} chars)")
+        logger.info(f"[Polisher] Polishing {len(self._raw)} chars (model: {self._polisher._model})")
         t0 = time.perf_counter()
         result = self._polisher.polish(self._raw)
         elapsed = time.perf_counter() - t0
-        logger.info(f"Polish done in {elapsed:.1f}s → {len(result)} chars")
+        logger.info(f"[Polisher] Done in {elapsed:.1f}s → {len(result)} chars")
         self.result_ready.emit(result)
 
 
@@ -61,11 +63,21 @@ class VoiceEngine(QObject):
     api_key_invalid = pyqtSignal()         # 401 or missing key
     mic_unavailable = pyqtSignal()         # no microphone or open failed
     _max_reached = pyqtSignal()            # thread-safe auto-stop trigger
+    _mic_error = pyqtSignal()              # mic issue detected during recording
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.recorder = VoiceRecorder(device_index=config.mic_index)
+
+        resolved = VoiceRecorder.resolve_device(config.mic_name, config.mic_index)
+        if resolved != config.mic_index:
+            config.mic_index = resolved
+            if resolved is None:
+                config.mic_name = ""
+            config.save()
+
+        self.recorder = VoiceRecorder(device_index=resolved)
+        self.recorder.prepare()
         self.asr = DashScopeASR(
             api_key=config.api_key,
             model=config.asr_model,
@@ -75,12 +87,19 @@ class VoiceEngine(QObject):
         self.history = HistoryManager(config)
         self.polisher = TextPolisher(
             api_key=config.api_key,
-            model="qwen-plus",
+            model=config.polish_model,
+            base_url=config.api_base_url,
         )
         self._state = "ready"
         self._worker: _TranscribeWorker | None = None
         self._polish_worker: _PolishWorker | None = None
         self._max_reached.connect(self._stop_recording)
+        self._mic_error.connect(self._on_recording_mic_error)
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(1000)
+        self._watchdog.timeout.connect(self._check_recording_health)
+        logger.info(f"{_TAG} Initialized (mode={config.mode}, "
+                    f"asr={config.asr_model}, polish={config.polish_model})")
 
     @property
     def state(self) -> str:
@@ -88,7 +107,11 @@ class VoiceEngine(QObject):
 
     def _set_state(self, s: str):
         self._state = s
-        logger.debug(f"State → {s}")
+        if s == "recording":
+            self._watchdog.start()
+        else:
+            self._watchdog.stop()
+        logger.debug(f"{_TAG} State → {s}")
         self.state_changed.emit(s)
 
     def toggle_record(self):
@@ -99,7 +122,7 @@ class VoiceEngine(QObject):
 
     def cancel(self):
         if self._state == "recording":
-            logger.info("Recording cancelled")
+            logger.info(f"{_TAG} Recording cancelled by user")
             self.recorder.cancel()
             self._set_state("ready")
 
@@ -109,26 +132,63 @@ class VoiceEngine(QObject):
     # ── recording ──
 
     def _start_recording(self):
-        logger.info("Recording started")
+        logger.info(f"{_TAG} Start recording (mode={self.config.mode})")
         self._record_t0 = time.monotonic()
         try:
             self.recorder.start(
                 on_audio_data=self._on_audio_chunk,
                 on_max_reached=self._on_max_reached,
+                on_mic_error=self._on_mic_error,
             )
         except Exception as e:
-            logger.error(f"Failed to open microphone: {e}")
-            self.error_occurred.emit(f"无法打开麦克风: {e}")
-            self.mic_unavailable.emit()
-            self._set_state("ready")
-            return
+            logger.warning(f"{_TAG} Start failed ({e}), re-preparing...")
+            try:
+                self.recorder.prepare()
+                self.recorder.start(
+                    on_audio_data=self._on_audio_chunk,
+                    on_max_reached=self._on_max_reached,
+                    on_mic_error=self._on_mic_error,
+                )
+            except Exception as e2:
+                logger.error(f"{_TAG} Failed to open microphone: {e2}")
+                self.error_occurred.emit(f"无法打开麦克风: {e2}")
+                self.mic_unavailable.emit()
+                self._set_state("ready")
+                return
+
         self._set_state("recording")
 
     def _on_max_reached(self):
         self._max_reached.emit()
 
+    def _on_mic_error(self):
+        self._mic_error.emit()
+
     def _on_audio_chunk(self, data: bytes):
         self.audio_data.emit(data)
+
+    def _on_recording_mic_error(self):
+        """Handle mic error detected during recording (from audio callback thread)."""
+        if self._state != "recording":
+            return
+        logger.error(f"{_TAG} Mic error during recording, auto-stopping")
+        self.recorder.stop()
+        self.error_occurred.emit("录音过程中发现麦克风异常，已自动停止")
+        self.mic_unavailable.emit()
+        self._set_state("ready")
+
+    def _check_recording_health(self):
+        """Watchdog: detect stalled audio stream (e.g. Bluetooth disconnect)."""
+        if self._state != "recording":
+            return
+        if self.recorder.is_stalled():
+            logger.error(f"{_TAG} Audio stream stalled "
+                         f"(no callback for >{self.recorder.STALL_TIMEOUT}s), "
+                         f"device likely disconnected")
+            self.recorder.stop()
+            self.error_occurred.emit("麦克风似乎已断开连接，录音已自动停止")
+            self.mic_unavailable.emit()
+            self._set_state("ready")
 
     def _stop_recording(self):
         if self._state != "recording":
@@ -136,12 +196,22 @@ class VoiceEngine(QObject):
         wall_duration = time.monotonic() - self._record_t0
         pcm = self.recorder.stop()
         if not pcm:
-            logger.warning("No audio captured")
+            logger.warning(f"{_TAG} No audio captured after {wall_duration:.1f}s")
+            self.error_occurred.emit("未录到音频，请重试")
             self._set_state("ready")
             return
 
-        logger.info(f"Recording stopped — {wall_duration:.1f}s captured "
-                    f"(PCM {len(pcm)} bytes)")
+        logger.info(f"{_TAG} Recording stopped — {wall_duration:.1f}s, "
+                    f"PCM {len(pcm)} bytes")
+
+        if self.recorder.is_silent():
+            logger.warning(f"{_TAG} Audio silent (peak={self.recorder.peak_amplitude}), "
+                           f"skipping ASR")
+            self.error_occurred.emit("未检测到声音，请检查麦克风")
+            self.mic_unavailable.emit()
+            self._set_state("ready")
+            return
+
         self._start_batch_transcribe(pcm, wall_duration)
 
     def _start_batch_transcribe(self, pcm: bytes, duration: float):
@@ -164,12 +234,13 @@ class VoiceEngine(QObject):
 
     def _finalize(self, text: str, pcm: bytes):
         if not text:
-            logger.warning("Empty transcription result")
+            logger.warning(f"{_TAG} Empty transcription result")
             self.error_occurred.emit("识别结果为空")
             self._set_state("ready")
             return
 
         if self.config.mode == "polish":
+            logger.info(f"{_TAG} Entering polish pipeline")
             self._set_state("processing")
             self.live_text.emit(f"[原文] {text}")
             self._polish_worker = _PolishWorker(self.polisher, text)
@@ -182,10 +253,10 @@ class VoiceEngine(QObject):
     def _inject_and_save(self, text: str, pcm: bytes):
         if self.config.paste_result:
             self.injector.inject(text, restore_clipboard=self.config.restore_clipboard)
-            logger.info(f"Text pasted at cursor ({len(text)} chars)")
+            logger.info(f"{_TAG} Pasted {len(text)} chars")
         else:
             self.injector.copy_only(text)
-            logger.info(f"Text copied to clipboard ({len(text)} chars)")
+            logger.info(f"{_TAG} Copied {len(text)} chars to clipboard")
 
         duration = len(pcm) / (16000 * 2)
         self.history.save_entry(
@@ -198,7 +269,7 @@ class VoiceEngine(QObject):
         self._set_state("ready")
 
     def _on_transcribe_error(self, msg: str):
-        logger.error(msg)
+        logger.error(f"{_TAG} Transcription error: {msg}")
         self.error_occurred.emit(msg)
         if "API 401:" in msg:
             self.api_key_invalid.emit()

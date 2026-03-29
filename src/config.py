@@ -23,8 +23,10 @@ class Config:
     api_key: str = ""
     api_base_url: str = "https://dashscope.aliyuncs.com/api/v1"
     asr_model: str = "qwen3-asr-flash"
+    polish_model: str = "qwen3.5-flash"
 
     mic_index: int | None = None
+    mic_name: str = ""
 
     paste_result: bool = True
     restore_clipboard: bool = False

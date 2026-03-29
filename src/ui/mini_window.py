@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMenu,
 )
 
+from core.log import logger
 from ui.theme import Theme
 from ui.waveform_widget import WaveformWidget
 
@@ -201,6 +202,56 @@ class _ResultPopup(QWidget):
         pass
 
 
+class _StatusPopup(QWidget):
+    """Floating status bar shown below the mini window during recording hover."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._label = QLabel()
+        self._label.setFont(Theme.font(11))
+        self._label.setStyleSheet(f"""
+            color: {Theme.TEXT_SECONDARY.name()};
+            background: {Theme.BG_PRIMARY.name()};
+            border: 1px solid rgba(255,255,255,20);
+            border-radius: 8px;
+            padding: 5px 10px;
+        """)
+        layout.addWidget(self._label)
+
+    def show_status(self, items: list[str], anchor: QWidget):
+        if not items:
+            self.hide()
+            return
+        self._label.setText("    ".join(items))
+        self.adjustSize()
+        pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            x = pos.x() + (anchor.width() - self.width()) // 2
+            x = max(geo.x(), min(x, geo.x() + geo.width() - self.width()))
+        else:
+            x = pos.x()
+        self.move(x, pos.y() + 3)
+        self.show()
+
+    def paintEvent(self, event):
+        pass
+
+
 class MiniRecordingWindow(QWidget):
     request_record = pyqtSignal()
     request_stop = pyqtSignal()
@@ -212,6 +263,7 @@ class MiniRecordingWindow(QWidget):
         super().__init__()
         self._engine = engine
         self._mode = "idle"
+        self._recording_device = ""
         self._drag_pos = None
         self._hovered = False
         self._show_result = False
@@ -229,6 +281,7 @@ class MiniRecordingWindow(QWidget):
         self._target_size = (IDLE_W, IDLE_H)
 
         self._result_popup = _ResultPopup()
+        self._status_popup = _StatusPopup()
 
         self._build_ui()
         self._set_widgets_for_mode("idle")
@@ -325,6 +378,7 @@ class MiniRecordingWindow(QWidget):
         cfg.save()
         self._update_polish_style()
         self.mode_changed.emit(cfg.mode)
+        logger.info(f"[MiniWin] Mode toggled → {cfg.mode}")
 
     def sync_mode(self):
         """Refresh polish button style after external mode change."""
@@ -358,6 +412,20 @@ class MiniRecordingWindow(QWidget):
 
     def _on_cancel(self):
         self.request_cancel.emit()
+
+    def _show_recording_status(self):
+        items: list[str] = []
+        dev = self._recording_device
+        if dev:
+            items.append(f"🎤 {dev}")
+        cfg = self._engine.config
+        if cfg.mode == "polish":
+            model = getattr(self._engine.polisher, '_model', 'unknown')
+            items.append(f"✦ {model}")
+        self._status_popup.show_status(items, self)
+
+    def _hide_recording_status(self):
+        self._status_popup.hide()
 
     def _on_action_click(self):
         if self._mode == "hover":
@@ -436,16 +504,13 @@ class MiniRecordingWindow(QWidget):
         self._style_action_record()
         self._update_polish_style()
         self._update_show_result_style()
+        self._set_widgets_for_mode("hover")
         self._animate_to(HOVER_W, HOVER_H, 300,
                          QEasingCurve.Type.InOutQuart)
-        QTimer.singleShot(200, self._reveal_hover_content)
-
-    def _reveal_hover_content(self):
-        if self._mode == "hover":
-            self._set_widgets_for_mode("hover")
 
     def _apply_recording(self):
         self._mode = "recording"
+        self._recording_device = self._engine.recorder.device_name
         self._waveform.reset()
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_RECORDING.name()};")
 
@@ -478,6 +543,7 @@ class MiniRecordingWindow(QWidget):
         if self._mode in ("idle", "shrinking"):
             return
         self._mode = "shrinking"
+        self._hide_recording_status()
         self._set_widgets_for_mode("idle")
         self._animate_to(IDLE_W, IDLE_H, 280,
                          QEasingCurve.Type.InOutQuart)
@@ -486,6 +552,7 @@ class MiniRecordingWindow(QWidget):
     # ── engine signals ──
 
     def _on_engine_state(self, state: str):
+        logger.debug(f"[MiniWin] Engine state → {state} (was {self._mode})")
         if state == "recording":
             self._apply_recording()
             self.show()
@@ -506,6 +573,7 @@ class MiniRecordingWindow(QWidget):
         QTimer.singleShot(800, self._shrink_to_idle)
 
     def _on_error(self, msg: str):
+        logger.debug(f"[MiniWin] Error received: {msg}")
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_WARNING.name()};")
         QTimer.singleShot(1500, self._shrink_to_idle)
 
@@ -544,10 +612,12 @@ class MiniRecordingWindow(QWidget):
         elif self._mode == "recording":
             self._btn_rec_stop.setVisible(True)
             self._animate_to(REC_HOVER_W, REC_H, 150)
+            self._show_recording_status()
         self.update()
 
     def leaveEvent(self, event):
         self._hovered = False
+        self._hide_recording_status()
         if self._mode == "hover":
             self._hover_timer.start(300)
         elif self._mode == "recording":

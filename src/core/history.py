@@ -5,13 +5,16 @@ Supports: save, load, delete, search, get page.
 """
 import json
 import time
-import uuid
 import wave
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from config import Config
+from core.log import logger
+
+_TAG = "[History]"
 
 
 @dataclass
@@ -41,7 +44,7 @@ class HistoryManager:
 
     def save_entry(self, text: str, duration: float, mode: str,
                    audio_data: Optional[bytes] = None) -> HistoryEntry:
-        entry_id = str(uuid.uuid4())[:8]
+        entry_id = self._next_id()
         entry = HistoryEntry(
             id=entry_id,
             text=text,
@@ -63,6 +66,9 @@ class HistoryManager:
                 wf.setframerate(16000)
                 wf.writeframes(audio_data)
 
+        logger.info(f"{_TAG} Saved entry {entry_id} "
+                    f"({duration:.1f}s, mode={mode}"
+                    f"{', +wav' if audio_data else ''})")
         self._enforce_size_limit()
         return entry
 
@@ -115,10 +121,21 @@ class HistoryManager:
         total = sum(f.stat().st_size for f in self._dir.rglob("*") if f.is_file())
         return total // 1024
 
+    def _next_id(self) -> str:
+        base = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if not (self._dir / f"{base}.json").exists():
+            return base
+        for seq in range(2, 100):
+            candidate = f"{base}_{seq}"
+            if not (self._dir / f"{candidate}.json").exists():
+                return candidate
+        return f"{base}_{int(time.time() * 1000) % 10000}"
+
     def _enforce_size_limit(self):
         """Delete oldest entries until total size is under MAX_SIZE_BYTES."""
         files = sorted(self._dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
         total = sum(f.stat().st_size for f in self._dir.rglob("*") if f.is_file())
+        deleted = 0
         while total > self.MAX_SIZE_BYTES and files:
             oldest = files.pop(0)
             entry_id = oldest.stem
@@ -129,3 +146,7 @@ class HistoryManager:
                 entry_size += wav.stat().st_size
                 wav.unlink()
             total -= entry_size
+            deleted += 1
+        if deleted:
+            logger.info(f"{_TAG} Size limit: deleted {deleted} old entries, "
+                        f"now {total // 1024} KB")

@@ -7,6 +7,8 @@ import dashscope
 
 from core.log import logger
 
+_TAG = "[ASR]"
+
 
 class DashScopeASR:
     """Batch ASR — records everything, then transcribes in one shot."""
@@ -16,6 +18,7 @@ class DashScopeASR:
         self.api_key = api_key
         self.model = model
         dashscope.base_http_api_url = base_url
+        logger.info(f"{_TAG} Initialized (model={model})")
 
     def transcribe(self, pcm_data: bytes,
                    sample_rate: int = 16000, channels: int = 1) -> str:
@@ -30,8 +33,8 @@ class DashScopeASR:
         b64 = base64.b64encode(wav_bytes).decode()
         data_uri = f"data:audio/wav;base64,{b64}"
 
-        logger.info(f"ASR request: PCM {len(pcm_data)} bytes → WAV {len(wav_bytes)} bytes "
-                    f"→ base64 {len(b64)} bytes")
+        logger.info(f"{_TAG} Request: PCM {len(pcm_data)} B → WAV {len(wav_bytes)} B "
+                    f"→ base64 {len(b64)} B")
 
         try:
             resp = dashscope.MultiModalConversation.call(
@@ -45,33 +48,33 @@ class DashScopeASR:
                 asr_options={"enable_itn": False},
             )
         except Exception as e:
-            logger.error(f"ASR API call exception: {e}")
+            logger.error(f"{_TAG} API call exception: {e}")
             raise
 
         if resp.status_code != 200:
-            logger.error(f"ASR API error {resp.status_code}: {resp.message}")
+            logger.error(f"{_TAG} API error {resp.status_code}: {resp.message}")
             raise RuntimeError(f"API {resp.status_code}: {resp.message}")
 
-        logger.info(f"ASR API response: status={resp.status_code}, "
-                    f"request_id={getattr(resp, 'request_id', 'N/A')}")
+        logger.debug(f"{_TAG} Response: status={resp.status_code}, "
+                     f"request_id={getattr(resp, 'request_id', 'N/A')}")
 
         try:
             content = resp.output.choices[0].message.content
             if isinstance(content, list):
                 if not content:
-                    logger.warning(f"ASR returned content=[] (no speech detected?)")
+                    logger.warning(f"{_TAG} Returned content=[] (no speech detected?)")
                     return ""
                 text = content[0].get("text", "")
             else:
                 text = str(content) if content else ""
 
             if not text:
-                logger.warning(f"ASR returned empty text. Raw content: {content}")
+                logger.warning(f"{_TAG} Empty text. Raw: {content}")
             else:
-                logger.info(f"ASR result: {text[:100]}{'...' if len(text) > 100 else ''}")
+                logger.info(f"{_TAG} Result: {text[:100]}{'…' if len(text) > 100 else ''}")
 
             return text
         except Exception as e:
-            logger.error(f"ASR response parse error: {e}")
-            logger.error(f"Raw output: {resp.output}")
+            logger.error(f"{_TAG} Response parse error: {e}")
+            logger.error(f"{_TAG} Raw output: {resp.output}")
             return ""

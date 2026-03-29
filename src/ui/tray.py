@@ -597,6 +597,21 @@ class _ApiKeyDialog(QDialog):
         return self._result
 
 
+class _DeviceRefreshWorker(QThread):
+    """Enumerate audio devices off the main thread."""
+    done = pyqtSignal(str, list)  # default_device_name, device_list
+
+    def run(self):
+        from core.recorder import VoiceRecorder
+        try:
+            default_name = VoiceRecorder.get_default_device_name()
+            devices = VoiceRecorder.list_devices()
+        except Exception:
+            default_name = "Unknown"
+            devices = []
+        self.done.emit(default_name, devices)
+
+
 MENU_STYLE = """
     QMenu {
         background: #2a2a2a;
@@ -635,6 +650,7 @@ class VoiceTray(QSystemTrayIcon):
 
         self._key_warning = not config.api_key
         self._mic_warning = False
+        self._pending_device_apply = False
         if self._key_warning:
             self.setIcon(icons.icon_key_invalid())
             self._update_tooltip("API Key 未配置，右键点击配置")
@@ -695,10 +711,35 @@ class VoiceTray(QSystemTrayIcon):
             self._mode_menu.addAction(act)
         menu.addMenu(self._mode_menu)
 
+        self._polish_model_menu = QMenu("润色模型", menu)
+        self._polish_model_menu.setStyleSheet(MENU_STYLE)
+        self._polish_models = [
+            ("qwen3.5-flash", "Qwen3.5 Flash"),
+            ("qwen-flash", "Qwen Flash"),
+            ("qwen-plus", "Qwen Plus"),
+            ("qwen-max", "Qwen Max"),
+        ]
+        for model_id, display_name in self._polish_models:
+            act = QAction(display_name, self._polish_model_menu)
+            act.setCheckable(True)
+            act.setChecked(self._config.polish_model == model_id)
+            act.triggered.connect(lambda checked, m=model_id: self._set_polish_model(m))
+            self._polish_model_menu.addAction(act)
+        menu.addMenu(self._polish_model_menu)
+
         self._device_menu = QMenu("输入设备", menu)
         self._device_menu.setStyleSheet(MENU_STYLE)
-        self._refresh_devices()
+        self._cached_default_name = ""
+        self._cached_devices: list[dict] = []
+        self._device_refresh_worker: _DeviceRefreshWorker | None = None
+        self._device_menu.aboutToShow.connect(self._on_device_menu_show)
         menu.addMenu(self._device_menu)
+
+        self._act_save_audio = QAction("保存录音文件", menu)
+        self._act_save_audio.setCheckable(True)
+        self._act_save_audio.setChecked(self._config.save_audio)
+        self._act_save_audio.triggered.connect(self._toggle_save_audio)
+        menu.addAction(self._act_save_audio)
 
         menu.addSeparator()
 
@@ -721,26 +762,83 @@ class VoiceTray(QSystemTrayIcon):
         act_quit.triggered.connect(self._quit)
         menu.addAction(act_quit)
 
+        menu.aboutToShow.connect(self._async_refresh_devices)
         self.setContextMenu(menu)
 
-    def _refresh_devices(self):
-        self._device_menu.clear()
+        self._sync_refresh_devices()
+
+    def _sync_refresh_devices(self):
+        from core.recorder import VoiceRecorder
         try:
-            import pyaudio
-            pa = pyaudio.PyAudio()
-            for i in range(pa.get_device_count()):
-                info = pa.get_device_info_by_index(i)
-                if info.get("maxInputChannels", 0) > 0:
-                    name = info.get("name", f"Device {i}")
-                    act = QAction(name, self._device_menu)
-                    act.setCheckable(True)
-                    act.setChecked(self._config.mic_index == i)
-                    act.triggered.connect(lambda checked, idx=i: self._set_device(idx))
-                    self._device_menu.addAction(act)
-            pa.terminate()
+            self._cached_default_name = VoiceRecorder.get_default_device_name()
+            self._cached_devices = VoiceRecorder.list_devices()
         except Exception:
-            act = QAction("(无法枚举设备)", self._device_menu)
+            self._cached_default_name = "Unknown"
+            self._cached_devices = []
+        self._rebuild_device_menu()
+
+    def _async_refresh_devices(self):
+        if self._device_refresh_worker is not None:
+            return
+        w = _DeviceRefreshWorker()
+        w.done.connect(self._on_devices_refreshed)
+        w.finished.connect(self._on_device_worker_finished)
+        self._device_refresh_worker = w
+        w.start()
+
+    def _on_device_worker_finished(self):
+        if self._device_refresh_worker:
+            self._device_refresh_worker.deleteLater()
+            self._device_refresh_worker = None
+
+    def _on_devices_refreshed(self, default_name: str, devices: list):
+        self._cached_default_name = default_name
+        self._cached_devices = devices
+        logger.debug(f"[Tray] Device refresh (async): default='{default_name}', "
+                     f"{len(devices)} device(s)")
+        self._rebuild_device_menu()
+
+    def _on_device_menu_show(self):
+        """Synchronous refresh when device submenu opens — guarantees fresh data."""
+        if self._device_refresh_worker is not None:
+            self._device_refresh_worker.wait(2000)
+            self._on_device_worker_finished()
+        else:
+            from core.recorder import VoiceRecorder
+            try:
+                self._cached_default_name = VoiceRecorder.get_default_device_name()
+                self._cached_devices = VoiceRecorder.list_devices()
+                logger.debug(f"[Tray] Device refresh (sync): "
+                             f"default='{self._cached_default_name}', "
+                             f"{len(self._cached_devices)} device(s)")
+            except Exception:
+                self._cached_default_name = "Unknown"
+                self._cached_devices = []
+        self._rebuild_device_menu()
+
+    def _rebuild_device_menu(self):
+        self._device_menu.clear()
+
+        label = f"系统默认 ({self._cached_default_name})" if self._cached_default_name else "系统默认"
+        act_default = QAction(label, self._device_menu)
+        act_default.setCheckable(True)
+        act_default.setChecked(self._config.mic_index is None)
+        act_default.triggered.connect(lambda checked: self._set_device(None, ""))
+        self._device_menu.addAction(act_default)
+        self._device_menu.addSeparator()
+
+        if not self._cached_devices:
+            act = QAction("(未发现兼容设备)", self._device_menu)
             act.setEnabled(False)
+            self._device_menu.addAction(act)
+            return
+
+        for dev in self._cached_devices:
+            act = QAction(dev["name"], self._device_menu)
+            act.setCheckable(True)
+            act.setChecked(self._config.mic_index == dev["index"])
+            act.triggered.connect(
+                lambda checked, idx=dev["index"], name=dev["name"]: self._set_device(idx, name))
             self._device_menu.addAction(act)
 
     def _set_mode(self, mode_id: str):
@@ -748,6 +846,7 @@ class VoiceTray(QSystemTrayIcon):
         self._config.save()
         self._sync_mode_menu()
         self._mini.sync_mode()
+        logger.info(f"[Tray] Mode → {mode_id}")
 
     def _on_mini_mode_changed(self, mode_id: str):
         self._sync_mode_menu()
@@ -756,6 +855,15 @@ class VoiceTray(QSystemTrayIcon):
         for act in self._mode_menu.actions():
             mode_name_map = {"纯转录": "transcribe", "智能润色": "polish"}
             act.setChecked(mode_name_map.get(act.text(), "") == self._config.mode)
+
+    def _set_polish_model(self, model_id: str):
+        self._config.polish_model = model_id
+        self._config.save()
+        self._engine.polisher.set_model(model_id)
+        for act in self._polish_model_menu.actions():
+            mid = next((m for m, d in self._polish_models if d == act.text()), "")
+            act.setChecked(mid == model_id)
+        logger.info(f"[Tray] Polish model → {model_id}")
 
     def _configure_hotkey(self):
         self._hotkey.stop_hotkey()
@@ -776,7 +884,7 @@ class VoiceTray(QSystemTrayIcon):
         self._hotkey.start()
         display = _hotkey_display(new_key)
         self._act_hotkey.setText(f"快捷键: {display}")
-        logger.info(f"Hotkey changed to: {display}")
+        logger.info(f"[Tray] Hotkey → {display}")
 
     def _configure_apikey(self):
         dlg = _ApiKeyDialog(self._config.api_key)
@@ -785,19 +893,42 @@ class VoiceTray(QSystemTrayIcon):
         self._config.api_key = dlg.api_key
         self._config.save()
         self._engine.asr.api_key = dlg.api_key
-        self._engine.polisher._api_key = dlg.api_key
-        logger.info("API Key updated")
+        self._engine.polisher.update_api_key(dlg.api_key)
+        logger.info("[Tray] API Key updated")
         if dlg.api_key:
             self._set_key_warning(False)
 
-    def _set_device(self, idx: int):
-        self._config.mic_index = idx
+    def _toggle_save_audio(self, checked: bool):
+        self._config.save_audio = checked
         self._config.save()
-        self._engine.recorder.set_device(idx)
-        self._refresh_devices()
+        logger.info(f"[Tray] Save audio → {'on' if checked else 'off'}")
+
+    def _set_device(self, idx: int | None, name: str = ""):
+        self._config.mic_index = idx
+        self._config.mic_name = name
+        self._config.save()
+        if self._engine.state == "recording":
+            self._pending_device_apply = True
+            logger.info(f"[Tray] Input device saved for next session "
+                        f"→ {name or 'system default'} (index={idx})")
+            self.showMessage("VoiceInput", "输入设备已切换，下次录音生效",
+                             QSystemTrayIcon.MessageIcon.Information, 2000)
+        else:
+            self._pending_device_apply = False
+            self._engine.recorder.set_device(idx)
+            logger.info(f"[Tray] Input device → {name or 'system default'} (index={idx})")
+        self._rebuild_device_menu()
         if self._mic_warning:
             self._mic_warning = False
             self._restore_idle_icon()
+
+    def _maybe_apply_deferred_input_device(self):
+        if not self._pending_device_apply or self._engine.state == "recording":
+            return
+        self._pending_device_apply = False
+        idx = self._config.mic_index
+        self._engine.recorder.set_device(idx)
+        logger.info(f"[Tray] Deferred input device applied (index={idx})")
 
     # ── tray interaction ──
 
@@ -828,6 +959,8 @@ class VoiceTray(QSystemTrayIcon):
         self.setToolTip(f"VoiceInput — {status}")
 
     def _on_state(self, state: str):
+        if state != "recording":
+            self._maybe_apply_deferred_input_device()
         if state == "recording":
             self._mic_warning = False
             self.setIcon(icons.icon_recording())
@@ -859,6 +992,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_mic_unavailable(self):
         self._mic_warning = True
+        logger.warning("[Tray] Mic unavailable, showing notification")
         self.showMessage(
             "VoiceInput",
             "无法打开麦克风，请检查设备连接或在右键菜单中切换输入设备",
@@ -893,8 +1027,10 @@ class VoiceTray(QSystemTrayIcon):
         os.startfile(str(_LOG_DIR))
 
     def _quit(self):
+        logger.info("[Tray] Quit requested")
         if self._engine.state == "recording":
             self._engine.cancel()
+        self._engine.recorder.release()
         self._hotkey.stop_hotkey()
         self._hotkey.wait(2000)
         QApplication.quit()
