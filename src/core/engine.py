@@ -205,10 +205,8 @@ class VoiceEngine(QObject):
                     f"PCM {len(pcm)} bytes")
 
         if self.recorder.is_silent():
-            logger.warning(f"{_TAG} Audio silent (peak={self.recorder.peak_amplitude}), "
-                           f"skipping ASR")
-            self.error_occurred.emit("未检测到声音，请检查麦克风")
-            self.mic_unavailable.emit()
+            logger.info(f"{_TAG} Audio silent (peak={self.recorder.peak_amplitude}), "
+                        f"skipping ASR")
             self._set_state("ready")
             return
 

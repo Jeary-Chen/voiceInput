@@ -164,8 +164,12 @@ class ComboHotkeyThread(QThread):
         self._mouse_listener = None
 
     def run(self):
-        from pynput.keyboard import Listener as KBL
-        from pynput.mouse import Listener as ML
+        try:
+            from pynput.keyboard import Listener as KBL
+            from pynput.mouse import Listener as ML
+        except Exception:
+            logger.error("[Hotkey] Failed to import pynput listeners", exc_info=True)
+            return
 
         def kb_filter(msg, data):
             name = _VK_TO_NAME.get(data.vkCode)
@@ -198,14 +202,17 @@ class ComboHotkeyThread(QThread):
                 if name in self._mouse_keys:
                     self._active = False
 
-        self._kb_listener = KBL(win32_event_filter=kb_filter)
+        try:
+            self._kb_listener = KBL(win32_event_filter=kb_filter)
 
-        if self._mouse_keys:
-            self._mouse_listener = ML(on_click=on_click)
-            self._mouse_listener.start()
+            if self._mouse_keys:
+                self._mouse_listener = ML(on_click=on_click)
+                self._mouse_listener.start()
 
-        self._kb_listener.start()
-        self._kb_listener.join()
+            self._kb_listener.start()
+            self._kb_listener.join()
+        except Exception:
+            logger.error("[Hotkey] Listener crashed", exc_info=True)
 
     def stop_hotkey(self):
         if self._kb_listener:
