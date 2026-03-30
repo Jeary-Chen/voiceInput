@@ -258,6 +258,7 @@ class MiniRecordingWindow(QWidget):
     request_cancel = pyqtSignal()
     request_history = pyqtSignal()
     mode_changed = pyqtSignal(str)
+    show_result_changed = pyqtSignal(bool)
 
     def __init__(self, engine):
         super().__init__()
@@ -266,7 +267,7 @@ class MiniRecordingWindow(QWidget):
         self._recording_device = ""
         self._drag_pos = None
         self._hovered = False
-        self._show_result = False
+        self._show_result = engine.config.show_result_text
         self._anchor_x: int | None = engine.config.mini_window_x
 
         self.setWindowFlags(
@@ -384,6 +385,11 @@ class MiniRecordingWindow(QWidget):
         """Refresh polish button style after external mode change."""
         self._update_polish_style()
 
+    def sync_show_result(self):
+        """Refresh ◳ button after tray menu toggles show_result_text."""
+        self._show_result = self._engine.config.show_result_text
+        self._update_show_result_style()
+
     def _update_show_result_style(self):
         if self._show_result:
             self._btn_show_result.setStyleSheet(_BTN_STYLE.format(
@@ -400,7 +406,11 @@ class MiniRecordingWindow(QWidget):
 
     def _toggle_show_result(self):
         self._show_result = not self._show_result
+        cfg = self._engine.config
+        cfg.show_result_text = self._show_result
+        cfg.save()
         self._update_show_result_style()
+        self.show_result_changed.emit(self._show_result)
 
     def _style_action_record(self):
         self._btn_action.setText("●")
@@ -426,6 +436,14 @@ class MiniRecordingWindow(QWidget):
 
     def _hide_recording_status(self):
         self._status_popup.hide()
+
+    def refresh_visibility(self):
+        """Apply the current hide-when-idle preference to the minimal idle state."""
+        if not self._engine.config.hide_mini_window_when_idle:
+            self.show()
+            return
+        if self._mode == "idle" and self._engine.state == "ready":
+            self.hide()
 
     def _on_action_click(self):
         if self._mode == "hover":
@@ -461,9 +479,13 @@ class MiniRecordingWindow(QWidget):
                     easing=QEasingCurve.Type.OutCubic):
         self._target_size = (w, h)
         screen = QApplication.primaryScreen()
-        if not screen or not self.isVisible():
-            self._position_at(w, h)
+        if not screen:
             return
+        # Expanding from hidden: show first, keep idle-sized start rect, then animate.
+        if not self.isVisible():
+            self.show()
+            if self.width() < 2 or self.height() < 2:
+                self._position_at(IDLE_W, IDLE_H)
 
         geo = screen.availableGeometry()
         x = self._get_x_for_width(w)
@@ -486,6 +508,11 @@ class MiniRecordingWindow(QWidget):
         if self._mode == "shrinking":
             self._mode = "idle"
             self.update()
+            if (self._engine.config.hide_mini_window_when_idle
+                    and self._engine.state == "ready"):
+                self.hide()
+            else:
+                self.show()
 
     def _position_at(self, w, h):
         screen = QApplication.primaryScreen()
@@ -555,7 +582,6 @@ class MiniRecordingWindow(QWidget):
         logger.debug(f"[MiniWin] Engine state → {state} (was {self._mode})")
         if state == "recording":
             self._apply_recording()
-            self.show()
         elif state == "processing":
             self._apply_processing()
         elif state == "ready":

@@ -133,6 +133,10 @@ class VoiceEngine(QObject):
 
     def _start_recording(self):
         logger.info(f"{_TAG} Start recording (mode={self.config.mode})")
+        if self.recorder.no_device:
+            logger.warning(f"{_TAG} No input device available")
+            self.mic_unavailable.emit()
+            return
         self._record_t0 = time.monotonic()
         try:
             self.recorder.start(

@@ -18,6 +18,7 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from config import Config
 from core.log import logger, install_qt_handler
 from core.engine import VoiceEngine
+from ui import icons
 from ui.mini_window import MiniRecordingWindow
 from ui.tray import VoiceTray
 
@@ -37,6 +38,7 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("VoiceInput")
+    app.setWindowIcon(icons.app_icon())
     install_qt_handler()
 
     if _is_already_running():
@@ -61,7 +63,7 @@ def main():
     hotkey_display = config.hotkey.replace("+", " + ").title()
     logger.success(f"VoiceInput started. Press {hotkey_display} to record.")
 
-    mini.show()
+    mini.refresh_visibility()
 
     sys.exit(app.exec())
 

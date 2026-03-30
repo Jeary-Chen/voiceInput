@@ -76,10 +76,15 @@ class VoiceRecorder:
         self._max_channels: int = self.CHANNELS
         self._native_rate: int = 0
         self._prepared = False
+        self._no_device = False
 
     @property
     def is_recording(self) -> bool:
         return self._recording
+
+    @property
+    def no_device(self) -> bool:
+        return self._no_device
 
     @property
     def peak_amplitude(self) -> int:
@@ -110,6 +115,20 @@ class VoiceRecorder:
         t0 = time.perf_counter()
         self._pa = pyaudio.PyAudio()
         info = self._device_info()
+
+        if info is None:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            self._no_device = True
+            self._device_name = "Unknown"
+            self._native_rate = 0
+            self._max_channels = 0
+            self._stream_rate = self.TARGET_RATE
+            self._stream_channels = self.CHANNELS
+            logger.info(f"{_TAG} No input device | NO STREAM ({elapsed_ms:.0f}ms)")
+            self._prepared = True
+            return
+
+        self._no_device = False
         self._device_name = _fix_name(info.get("name", "Unknown"))
         self._native_rate = int(info.get("defaultSampleRate", 0))
         self._max_channels = int(info.get("maxInputChannels", self.CHANNELS))
@@ -299,7 +318,7 @@ class VoiceRecorder:
 
     # ── capability negotiation ──
 
-    def _device_info(self) -> dict:
+    def _device_info(self) -> dict | None:
         if self._device_index is not None:
             try:
                 return self._pa.get_device_info_by_index(self._device_index)
@@ -308,7 +327,11 @@ class VoiceRecorder:
                     f"{_TAG} Device index {self._device_index} no longer valid, "
                     f"falling back to system default")
                 self._device_index = None
-        return self._pa.get_default_input_device_info()
+        try:
+            return self._pa.get_default_input_device_info()
+        except OSError:
+            logger.warning(f"{_TAG} No default input device available")
+            return None
 
     def _negotiate_params(self) -> tuple[int, int]:
         """Choose best (rate, channels) using is_format_supported only.

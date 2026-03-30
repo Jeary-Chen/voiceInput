@@ -36,6 +36,8 @@ class Config:
     play_sounds: bool = True
     save_history: bool = True
     save_audio: bool = False
+    hide_mini_window_when_idle: bool = False
+    show_result_text: bool = False
 
     mini_window_x: int | None = None
 
@@ -67,7 +69,6 @@ class Config:
             "up", "down", "left", "right",
             "capslock", "numlock", "scrolllock", "printscreen", "pause",
             ";", "=", ",", "-", ".", "/", "`", "[", "\\", "]", "'",
-            "mouse_left", "mouse_right", "mouse_middle",
         }
         parts = [p.strip().lower() for p in cfg.hotkey.split("+")]
         if not parts or not all(p in _VALID_KEYS for p in parts):

@@ -73,8 +73,6 @@ _DISPLAY = {
     "lctrl": "L-Ctrl", "rctrl": "R-Ctrl",
     "lshift": "L-Shift", "rshift": "R-Shift",
     "lalt": "L-Alt", "ralt": "R-Alt",
-    "mouse_left": "鼠标左键", "mouse_right": "鼠标右键",
-    "mouse_middle": "鼠标中键",
     "space": "Space", "enter": "Enter", "tab": "Tab",
     "escape": "Esc", "backspace": "Backspace", "delete": "Delete",
     "insert": "Insert", "home": "Home", "end": "End",
@@ -98,14 +96,12 @@ def _hotkey_display(combo: str) -> str:
 
 
 _PYN_KEYS: dict = {}
-_PYN_BUTTONS: dict = {}
 
 
 def _init_pynput():
     if _PYN_KEYS:
         return
     from pynput.keyboard import Key
-    from pynput.mouse import Button
     _PYN_KEYS.update({
         Key.ctrl_l: "lctrl", Key.ctrl_r: "rctrl",
         Key.shift_l: "lshift", Key.shift_r: "rshift",
@@ -123,11 +119,6 @@ def _init_pynput():
         fk = getattr(Key, f"f{i}", None)
         if fk:
             _PYN_KEYS[fk] = f"f{i}"
-    _PYN_BUTTONS.update({
-        Button.left: "mouse_left",
-        Button.right: "mouse_right",
-        Button.middle: "mouse_middle",
-    })
 
 
 def _pyn_key(key) -> str | None:
@@ -142,12 +133,6 @@ def _pyn_key(key) -> str | None:
             return _VK_TO_NAME.get(key.vk)
     return None
 
-
-def _pyn_btn(button) -> str | None:
-    _init_pynput()
-    return _PYN_BUTTONS.get(button)
-
-
 class ComboHotkeyThread(QThread):
     """Global hotkey — order-independent combo detection with key suppression."""
     triggered = pyqtSignal()
@@ -156,17 +141,13 @@ class ComboHotkeyThread(QThread):
         super().__init__()
         parts = [p.strip().lower() for p in hotkey_str.split("+")]
         self._combo = frozenset(parts)
-        self._kb_keys = frozenset(p for p in parts if not p.startswith("mouse_"))
-        self._mouse_keys = frozenset(p for p in parts if p.startswith("mouse_"))
         self._pressed: set[str] = set()
         self._active = False
         self._kb_listener = None
-        self._mouse_listener = None
 
     def run(self):
         try:
             from pynput.keyboard import Listener as KBL
-            from pynput.mouse import Listener as ML
         except Exception:
             logger.error("[Hotkey] Failed to import pynput listeners", exc_info=True)
             return
@@ -181,34 +162,13 @@ class ComboHotkeyThread(QThread):
                 if was_new and self._pressed >= self._combo and not self._active:
                     self._active = True
                     self.triggered.emit()
-                    if name in self._kb_keys:
-                        self._kb_listener.suppress_event()
+                    self._kb_listener.suppress_event()
             elif msg in (0x0101, 0x0105):
                 self._pressed.discard(name)
-                if name in self._kb_keys:
-                    self._active = False
-
-        def on_click(x, y, button, pressed):
-            name = _pyn_btn(button)
-            if not name:
-                return
-            if pressed:
-                self._pressed.add(name)
-                if self._pressed >= self._combo and not self._active:
-                    self._active = True
-                    self.triggered.emit()
-            else:
-                self._pressed.discard(name)
-                if name in self._mouse_keys:
-                    self._active = False
+                self._active = False
 
         try:
             self._kb_listener = KBL(win32_event_filter=kb_filter)
-
-            if self._mouse_keys:
-                self._mouse_listener = ML(on_click=on_click)
-                self._mouse_listener.start()
-
             self._kb_listener.start()
             self._kb_listener.join()
         except Exception:
@@ -217,8 +177,6 @@ class ComboHotkeyThread(QThread):
     def stop_hotkey(self):
         if self._kb_listener:
             self._kb_listener.stop()
-        if self._mouse_listener:
-            self._mouse_listener.stop()
 
 
 _QT_KEY_NAMES = {
@@ -234,13 +192,6 @@ _QT_KEY_NAMES = {
     Qt.Key.Key_ScrollLock: "scrolllock",
     Qt.Key.Key_Print: "printscreen", Qt.Key.Key_Pause: "pause",
 }
-
-_QT_BTN_NAMES = {
-    Qt.MouseButton.LeftButton: "mouse_left",
-    Qt.MouseButton.RightButton: "mouse_right",
-    Qt.MouseButton.MiddleButton: "mouse_middle",
-}
-
 
 def _qt_key(key_code: int) -> str | None:
     if key_code in _QT_KEY_NAMES:
@@ -296,6 +247,7 @@ class _HotkeyDialog(QDialog):
     def __init__(self, current: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置快捷键")
+        self.setWindowIcon(icons.app_icon())
         self.setFixedSize(360, 180)
         self.setStyleSheet("background:#1e1e1e; color:#fff;")
         self._current = _canonical(current.split("+"))
@@ -314,7 +266,7 @@ class _HotkeyDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        hint = QLabel("同时按下新的快捷键组合（支持鼠标按键）：")
+        hint = QLabel("同时按下新的快捷键组合：")
         hint.setStyleSheet("font-size:13px;")
         layout.addWidget(hint)
 
@@ -393,24 +345,6 @@ class _HotkeyDialog(QDialog):
             name = _qt_key(key)
             if name:
                 self._pressed.discard(name)
-        if not self._pressed:
-            self._settle.start()
-
-    def mousePressEvent(self, event):
-        name = _QT_BTN_NAMES.get(event.button())
-        if not name:
-            return
-        event.accept()
-        self._settle.stop()
-        self._pressed.add(name)
-        if len(self._pressed) >= len(self._best):
-            self._best = set(self._pressed)
-            self._show_best()
-
-    def mouseReleaseEvent(self, event):
-        name = _QT_BTN_NAMES.get(event.button())
-        if name:
-            self._pressed.discard(name)
         if not self._pressed:
             self._settle.start()
 
@@ -509,6 +443,7 @@ class _ApiKeyDialog(QDialog):
     def __init__(self, current_key: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("配置 API Key")
+        self.setWindowIcon(icons.app_icon())
         self.setFixedSize(420, 150)
         self.setStyleSheet("background:#1e1e1e; color:#fff;")
         self._result: str | None = None
@@ -658,7 +593,6 @@ class VoiceTray(QSystemTrayIcon):
 
         engine.state_changed.connect(self._on_state)
         engine.transcription_done.connect(self._on_done)
-        engine.error_occurred.connect(self._on_error)
         engine.api_key_invalid.connect(self._on_key_invalid)
         engine.mic_unavailable.connect(self._on_mic_unavailable)
 
@@ -667,6 +601,7 @@ class VoiceTray(QSystemTrayIcon):
         mini.request_cancel.connect(self._on_cancel)
         mini.request_history.connect(self._open_history)
         mini.mode_changed.connect(self._on_mini_mode_changed)
+        mini.show_result_changed.connect(self._on_mini_show_result_changed)
 
         self._hotkey = ComboHotkeyThread(config.hotkey)
         self._hotkey.triggered.connect(self._on_hotkey)
@@ -741,6 +676,18 @@ class VoiceTray(QSystemTrayIcon):
         self._act_save_audio.triggered.connect(self._toggle_save_audio)
         menu.addAction(self._act_save_audio)
 
+        self._act_hide_idle_mini = QAction("空闲时隐藏顶部磁吸栏", menu)
+        self._act_hide_idle_mini.setCheckable(True)
+        self._act_hide_idle_mini.setChecked(self._config.hide_mini_window_when_idle)
+        self._act_hide_idle_mini.triggered.connect(self._toggle_hide_idle_mini)
+        menu.addAction(self._act_hide_idle_mini)
+
+        self._act_show_result_text = QAction("显示识别原文", menu)
+        self._act_show_result_text.setCheckable(True)
+        self._act_show_result_text.setChecked(self._config.show_result_text)
+        self._act_show_result_text.triggered.connect(self._toggle_show_result_text)
+        menu.addAction(self._act_show_result_text)
+
         menu.addSeparator()
 
         hotkey_display = _hotkey_display(self._config.hotkey)
@@ -776,6 +723,7 @@ class VoiceTray(QSystemTrayIcon):
             self._cached_default_name = "Unknown"
             self._cached_devices = []
         self._rebuild_device_menu()
+        self._restore_idle_icon()
 
     def _refresh_devices(self):
         """Release recorder's PyAudio so PortAudio re-scans, then enumerate.
@@ -802,6 +750,7 @@ class VoiceTray(QSystemTrayIcon):
             self._engine.recorder.prepare()
         self._auto_fallback_if_device_gone()
         self._rebuild_device_menu()
+        self._restore_idle_icon()
 
     def _auto_fallback_if_device_gone(self):
         """If the selected device is no longer present, switch to system default.
@@ -869,6 +818,11 @@ class VoiceTray(QSystemTrayIcon):
     def _on_mini_mode_changed(self, mode_id: str):
         self._sync_mode_menu()
 
+    def _on_mini_show_result_changed(self, on: bool):
+        self._act_show_result_text.blockSignals(True)
+        self._act_show_result_text.setChecked(on)
+        self._act_show_result_text.blockSignals(False)
+
     def _sync_mode_menu(self):
         for act in self._mode_menu.actions():
             mode_name_map = {"纯转录": "transcribe", "智能润色": "polish"}
@@ -921,6 +875,18 @@ class VoiceTray(QSystemTrayIcon):
         self._config.save()
         logger.info(f"[Tray] Save audio → {'on' if checked else 'off'}")
 
+    def _toggle_hide_idle_mini(self, checked: bool):
+        self._config.hide_mini_window_when_idle = checked
+        self._config.save()
+        self._mini.refresh_visibility()
+        logger.info(f"[Tray] Hide idle mini window → {'on' if checked else 'off'}")
+
+    def _toggle_show_result_text(self, checked: bool):
+        self._config.show_result_text = checked
+        self._config.save()
+        self._mini.sync_show_result()
+        logger.info(f"[Tray] Show result text → {'on' if checked else 'off'}")
+
     def _set_device(self, idx: int | None, name: str = ""):
         self._config.mic_index = idx
         self._config.mic_name = name
@@ -936,9 +902,8 @@ class VoiceTray(QSystemTrayIcon):
             self._engine.recorder.set_device(idx)
             logger.info(f"[Tray] Input device → {name or 'system default'} (index={idx})")
         self._rebuild_device_menu()
-        if self._mic_warning:
-            self._mic_warning = False
-            self._restore_idle_icon()
+        self._mic_warning = False
+        self._restore_idle_icon()
 
     def _maybe_apply_deferred_input_device(self):
         if not self._pending_device_apply or self._engine.state == "recording":
@@ -1000,23 +965,18 @@ class VoiceTray(QSystemTrayIcon):
         self._update_tooltip("就绪")
         QTimer.singleShot(2000, self._restore_idle_icon)
 
-    def _on_error(self, msg: str):
-        self.setIcon(icons.icon_warning())
-        self._update_tooltip("就绪")
-        QTimer.singleShot(2000, self._restore_idle_icon)
-
     def _on_key_invalid(self):
         self._key_warning = True
 
     def _on_mic_unavailable(self):
-        self._mic_warning = True
-        logger.warning("[Tray] Mic unavailable, showing notification")
-        self.showMessage(
-            "VoiceInput",
-            "无法打开麦克风，请检查设备连接或在右键菜单中切换输入设备",
-            QSystemTrayIcon.MessageIcon.Warning,
-            5000,
-        )
+        if self._engine.recorder.no_device:
+            msg = "未找到输入设备"
+        else:
+            self._mic_warning = True
+            msg = "无法打开麦克风，请检查设备连接或在右键菜单中切换输入设备"
+        logger.warning(f"[Tray] Mic unavailable: {msg}")
+        self.showMessage("VoiceInput", msg,
+                         QSystemTrayIcon.MessageIcon.Warning, 5000)
 
     def _set_key_warning(self, warning: bool):
         self._key_warning = warning
@@ -1026,6 +986,9 @@ class VoiceTray(QSystemTrayIcon):
         if self._key_warning:
             self.setIcon(icons.icon_key_invalid())
             self._update_tooltip("API Key 无效，右键点击配置")
+        elif self._engine.recorder.no_device:
+            self.setIcon(icons.icon_key_invalid())
+            self._update_tooltip("未找到输入设备")
         elif self._mic_warning:
             self.setIcon(icons.icon_key_invalid())
             self._update_tooltip("麦克风不可用，右键切换输入设备")

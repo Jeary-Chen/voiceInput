@@ -1,10 +1,14 @@
 """Tray icons — programmatic microphone with status dots."""
+import sys
+from pathlib import Path
+
 from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 
 from ui.theme import Theme
 
 _SIZE = 64
+_APP_ICON: QIcon | None = None
 
 
 def _draw_mic(p: QPainter, size: int) -> None:
@@ -48,6 +52,31 @@ def _make_icon(mic_color: QColor, dot_color: QColor | None = None) -> QIcon:
     return QIcon(pix)
 
 
+def app_icon() -> QIcon:
+    global _APP_ICON
+    if _APP_ICON is not None:
+        return _APP_ICON
+
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable))
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "assets" / "app_icon.ico")
+    candidates.append(Path(__file__).resolve().parents[2] / "assets" / "app_icon.ico")
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        icon = QIcon(str(path))
+        if not icon.isNull():
+            _APP_ICON = icon
+            return _APP_ICON
+
+    _APP_ICON = icon_idle()
+    return _APP_ICON
+
+
 def icon_idle() -> QIcon:
     return _make_icon(QColor(140, 140, 140))
 
@@ -62,10 +91,6 @@ def icon_processing() -> QIcon:
 
 def icon_done() -> QIcon:
     return _make_icon(QColor(80, 80, 80), Theme.COLOR_DONE)
-
-
-def icon_warning() -> QIcon:
-    return _make_icon(QColor(180, 60, 60), Theme.COLOR_WARNING)
 
 
 def icon_key_invalid() -> QIcon:
