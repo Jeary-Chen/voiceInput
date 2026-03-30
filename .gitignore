@@ -23,4 +23,5 @@ _reference/
 _release/
 
 # 未使用的静态资源
-src/ui/assets/
+src/ui/assets/*
+!src/ui/assets/app_icon.ico

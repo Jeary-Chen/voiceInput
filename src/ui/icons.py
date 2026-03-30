@@ -1,4 +1,4 @@
-"""Tray icons — programmatic microphone with status dots."""
+"""Tray icons and shared app icon helpers."""
 import sys
 from pathlib import Path
 
@@ -9,6 +9,21 @@ from ui.theme import Theme
 
 _SIZE = 64
 _APP_ICON: QIcon | None = None
+
+
+def _app_icon_candidates() -> list[Path]:
+    here = Path(__file__).resolve()
+    candidates: list[Path] = [
+        here.parent / "assets" / "app_icon.ico",
+    ]
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable))
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "ui" / "assets" / "app_icon.ico")
+        candidates.append(Path(meipass) / "assets" / "app_icon.ico")
+    candidates.append(here.parents[2] / "assets" / "app_icon.ico")
+    return candidates
 
 
 def _draw_mic(p: QPainter, size: int) -> None:
@@ -57,15 +72,7 @@ def app_icon() -> QIcon:
     if _APP_ICON is not None:
         return _APP_ICON
 
-    candidates: list[Path] = []
-    if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable))
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        candidates.append(Path(meipass) / "assets" / "app_icon.ico")
-    candidates.append(Path(__file__).resolve().parents[2] / "assets" / "app_icon.ico")
-
-    for path in candidates:
+    for path in _app_icon_candidates():
         if not path.is_file():
             continue
         icon = QIcon(str(path))
