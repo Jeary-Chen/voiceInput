@@ -148,6 +148,34 @@ class ComboHotkeyThread(QThread):
         self._active_time: float = 0.0
         self._kb_listener = None
 
+    def _is_combo_key(self, name: str | None) -> bool:
+        """True if this physical key belongs to the configured shortcut (incl. generic ctrl/shift/alt)."""
+        if not name:
+            return False
+        if name in self._combo:
+            return True
+        if "ctrl" in self._combo and name in ("lctrl", "rctrl"):
+            return True
+        if "shift" in self._combo and name in ("lshift", "rshift"):
+            return True
+        if "alt" in self._combo and name in ("lalt", "ralt"):
+            return True
+        return False
+
+    def _combo_fully_pressed(self) -> bool:
+        """Order-independent: every combo slot satisfied (generic mods match either side key)."""
+        for key in self._combo:
+            if key in self._pressed:
+                continue
+            if key == "ctrl" and ("lctrl" in self._pressed or "rctrl" in self._pressed):
+                continue
+            if key == "shift" and ("lshift" in self._pressed or "rshift" in self._pressed):
+                continue
+            if key == "alt" and ("lalt" in self._pressed or "ralt" in self._pressed):
+                continue
+            return False
+        return True
+
     def run(self):
         try:
             from pynput.keyboard import Listener as KBL
@@ -159,21 +187,24 @@ class ComboHotkeyThread(QThread):
             name = _VK_TO_NAME.get(data.vkCode)
             if not name:
                 return
+            combo_key = self._is_combo_key(name)
             if msg in (0x0100, 0x0104):
                 was_new = name not in self._pressed
                 self._pressed.add(name)
-                if was_new and self._pressed >= self._combo and not self._active:
+                if was_new and self._combo_fully_pressed() and not self._active:
                     self._active = True
                     self._active_time = time.monotonic()
                     self.triggered.emit()
+                if combo_key:
                     self._kb_listener.suppress_event()
             elif msg in (0x0101, 0x0105):
-                if self._active and name in self._combo:
+                if self._active and combo_key:
                     hold_ms = int((time.monotonic() - self._active_time) * 1000)
                     self._active = False
                     self.released.emit(hold_ms)
-                    self._kb_listener.suppress_event()
                 self._pressed.discard(name)
+                if combo_key:
+                    self._kb_listener.suppress_event()
 
         try:
             self._kb_listener = KBL(win32_event_filter=kb_filter)
