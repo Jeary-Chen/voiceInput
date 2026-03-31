@@ -42,7 +42,7 @@ class _RecStopButton(QWidget):
     clicked = pyqtSignal()
     cancelled = pyqtSignal()
 
-    CLICK_THRESHOLD_MS = 200
+    CLICK_THRESHOLD_MS = 300
     HOLD_MS = 500
     _TICK = 25
     SIZE = 26
@@ -56,6 +56,7 @@ class _RecStopButton(QWidget):
         self._progress = 0.0
         self._holding = False
         self._completed = False
+        self._external_hold = False
         self._elapsed_ms = 0
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(self._TICK)
@@ -71,7 +72,7 @@ class _RecStopButton(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
+        if e.button() == Qt.MouseButton.LeftButton and not self._external_hold:
             self._tick_timer.stop()
             was_holding = self._holding
             in_click_zone = self._elapsed_ms < self.CLICK_THRESHOLD_MS
@@ -93,6 +94,7 @@ class _RecStopButton(QWidget):
             self._progress = 0.0
             self._holding = False
             self._completed = True
+            self._external_hold = False
             self._elapsed_ms = 0
             self.update()
             self.cancelled.emit()
@@ -132,10 +134,33 @@ class _RecStopButton(QWidget):
         self.update()
 
     def leaveEvent(self, event):
-        if self._holding:
+        if self._holding and not self._external_hold:
             self._holding = False
             self._tick_timer.stop()
             self._progress = 0.0
+        self.update()
+
+    def start_external_hold(self, skip_click_threshold: bool = False):
+        """Begin the long-press progress animation from an external trigger."""
+        self._external_hold = True
+        self._holding = True
+        self._completed = False
+        if skip_click_threshold:
+            self._elapsed_ms = self.CLICK_THRESHOLD_MS + self._TICK
+            self._progress = min(self._TICK / self.HOLD_MS, 1.0)
+        else:
+            self._elapsed_ms = 0
+            self._progress = 0.0
+        self._tick_timer.start()
+        self.update()
+
+    def cancel_external_hold(self):
+        """Cancel an in-progress external hold (hotkey released early)."""
+        self._external_hold = False
+        self._tick_timer.stop()
+        self._holding = False
+        self._progress = 0.0
+        self._elapsed_ms = 0
         self.update()
 
 
@@ -264,7 +289,6 @@ class MiniRecordingWindow(QWidget):
         super().__init__()
         self._engine = engine
         self._mode = "idle"
-        self._recording_device = ""
         self._drag_pos = None
         self._hovered = False
         self._show_result = engine.config.show_result_text
@@ -291,6 +315,12 @@ class MiniRecordingWindow(QWidget):
         self._hover_timer = QTimer(self)
         self._hover_timer.setSingleShot(True)
         self._hover_timer.timeout.connect(self._on_hover_timeout)
+        self._hotkey_hold_timer = QTimer(self)
+        self._hotkey_hold_timer.setSingleShot(True)
+        self._hotkey_hold_timer.timeout.connect(self._begin_hotkey_hold_visuals)
+        self._deferred_shrink_timer = QTimer(self)
+        self._deferred_shrink_timer.setSingleShot(True)
+        self._deferred_shrink_timer.timeout.connect(self._shrink_to_idle)
 
         engine.state_changed.connect(self._on_engine_state)
         engine.audio_data.connect(self._on_audio)
@@ -423,9 +453,36 @@ class MiniRecordingWindow(QWidget):
     def _on_cancel(self):
         self.request_cancel.emit()
 
+    def start_hotkey_hold(self):
+        """External trigger: delay stop button until hold becomes a long-press."""
+        if self._mode != "recording":
+            return
+        self._hotkey_hold_timer.start(self.hotkey_click_threshold_ms())
+
+    def stop_hotkey_hold(self):
+        """External trigger: cancel the long-press animation (short press release)."""
+        self._hotkey_hold_timer.stop()
+        self._btn_rec_stop.cancel_external_hold()
+        if not self._hovered:
+            self._btn_rec_stop.setVisible(False)
+            self._animate_to(REC_W, REC_H, 150)
+
+    def hotkey_click_threshold_ms(self) -> int:
+        """Return the short-press threshold shared with the stop button."""
+        return self._btn_rec_stop.CLICK_THRESHOLD_MS
+
+    def _begin_hotkey_hold_visuals(self):
+        """Show the stop button only after the short-press window has passed."""
+        if self._mode != "recording":
+            return
+        self._btn_rec_stop.setVisible(True)
+        if not self._hovered:
+            self._animate_to(REC_HOVER_W, REC_H, 150)
+        self._btn_rec_stop.start_external_hold(skip_click_threshold=True)
+
     def _show_recording_status(self):
         items: list[str] = []
-        dev = self._recording_device
+        dev = self._engine.recorder.device_name
         if dev:
             items.append(f"🎤 {dev}")
         cfg = self._engine.config
@@ -436,6 +493,13 @@ class MiniRecordingWindow(QWidget):
 
     def _hide_recording_status(self):
         self._status_popup.hide()
+
+    def _cancel_deferred_shrink(self):
+        self._deferred_shrink_timer.stop()
+
+    def _schedule_deferred_shrink(self, delay_ms: int):
+        self._cancel_deferred_shrink()
+        self._deferred_shrink_timer.start(delay_ms)
 
     def refresh_visibility(self):
         """Apply the current hide-when-idle preference to the minimal idle state."""
@@ -536,8 +600,8 @@ class MiniRecordingWindow(QWidget):
                          QEasingCurve.Type.InOutQuart)
 
     def _apply_recording(self):
+        self._cancel_deferred_shrink()
         self._mode = "recording"
-        self._recording_device = self._engine.recorder.device_name
         self._waveform.reset()
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_RECORDING.name()};")
 
@@ -556,6 +620,7 @@ class MiniRecordingWindow(QWidget):
             self._animate_to(REC_W, REC_H, 280)
 
     def _apply_processing(self):
+        self._cancel_deferred_shrink()
         self._mode = "processing"
         self._waveform.freeze()
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_PROCESSING.name()};")
@@ -567,6 +632,8 @@ class MiniRecordingWindow(QWidget):
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_DONE.name()};")
 
     def _shrink_to_idle(self):
+        if self._engine.state != "ready":
+            return
         if self._mode in ("idle", "shrinking"):
             return
         self._mode = "shrinking"
@@ -596,12 +663,12 @@ class MiniRecordingWindow(QWidget):
         self._apply_done()
         if self._show_result:
             self._result_popup.show_text(text, self)
-        QTimer.singleShot(800, self._shrink_to_idle)
+        self._schedule_deferred_shrink(800)
 
     def _on_error(self, msg: str):
         logger.debug(f"[MiniWin] Error received: {msg}")
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_WARNING.name()};")
-        QTimer.singleShot(1500, self._shrink_to_idle)
+        self._schedule_deferred_shrink(1500)
 
     def _on_hover_timeout(self):
         if not self._hovered and self._mode == "hover":

@@ -1,5 +1,6 @@
 import ctypes
 import os
+import time
 
 from PyQt6.QtCore import Qt, QEvent, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence
@@ -136,6 +137,7 @@ def _pyn_key(key) -> str | None:
 class ComboHotkeyThread(QThread):
     """Global hotkey — order-independent combo detection with key suppression."""
     triggered = pyqtSignal()
+    released = pyqtSignal(int)  # hold duration in ms
 
     def __init__(self, hotkey_str: str):
         super().__init__()
@@ -143,6 +145,7 @@ class ComboHotkeyThread(QThread):
         self._combo = frozenset(parts)
         self._pressed: set[str] = set()
         self._active = False
+        self._active_time: float = 0.0
         self._kb_listener = None
 
     def run(self):
@@ -161,11 +164,16 @@ class ComboHotkeyThread(QThread):
                 self._pressed.add(name)
                 if was_new and self._pressed >= self._combo and not self._active:
                     self._active = True
+                    self._active_time = time.monotonic()
                     self.triggered.emit()
                     self._kb_listener.suppress_event()
             elif msg in (0x0101, 0x0105):
+                if self._active and name in self._combo:
+                    hold_ms = int((time.monotonic() - self._active_time) * 1000)
+                    self._active = False
+                    self.released.emit(hold_ms)
+                    self._kb_listener.suppress_event()
                 self._pressed.discard(name)
-                self._active = False
 
         try:
             self._kb_listener = KBL(win32_event_filter=kb_filter)
@@ -596,15 +604,17 @@ class VoiceTray(QSystemTrayIcon):
         engine.api_key_invalid.connect(self._on_key_invalid)
         engine.mic_unavailable.connect(self._on_mic_unavailable)
 
-        mini.request_record.connect(self._on_hotkey)
-        mini.request_stop.connect(self._on_hotkey)
+        mini.request_record.connect(self._on_tray_click)
+        mini.request_stop.connect(self._on_tray_click)
         mini.request_cancel.connect(self._on_cancel)
         mini.request_history.connect(self._open_history)
         mini.mode_changed.connect(self._on_mini_mode_changed)
         mini.show_result_changed.connect(self._on_mini_show_result_changed)
 
+        self._hotkey_hold_active = False
         self._hotkey = ComboHotkeyThread(config.hotkey)
         self._hotkey.triggered.connect(self._on_hotkey)
+        self._hotkey.released.connect(self._on_hotkey_release)
         self._hotkey.start()
 
         from core.device_watcher import AudioDeviceWatcher
@@ -612,7 +622,7 @@ class VoiceTray(QSystemTrayIcon):
         self._device_change_timer = QTimer()
         self._device_change_timer.setSingleShot(True)
         self._device_change_timer.setInterval(500)
-        self._device_change_timer.timeout.connect(self._refresh_devices)
+        self._device_change_timer.timeout.connect(self._start_async_refresh)
         self._device_watcher.signals.changed.connect(self._device_change_timer.start)
         self._device_watcher.start()
 
@@ -623,7 +633,7 @@ class VoiceTray(QSystemTrayIcon):
         menu.setStyleSheet(MENU_STYLE)
 
         self._act_record = QAction("开始录音", menu)
-        self._act_record.triggered.connect(self._on_hotkey)
+        self._act_record.triggered.connect(self._on_tray_click)
         menu.addAction(self._act_record)
 
         menu.addSeparator()
@@ -666,9 +676,20 @@ class VoiceTray(QSystemTrayIcon):
 
         self._device_menu = QMenu("输入设备", menu)
         self._device_menu.setStyleSheet(MENU_STYLE)
+        self._device_menu.aboutToShow.connect(self._on_device_menu_show)
         self._cached_default_name = ""
         self._cached_devices: list[dict] = []
+        self._dev_refresh_running = False
+        self._dev_refresh_scheduled = False
+        self._dev_refresh_repeat = False
+        self._dev_refresh_ready = False
         menu.addMenu(self._device_menu)
+
+        self._act_show_result_text = QAction("显示识别原文", menu)
+        self._act_show_result_text.setCheckable(True)
+        self._act_show_result_text.setChecked(self._config.show_result_text)
+        self._act_show_result_text.triggered.connect(self._toggle_show_result_text)
+        menu.addAction(self._act_show_result_text)
 
         self._act_save_audio = QAction("保存录音文件", menu)
         self._act_save_audio.setCheckable(True)
@@ -681,12 +702,6 @@ class VoiceTray(QSystemTrayIcon):
         self._act_hide_idle_mini.setChecked(self._config.hide_mini_window_when_idle)
         self._act_hide_idle_mini.triggered.connect(self._toggle_hide_idle_mini)
         menu.addAction(self._act_hide_idle_mini)
-
-        self._act_show_result_text = QAction("显示识别原文", menu)
-        self._act_show_result_text.setCheckable(True)
-        self._act_show_result_text.setChecked(self._config.show_result_text)
-        self._act_show_result_text.triggered.connect(self._toggle_show_result_text)
-        menu.addAction(self._act_show_result_text)
 
         menu.addSeparator()
 
@@ -709,48 +724,115 @@ class VoiceTray(QSystemTrayIcon):
         act_quit.triggered.connect(self._quit)
         menu.addAction(act_quit)
 
-        menu.aboutToShow.connect(self._refresh_devices)
+        menu.aboutToShow.connect(self._start_async_refresh)
         self.setContextMenu(menu)
 
-        self._sync_refresh_devices()
+        self._start_async_refresh()
 
-    def _sync_refresh_devices(self):
-        from core.recorder import VoiceRecorder
-        try:
-            self._cached_default_name = VoiceRecorder.get_default_device_name()
-            self._cached_devices = VoiceRecorder.list_devices()
-        except Exception:
-            self._cached_default_name = "Unknown"
-            self._cached_devices = []
-        self._rebuild_device_menu()
-        self._restore_idle_icon()
+    # ── device refresh (async) ──
 
-    def _refresh_devices(self):
-        """Release recorder's PyAudio so PortAudio re-scans, then enumerate.
-
-        PortAudio caches the device list per-process as long as any context
-        is alive.  Temporarily releasing the recorder's PyAudio forces
-        Pa_Initialize to re-scan the OS device tree on next call.
-        """
-        need_reopen = (self._engine.state != "recording"
-                       and self._engine.recorder._pa is not None)
-        if need_reopen:
+    def _release_all_pa(self):
+        """Release ALL PyAudio instances so PortAudio re-scans on next init."""
+        if (self._engine.state != "recording"
+                and self._engine.recorder._pa is not None):
             self._engine.recorder._release_pa()
-        from core.recorder import VoiceRecorder
-        try:
-            self._cached_default_name = VoiceRecorder.get_default_device_name()
-            self._cached_devices = VoiceRecorder.list_devices()
-            logger.debug(f"[Tray] Device refresh: "
-                         f"default='{self._cached_default_name}', "
-                         f"{len(self._cached_devices)} device(s)")
-        except Exception:
-            self._cached_default_name = "Unknown"
-            self._cached_devices = []
-        if need_reopen:
+        self._audio.release()
+
+    def _restore_all_pa(self):
+        """Re-create PyAudio instances after enumeration (idempotent)."""
+        if not self._audio._stream_ready:
+            self._audio._init_stream()
+        if self._engine.recorder._pa is None and self._engine.state != "recording":
             self._engine.recorder.prepare()
+
+    def _start_async_refresh(self):
+        """Schedule a device refresh after the menu is shown."""
+        if self._dev_refresh_running or self._dev_refresh_scheduled:
+            self._dev_refresh_repeat = True
+            return
+        self._dev_refresh_ready = False
+        self._dev_refresh_scheduled = True
+        QTimer.singleShot(0, self._run_refresh_devices)
+
+    def _run_refresh_devices(self):
+        """Main-thread refresh: release PyAudio, enumerate, then restore."""
+        self._dev_refresh_scheduled = False
+        if self._dev_refresh_running:
+            self._dev_refresh_repeat = True
+            return
+        self._dev_refresh_running = True
+
+        from core.recorder import VoiceRecorder
+        from core.device_watcher import (
+            get_default_capture_device_name,
+            get_full_device_names,
+        )
+        try:
+            self._release_all_pa()
+            full_names = get_full_device_names()
+            default_name = get_default_capture_device_name() or VoiceRecorder.get_default_device_name()
+            raw_devices = VoiceRecorder.list_devices()
+            raw_by_name = {dev["name"]: dev for dev in raw_devices}
+            if full_names:
+                devices = [
+                    {
+                        "name": trunc,
+                        "display_name": full,
+                        "index": raw_by_name.get(trunc, {}).get("index"),
+                    }
+                    for trunc, full in full_names.items()
+                ]
+            else:
+                devices = raw_devices
+            if default_name:
+                trunc = default_name[:31]
+                if trunc in full_names:
+                    default_name = full_names[trunc]
+        except Exception:
+            default_name = "Unknown"
+            devices = []
+        self._cached_default_name = default_name
+        self._cached_devices = devices
+        self._dev_refresh_ready = True
+        logger.info(f"[Tray] Device refresh done: "
+                    f"default='{default_name}', {len(devices)} device(s)")
+        self._on_refresh_done()
+        self._dev_refresh_running = False
+        if self._dev_refresh_repeat:
+            self._dev_refresh_repeat = False
+            self._start_async_refresh()
+
+    def _on_refresh_done(self):
+        """Main-thread callback after background refresh completes."""
+        self._restore_all_pa()
+        self._sync_system_default_device()
         self._auto_fallback_if_device_gone()
         self._rebuild_device_menu()
-        self._restore_idle_icon()
+        self._sync_tray_icon_with_engine()
+
+    def _on_device_menu_show(self):
+        """When user opens '输入设备', wait for the ongoing refresh to finish."""
+        if not self._dev_refresh_ready:
+            deadline = time.monotonic() + 3.0
+            while not self._dev_refresh_ready and time.monotonic() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.01)
+        self._rebuild_device_menu()
+
+    def _sync_system_default_device(self):
+        """If following system default, rebind recorder when default device changed."""
+        if self._config.mic_name:
+            return
+        current_default = self._cached_default_name or ""
+        recorder_name = self._engine.recorder.device_name or ""
+        if not current_default or recorder_name == current_default:
+            return
+        if self._engine.state != "recording":
+            self._engine.recorder.set_device(None, "")
+            logger.info(f"[Tray] System default device changed: '{recorder_name}' -> '{current_default}'")
+        else:
+            self._pending_device_apply = True
+            logger.info(f"[Tray] System default changed during recording, will apply: '{current_default}'")
 
     def _auto_fallback_if_device_gone(self):
         """If the selected device is no longer present, switch to system default.
@@ -759,17 +841,28 @@ class VoiceTray(QSystemTrayIcon):
         name.  If the same-named device still exists but its index changed,
         we silently update the stored index.
         """
-        if self._config.mic_index is None:
+        if not self._config.mic_name:
             return
         saved_name = self._config.mic_name
         match = next((d for d in self._cached_devices if d["name"] == saved_name), None)
         if match is not None:
-            if match["index"] != self._config.mic_index:
+            if match["index"] is None and self._config.mic_index is not None:
+                self._config.mic_index = None
+                self._config.save()
+                if self._engine.state != "recording":
+                    self._engine.recorder.set_device(None, saved_name)
+                else:
+                    self._pending_device_apply = True
+                logger.info(f"[Tray] Device '{saved_name}' temporarily unresolved, cleared stale index")
+                return
+            if match["index"] is not None and match["index"] != self._config.mic_index:
                 old_idx = self._config.mic_index
                 self._config.mic_index = match["index"]
                 self._config.save()
                 if self._engine.state != "recording":
-                    self._engine.recorder.set_device(match["index"])
+                    self._engine.recorder.set_device(match["index"], saved_name)
+                else:
+                    self._pending_device_apply = True
                 logger.info(f"[Tray] Device '{saved_name}' index changed "
                             f"{old_idx} → {match['index']}")
             return
@@ -778,7 +871,9 @@ class VoiceTray(QSystemTrayIcon):
         self._config.mic_name = ""
         self._config.save()
         if self._engine.state != "recording":
-            self._engine.recorder.set_device(None)
+            self._engine.recorder.set_device(None, "")
+        else:
+            self._pending_device_apply = True
         logger.info(f"[Tray] Selected device '{saved_name}' (index={old}) gone, "
                     f"switched to system default")
 
@@ -788,8 +883,8 @@ class VoiceTray(QSystemTrayIcon):
         label = f"系统默认 ({self._cached_default_name})" if self._cached_default_name else "系统默认"
         act_default = QAction(label, self._device_menu)
         act_default.setCheckable(True)
-        act_default.setChecked(self._config.mic_index is None)
-        act_default.triggered.connect(lambda checked: self._set_device(None, ""))
+        act_default.setChecked(not self._config.mic_name)
+        act_default.triggered.connect(lambda checked: self._set_default_device())
         self._device_menu.addAction(act_default)
         self._device_menu.addSeparator()
 
@@ -800,12 +895,12 @@ class VoiceTray(QSystemTrayIcon):
             return
 
         for dev in self._cached_devices:
-            act = QAction(dev["name"], self._device_menu)
+            display = dev.get("display_name", dev["name"])
+            act = QAction(display, self._device_menu)
             act.setCheckable(True)
-            act.setChecked(self._config.mic_name == dev["name"]
-                           and self._config.mic_index is not None)
+            act.setChecked(self._config.mic_name == dev["name"])
             act.triggered.connect(
-                lambda checked, idx=dev["index"], name=dev["name"]: self._set_device(idx, name))
+                lambda checked, idx=dev.get("index"), name=dev["name"]: self._set_device(name, idx))
             self._device_menu.addAction(act)
 
     def _set_mode(self, mode_id: str):
@@ -845,6 +940,7 @@ class VoiceTray(QSystemTrayIcon):
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.hotkey:
             self._hotkey = ComboHotkeyThread(self._config.hotkey)
             self._hotkey.triggered.connect(self._on_hotkey)
+            self._hotkey.released.connect(self._on_hotkey_release)
             self._hotkey.start()
             return
 
@@ -853,6 +949,7 @@ class VoiceTray(QSystemTrayIcon):
         self._config.save()
         self._hotkey = ComboHotkeyThread(new_key)
         self._hotkey.triggered.connect(self._on_hotkey)
+        self._hotkey.released.connect(self._on_hotkey_release)
         self._hotkey.start()
         display = _hotkey_display(new_key)
         self._act_hotkey.setText(f"快捷键: {display}")
@@ -887,39 +984,72 @@ class VoiceTray(QSystemTrayIcon):
         self._mini.sync_show_result()
         logger.info(f"[Tray] Show result text → {'on' if checked else 'off'}")
 
-    def _set_device(self, idx: int | None, name: str = ""):
-        self._config.mic_index = idx
-        self._config.mic_name = name
+    def _set_default_device(self):
+        self._config.mic_index = None
+        self._config.mic_name = ""
         self._config.save()
         if self._engine.state == "recording":
             self._pending_device_apply = True
-            logger.info(f"[Tray] Input device saved for next session "
-                        f"→ {name or 'system default'} (index={idx})")
+            logger.info("[Tray] Input device saved for next session → system default")
             self.showMessage("VoiceInput", "输入设备已切换，下次录音生效",
                              QSystemTrayIcon.MessageIcon.Information, 2000)
         else:
             self._pending_device_apply = False
-            self._engine.recorder.set_device(idx)
-            logger.info(f"[Tray] Input device → {name or 'system default'} (index={idx})")
+            self._engine.recorder.set_device(None, "")
+            logger.info("[Tray] Input device → system default (index=None)")
         self._rebuild_device_menu()
         self._mic_warning = False
-        self._restore_idle_icon()
+        self._sync_tray_icon_with_engine()
+
+    def _set_device(self, name: str, idx: int | None = None):
+        resolved = idx if idx is not None else None
+        self._config.mic_name = name
+        self._config.mic_index = resolved
+        self._config.save()
+        if self._engine.state == "recording":
+            self._pending_device_apply = True
+            logger.info(f"[Tray] Input device saved for next session "
+                        f"→ {name} (index={resolved})")
+            self.showMessage("VoiceInput", "输入设备已切换，下次录音生效",
+                             QSystemTrayIcon.MessageIcon.Information, 2000)
+        else:
+            self._pending_device_apply = False
+            self._engine.recorder.set_device(resolved, name)
+            logger.info(f"[Tray] Input device → {name} (index={resolved})")
+        self._rebuild_device_menu()
+        self._mic_warning = False
+        self._sync_tray_icon_with_engine()
 
     def _maybe_apply_deferred_input_device(self):
         if not self._pending_device_apply or self._engine.state == "recording":
             return
         self._pending_device_apply = False
         idx = self._config.mic_index
-        self._engine.recorder.set_device(idx)
-        logger.info(f"[Tray] Deferred input device applied (index={idx})")
+        name = self._config.mic_name
+        self._engine.recorder.set_device(idx, name)
+        logger.info(f"[Tray] Deferred input device applied (name='{name or 'system default'}', index={idx})")
 
     # ── tray interaction ──
 
     def _on_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self._on_hotkey()
+            self._on_tray_click()
+
+    def _on_tray_click(self):
+        """Tray icon click: simple toggle, no hold-to-cancel."""
+        if self._engine.state == "processing":
+            return
+        if self._engine.state == "ready":
+            if not self._config.api_key:
+                self._configure_apikey()
+                return
+            self._audio.play_start()
+        elif self._engine.state == "recording":
+            self._audio.play_stop()
+        self._engine.toggle_record()
 
     def _on_cancel(self):
+        self._hotkey_hold_active = False
         if self._engine.state == "recording":
             self._audio.play_stop()
             self._engine.cancel()
@@ -932,30 +1062,52 @@ class VoiceTray(QSystemTrayIcon):
                 self._configure_apikey()
                 return
             self._audio.play_start()
+            self._engine.toggle_record()
         elif self._engine.state == "recording":
+            self._hotkey_hold_active = True
+            self._mini.start_hotkey_hold()
+
+    def _on_hotkey_release(self, hold_ms: int):
+        if not self._hotkey_hold_active:
+            return
+        self._hotkey_hold_active = False
+        if self._engine.state != "recording":
+            self._mini.stop_hotkey_hold()
+            return
+        self._mini.stop_hotkey_hold()
+        if hold_ms < self._mini.hotkey_click_threshold_ms():
             self._audio.play_stop()
-        self._engine.toggle_record()
+            self._engine.toggle_record()
 
     # ── engine state ──
 
     def _update_tooltip(self, status: str):
         self.setToolTip(f"VoiceInput — {status}")
 
+    def _sync_tray_icon_with_engine(self):
+        """Align icon and primary tooltip with engine state (e.g. after menu device refresh)."""
+        st = self._engine.state
+        if st == "recording":
+            self.setIcon(icons.icon_recording())
+            self._update_tooltip("录音中")
+        elif st == "processing":
+            self.setIcon(icons.icon_processing())
+            self._update_tooltip("识别中")
+        else:
+            self._restore_idle_icon()
+
     def _on_state(self, state: str):
         if state != "recording":
             self._maybe_apply_deferred_input_device()
         if state == "recording":
             self._mic_warning = False
-            self.setIcon(icons.icon_recording())
-            self._update_tooltip("录音中")
+        self._sync_tray_icon_with_engine()
+        if state == "recording":
             self._act_record.setText("停止录音")
         elif state == "processing":
-            self.setIcon(icons.icon_processing())
-            self._update_tooltip("识别中")
             self._act_record.setText("处理中...")
             self._act_record.setEnabled(False)
         elif state == "ready":
-            self._restore_idle_icon()
             self._act_record.setText("开始录音")
             self._act_record.setEnabled(True)
 
@@ -983,6 +1135,9 @@ class VoiceTray(QSystemTrayIcon):
         self._restore_idle_icon()
 
     def _restore_idle_icon(self):
+        if self._engine.state in ("recording", "processing"):
+            self._sync_tray_icon_with_engine()
+            return
         if self._key_warning:
             self.setIcon(icons.icon_key_invalid())
             self._update_tooltip("API Key 无效，右键点击配置")

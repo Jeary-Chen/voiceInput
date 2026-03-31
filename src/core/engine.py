@@ -69,14 +69,14 @@ class VoiceEngine(QObject):
         super().__init__()
         self.config = config
 
-        resolved = VoiceRecorder.resolve_device(config.mic_name, config.mic_index)
-        if resolved != config.mic_index:
-            config.mic_index = resolved
-            if resolved is None:
-                config.mic_name = ""
-            config.save()
+        resolved = None
+        if config.mic_name:
+            resolved = VoiceRecorder.resolve_device(config.mic_name, config.mic_index)
+            if resolved != config.mic_index:
+                config.mic_index = resolved
+                config.save()
 
-        self.recorder = VoiceRecorder(device_index=resolved)
+        self.recorder = VoiceRecorder(device_index=resolved, preferred_name=config.mic_name)
         self.recorder.prepare()
         self.asr = DashScopeASR(
             api_key=config.api_key,

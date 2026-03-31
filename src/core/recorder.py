@@ -55,8 +55,9 @@ class VoiceRecorder:
     MAX_DURATION = 600       # 10 min hard cap
     SILENCE_THRESHOLD = 200  # peak int16 amplitude below this = silence
 
-    def __init__(self, device_index: int | None = None):
+    def __init__(self, device_index: int | None = None, preferred_name: str = ""):
         self._device_index = device_index
+        self._preferred_name = preferred_name
         self._pa: pyaudio.PyAudio | None = None
         self._stream: pyaudio.Stream | None = None
         self._audio_chunks: list[bytes] = []
@@ -158,10 +159,15 @@ class VoiceRecorder:
         self._release_pa()
         self._prepared = False
 
-    def set_device(self, index: int | None):
+    def set_device(self, index: int | None, preferred_name: str = ""):
         old = self._device_index
+        old_name = self._preferred_name
         self._device_index = index
-        logger.info(f"{_TAG} Device changed: {old} → {index}")
+        self._preferred_name = preferred_name
+        logger.info(
+            f"{_TAG} Device changed: index {old} → {index}, "
+            f"name '{old_name or 'system default'}' → '{preferred_name or 'system default'}'"
+        )
         self.prepare()
 
     # ── recording lifecycle ──
@@ -319,6 +325,8 @@ class VoiceRecorder:
     # ── capability negotiation ──
 
     def _device_info(self) -> dict | None:
+        if self._preferred_name and self._device_index is None:
+            self._device_index = self.resolve_device(self._preferred_name, None)
         if self._device_index is not None:
             try:
                 return self._pa.get_device_info_by_index(self._device_index)
@@ -328,7 +336,16 @@ class VoiceRecorder:
                     f"falling back to system default")
                 self._device_index = None
         try:
-            return self._pa.get_default_input_device_info()
+            info = self._pa.get_default_input_device_info()
+            try:
+                from core.device_watcher import get_default_capture_device_name
+                full_name = get_default_capture_device_name()
+                if full_name:
+                    info = dict(info)
+                    info["name"] = full_name
+            except Exception:
+                pass
+            return info
         except OSError:
             logger.warning(f"{_TAG} No default input device available")
             return None
@@ -496,7 +513,7 @@ class VoiceRecorder:
                                     f"moved: {saved_index} → {dev['index']}")
                     return dev["index"]
             logger.warning(f"{_TAG} Saved device '{saved_name}' not found "
-                           f"in current device list, using system default")
+                           f"in current device list")
             return None
 
         logger.warning(f"{_TAG} No device name saved (legacy config), "
