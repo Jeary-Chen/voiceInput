@@ -1,8 +1,10 @@
 import ctypes
 import os
+import sys
+import threading
 import time
 
-from PyQt6.QtCore import Qt, QEvent, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtCore import Qt, QEvent, QObject, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence
 from PyQt6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication,
@@ -19,7 +21,7 @@ from ui import icons
 
 
 _MOD_KEYS = frozenset({
-    "ctrl", "shift", "alt",
+    "ctrl", "shift", "alt", "capslock",
     "lctrl", "rctrl", "lshift", "rshift", "lalt", "ralt",
 })
 
@@ -225,6 +227,76 @@ class ComboHotkeyThread(QThread):
             self._kb_listener.stop()
 
 
+class _HotkeyGrabSignals(QObject):
+    key_down = pyqtSignal(str)
+    key_up = pyqtSignal(str)
+
+
+class _PynputHotkeyGrabWorker(threading.Thread):
+    """快捷键设置窗：pynput ``WH_KEYBOARD_LL`` + ``win32_event_filter`` 全局拦键。
+
+    ``suppress_event()`` 会抛 ``SuppressException`` 以拦键；须先 ``emit`` 再 ``suppress``。
+    若 ``emit`` 时 ``QObject`` 已析构（关窗与卸钩竞态），捕获 ``RuntimeError`` 并
+    ``return False``，本键交还系统，**不得**再 ``suppress``，以免整机键盘卡死。
+    """
+    def __init__(self, sigs: _HotkeyGrabSignals):
+        super().__init__(name="HotkeyGrabPynput", daemon=True)
+        self._sigs = sigs
+        self._stop_requested = False
+        self._kb_listener = None
+
+    def stop_grab(self):
+        self._stop_requested = True
+        listener = self._kb_listener
+        if listener is not None:
+            listener.stop()
+
+    def run(self):
+        if sys.platform != "win32":
+            return
+        try:
+            from pynput.keyboard import Listener as KBL
+        except Exception:
+            logger.error("[HotkeyGrab] Failed to import pynput", exc_info=True)
+            return
+        if self._stop_requested:
+            return
+
+        self_ref = self
+
+        def kb_filter(msg, data):
+            if msg not in (0x0100, 0x0101, 0x0104, 0x0105):
+                return True
+            name = _VK_TO_NAME.get(data.vkCode)
+            try:
+                if msg in (0x0100, 0x0104) and name:
+                    self_ref._sigs.key_down.emit(name)
+                elif msg in (0x0101, 0x0105) and name:
+                    self_ref._sigs.key_up.emit(name)
+            except RuntimeError:
+                # 对话框已关、_grab_sig 已删时 emit 失败；勿 suppress，否则按键整桌失效
+                return False
+            self_ref._kb_listener.suppress_event()
+
+        try:
+            self._kb_listener = KBL(win32_event_filter=kb_filter)
+        except Exception:
+            logger.error("[HotkeyGrab] Failed to create pynput Listener", exc_info=True)
+            return
+        if self._stop_requested:
+            self._kb_listener = None
+            return
+        try:
+            logger.info("[HotkeyGrab] pynput listener started")
+            self._kb_listener.start()
+            self._kb_listener.join()
+        except Exception:
+            logger.error("[HotkeyGrab] Listener crashed", exc_info=True)
+        finally:
+            self._kb_listener = None
+            logger.info("[HotkeyGrab] pynput listener stopped")
+
+
 _QT_KEY_NAMES = {
     Qt.Key.Key_Space: "space", Qt.Key.Key_Return: "enter",
     Qt.Key.Key_Enter: "enter", Qt.Key.Key_Tab: "tab",
@@ -312,7 +384,7 @@ class _HotkeyDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        hint = QLabel("同时按下新的快捷键组合：")
+        hint = QLabel("按下新的快捷键或快捷键组合：")
         hint.setStyleSheet("font-size:13px;")
         layout.addWidget(hint)
 
@@ -354,6 +426,125 @@ class _HotkeyDialog(QDialog):
         layout.addLayout(btn_row)
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._grab_sig = _HotkeyGrabSignals(self)
+        self._grab_sig.key_down.connect(
+            self._on_grab_key_down, Qt.ConnectionType.QueuedConnection)
+        self._grab_sig.key_up.connect(
+            self._on_grab_key_up, Qt.ConnectionType.QueuedConnection)
+        self._grab_worker: _PynputHotkeyGrabWorker | None = None
+        self._hotkey_grab_disposed = False
+        self._fg_poll = QTimer(self)
+        self._fg_poll.setInterval(150)
+        self._fg_poll.timeout.connect(self.sync_hotkey_grab_with_activation)
+        self._sync_grab_debounce = QTimer(self)
+        self._sync_grab_debounce.setSingleShot(True)
+        self._sync_grab_debounce.setInterval(0)
+        self._sync_grab_debounce.timeout.connect(self.sync_hotkey_grab_with_activation)
+
+    def _hotkey_dialog_is_foreground(self) -> bool:
+        """本对话框是否为 Win32 前台窗口（比 isActiveWindow 可靠）。"""
+        if sys.platform != "win32":
+            return self.isActiveWindow()
+        try:
+            hwnd = int(self.winId())
+        except Exception:
+            return False
+        if not hwnd:
+            return False
+        user32 = ctypes.windll.user32
+        fg = user32.GetForegroundWindow()
+        if not fg:
+            return False
+        if fg == hwnd:
+            return True
+        GA_ROOT = 2
+        return bool(user32.GetAncestor(fg, GA_ROOT) == hwnd)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fg_poll.start()
+        # 挂在 self 上的单发定时器，避免关窗后仍投递 singleShot 再次起钩子
+        self._sync_grab_debounce.start()
+
+    def changeEvent(self, event):
+        if event.type() in (
+                QEvent.Type.WindowActivate,
+                QEvent.Type.WindowDeactivate,
+                QEvent.Type.ActivationChange):
+            self._sync_grab_debounce.start()
+        super().changeEvent(event)
+
+    def closeEvent(self, event):
+        # 须先于停定时器，防止 sync 与 _start 在关窗过程中再起线程
+        self._hotkey_grab_disposed = True
+        self._sync_grab_debounce.stop()
+        self._fg_poll.stop()
+        self._stop_hotkey_grab()
+        super().closeEvent(event)
+
+    def sync_hotkey_grab_with_activation(self):
+        """仅当本对话框为系统前台时挂全局钩子；否则撤钩并复位 chord。"""
+        if self._hotkey_grab_disposed:
+            return
+        if self._hotkey_dialog_is_foreground():
+            self._start_hotkey_grab_if_needed()
+        else:
+            self._release_hotkey_grab_on_deactivate()
+
+    def _release_hotkey_grab_on_deactivate(self):
+        """失焦/切到其他应用：撤钩子并清空 chord，避免收不到 keyup 导致状态错乱。"""
+        self._stop_hotkey_grab()
+        self._settle.stop()
+        self._pressed.clear()
+        self._best.clear()
+        combo = self._captured if self._captured else self._current
+        self._key_display.setText(_hotkey_display(combo))
+        self._validate(combo)
+
+    def _start_hotkey_grab_if_needed(self):
+        if self._hotkey_grab_disposed:
+            return
+        if self._grab_worker is not None or sys.platform != "win32":
+            return
+        if not self._hotkey_dialog_is_foreground():
+            return
+        try:
+            from pynput.keyboard import Listener as _KBL  # noqa: F401
+        except Exception:
+            logger.warning("[HotkeyDialog] No global key grab (pynput missing)")
+            return
+        logger.info("[HotkeyDialog] Starting pynput keyboard grab")
+        self._grab_worker = _PynputHotkeyGrabWorker(self._grab_sig)
+        self._grab_worker.start()
+
+    def _stop_hotkey_grab(self):
+        if self._grab_worker is None:
+            return
+        logger.info("[HotkeyDialog] Stopping pynput keyboard grab")
+        self._grab_worker.stop_grab()
+        self._grab_worker.join(timeout=5.0)
+        if self._grab_worker.is_alive():
+            logger.error(
+                "[HotkeyDialog] Grab thread did not exit in 5s — "
+                "keyboard may still be stuck")
+        self._grab_worker = None
+
+    def _on_grab_key_down(self, name: str):
+        if name == "escape" and not self._pressed:
+            self.reject()
+            return
+        if name in self._pressed:
+            return
+        self._settle.stop()
+        self._pressed.add(name)
+        if len(self._pressed) >= len(self._best):
+            self._best = set(self._pressed)
+            self._show_best()
+
+    def _on_grab_key_up(self, name: str):
+        self._pressed.discard(name)
+        if not self._pressed:
+            self._settle.start()
 
     def event(self, e):
         if e.type() == QEvent.Type.ShortcutOverride:
@@ -362,6 +553,9 @@ class _HotkeyDialog(QDialog):
         return super().event(e)
 
     def keyPressEvent(self, event):
+        if self._grab_worker is not None:
+            event.accept()
+            return
         if event.isAutoRepeat():
             return
         event.accept()
@@ -381,6 +575,9 @@ class _HotkeyDialog(QDialog):
             self._show_best()
 
     def keyReleaseEvent(self, event):
+        if self._grab_worker is not None:
+            event.accept()
+            return
         if event.isAutoRepeat():
             return
         event.accept()
@@ -419,7 +616,7 @@ class _HotkeyDialog(QDialog):
             is_fkey = p.startswith("f") and p[1:].isdigit()
             if not (p in _MOD_KEYS or is_fkey or p.startswith("mouse_")):
                 self._key_display.setStyleSheet(self._STYLE_ERR)
-                self._status.setText("单个普通键容易误触，请搭配其他键")
+                self._status.setText("不允许使用单个常用按键，请搭配其他键使用。")
                 self._status.setStyleSheet("font-size:12px; color:#ff6b60;")
                 self._btn_ok.setEnabled(False)
                 return
@@ -600,9 +797,7 @@ class _PolishExtraPromptDialog(QDialog):
         layout.setSpacing(10)
 
         hint = QLabel(
-            "在「智能润色」模式下，下列内容会追加到系统提示中；"
-            "只需要描述你的要求，例如删除原始文本中的重复语句。"
-            "留空则仅使用默认润色规则。"
+            "在下方设置你的润色提示词，会和默认提示词一起追加到系统提示中。例：把所有的标点换成空格。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("font-size:12px; color:#aaa;")
@@ -610,7 +805,7 @@ class _PolishExtraPromptDialog(QDialog):
 
         self._edit = QTextEdit()
         self._edit.setPlainText(current or "")
-        self._edit.setPlaceholderText("例如：不要标点，词与词之间用空格分隔。")
+        self._edit.setPlaceholderText("留空以使用默认的润色提示词")
         self._edit.setStyleSheet("""
             QTextEdit {
                 background:#2a2a2a; color:#fff; border:1px solid #555;
