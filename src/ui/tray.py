@@ -7,7 +7,7 @@ from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence
 from PyQt6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication,
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit,
+    QLineEdit, QTextEdit,
 )
 
 from config import Config
@@ -146,6 +146,7 @@ class ComboHotkeyThread(QThread):
         self._pressed: set[str] = set()
         self._active = False
         self._active_time: float = 0.0
+        self._hook_suppressed: set[str] = set()
         self._kb_listener = None
 
     def _is_combo_key(self, name: str | None) -> bool:
@@ -195,7 +196,8 @@ class ComboHotkeyThread(QThread):
                     self._active = True
                     self._active_time = time.monotonic()
                     self.triggered.emit()
-                if combo_key:
+                if combo_key and self._combo_fully_pressed():
+                    self._hook_suppressed.add(name)
                     self._kb_listener.suppress_event()
             elif msg in (0x0101, 0x0105):
                 if self._active and combo_key:
@@ -203,8 +205,13 @@ class ComboHotkeyThread(QThread):
                     self._active = False
                     self.released.emit(hold_ms)
                 self._pressed.discard(name)
-                if combo_key:
+                # 只抑制「曾被抑制过 KEYDOWN」的键的 KEYUP；否则系统仍认为 Shift/Ctrl 未弹起（粘键），
+                # 会导致滚轮变横滚、点击异常等。
+                if name in self._hook_suppressed:
+                    self._hook_suppressed.discard(name)
                     self._kb_listener.suppress_event()
+                if not any(self._is_combo_key(n) for n in self._pressed):
+                    self._hook_suppressed.clear()
 
         try:
             self._kb_listener = KBL(win32_event_filter=kb_filter)
@@ -578,6 +585,73 @@ class _ApiKeyDialog(QDialog):
         return self._result
 
 
+class _PolishExtraPromptDialog(QDialog):
+    """编辑智能润色时附加在用户文本上的风格/格式要求（写入 config.custom_prompt）。"""
+
+    def __init__(self, current: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("润色附加要求")
+        self.setWindowIcon(icons.app_icon())
+        self.setMinimumSize(480, 320)
+        self.setStyleSheet("background:#1e1e1e; color:#fff;")
+        self._saved: str | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        hint = QLabel(
+            "在「智能润色」模式下，下列内容会追加到系统提示中；"
+            "只需要描述你的要求，例如删除原始文本中的重复语句。"
+            "留空则仅使用默认润色规则。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size:12px; color:#aaa;")
+        layout.addWidget(hint)
+
+        self._edit = QTextEdit()
+        self._edit.setPlainText(current or "")
+        self._edit.setPlaceholderText("例如：不要标点，词与词之间用空格分隔。")
+        self._edit.setStyleSheet("""
+            QTextEdit {
+                background:#2a2a2a; color:#fff; border:1px solid #555;
+                border-radius:6px; padding:8px; font-size:13px;
+            }
+            QTextEdit:focus { border:1px solid #007aff; }
+        """)
+        layout.addWidget(self._edit)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_ok = QPushButton("保存")
+        btn_ok.setFixedWidth(80)
+        btn_ok.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_ok.setStyleSheet("""
+            QPushButton { background:#007aff; color:#fff; border:none;
+                          border-radius:6px; padding:6px; font-size:13px; }
+            QPushButton:hover { background:#0066dd; }
+        """)
+        btn_ok.clicked.connect(self._accept_save)
+        btn_row.addWidget(btn_ok)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFixedWidth(80)
+        btn_cancel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_cancel.setStyleSheet("""
+            QPushButton { background:transparent; color:#999; border:1px solid #444;
+                          border-radius:6px; padding:6px; font-size:13px; }
+            QPushButton:hover { background:#2a2a2a; color:#fff; }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+    def _accept_save(self):
+        self._saved = self._edit.toPlainText()
+        self.accept()
+
+    @property
+    def prompt_text(self) -> str:
+        return (self._saved or "").strip()
+
 
 MENU_STYLE = """
     QMenu {
@@ -715,6 +789,12 @@ class VoiceTray(QSystemTrayIcon):
         self._dev_refresh_repeat = False
         self._dev_refresh_ready = False
         menu.addMenu(self._device_menu)
+
+        menu.addSeparator()
+
+        act_polish_extra = QAction("润色附加要求…", menu)
+        act_polish_extra.triggered.connect(self._configure_polish_extra)
+        menu.addAction(act_polish_extra)
 
         self._act_show_result_text = QAction("显示识别原文", menu)
         self._act_show_result_text.setCheckable(True)
@@ -953,6 +1033,22 @@ class VoiceTray(QSystemTrayIcon):
         for act in self._mode_menu.actions():
             mode_name_map = {"纯转录": "transcribe", "智能润色": "polish"}
             act.setChecked(mode_name_map.get(act.text(), "") == self._config.mode)
+
+    def _configure_polish_extra(self):
+        dlg = _PolishExtraPromptDialog(self._config.custom_prompt, self._menu_parent())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._config.custom_prompt = dlg.prompt_text
+        self._config.save()
+        logger.info("[Tray] Polish extra prompt updated "
+                    f"({len(self._config.custom_prompt)} chars)")
+
+    def _menu_parent(self):
+        """Parent for modal dialogs so they stay above the tray context."""
+        try:
+            return QApplication.activeWindow() or QApplication.focusWidget()
+        except Exception:
+            return None
 
     def _set_polish_model(self, model_id: str):
         self._config.polish_model = model_id

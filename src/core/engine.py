@@ -40,15 +40,19 @@ class _TranscribeWorker(QThread):
 class _PolishWorker(QThread):
     result_ready = pyqtSignal(str)
 
-    def __init__(self, polisher: TextPolisher, raw_text: str):
+    def __init__(self, polisher: TextPolisher, raw_text: str, config: Config):
         super().__init__()
         self._polisher = polisher
         self._raw = raw_text
+        self._config = config
 
     def run(self):
+        # 在真正请求模型时读取 custom_prompt，与 polish_model 一致；录音中保存也会在 ASR
+        # 完成后、本线程调用 API 前读到最新润色附加要求。
+        extra = (self._config.custom_prompt or "").strip()
         logger.info(f"[Polisher] Polishing {len(self._raw)} chars (model: {self._polisher._model})")
         t0 = time.perf_counter()
-        result = self._polisher.polish(self._raw)
+        result = self._polisher.polish(self._raw, extra)
         elapsed = time.perf_counter() - t0
         logger.info(f"[Polisher] Done in {elapsed:.1f}s → {len(result)} chars")
         self.result_ready.emit(result)
@@ -245,7 +249,7 @@ class VoiceEngine(QObject):
             logger.info(f"{_TAG} Entering polish pipeline")
             self._set_state("processing")
             self.live_text.emit(f"[原文] {text}")
-            self._polish_worker = _PolishWorker(self.polisher, text)
+            self._polish_worker = _PolishWorker(self.polisher, text, self.config)
             self._polish_worker.result_ready.connect(lambda polished: self._inject_and_save(polished, pcm))
             self._polish_worker.finished.connect(self._cleanup_polish_worker)
             self._polish_worker.start()
