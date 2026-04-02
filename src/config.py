@@ -1,6 +1,7 @@
 import json
 import os
-from dataclasses import dataclass, asdict
+import uuid
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 
@@ -17,7 +18,8 @@ class Config:
     hotkey: str = "lctrl+lshift+r"
     trigger_mode: str = "toggle"
     mode: str = "transcribe"
-    custom_prompt: str = ""
+    custom_prompts: list = field(default_factory=list)
+    active_prompt_id: str = ""
     language: str = "auto"
 
     api_key: str = ""
@@ -41,20 +43,36 @@ class Config:
 
     mini_window_x: int | None = None
 
+    @property
+    def active_prompt_text(self) -> str:
+        if not self.active_prompt_id or not self.custom_prompts:
+            return ""
+        for p in self.custom_prompts:
+            if p.get("id") == self.active_prompt_id:
+                return p.get("content", "")
+        return ""
+
     @classmethod
     def load(cls) -> "Config":
         path = _config_path()
+        raw_data: dict = {}
         if path.exists():
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                    raw_data = json.load(f)
                 known = {fld.name for fld in cls.__dataclass_fields__.values()}
-                filtered = {k: v for k, v in data.items() if k in known}
+                filtered = {k: v for k, v in raw_data.items() if k in known}
                 cfg = cls(**filtered)
             except Exception:
                 cfg = cls()
         else:
             cfg = cls()
+
+        old_text = raw_data.get("custom_prompt", "").strip()
+        if old_text and not cfg.custom_prompts:
+            pid = uuid.uuid4().hex[:8]
+            cfg.custom_prompts = [{"id": pid, "name": "自定义提示词", "content": old_text}]
+            cfg.active_prompt_id = pid
 
         if not cfg.api_key:
             cfg.api_key = os.environ.get("DASHSCOPE_API_KEY", "")

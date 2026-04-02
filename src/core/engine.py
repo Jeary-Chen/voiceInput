@@ -49,7 +49,7 @@ class _PolishWorker(QThread):
     def run(self):
         # 在真正请求模型时读取 custom_prompt，与 polish_model 一致；录音中保存也会在 ASR
         # 完成后、本线程调用 API 前读到最新润色附加要求。
-        extra = (self._config.custom_prompt or "").strip()
+        extra = (self._config.active_prompt_text or "").strip()
         logger.info(f"[Polisher] Polishing {len(self._raw)} chars (model: {self._polisher._model})")
         t0 = time.perf_counter()
         result = self._polisher.polish(self._raw, extra)

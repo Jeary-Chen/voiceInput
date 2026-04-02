@@ -7,7 +7,7 @@ Behavior:
   - Done:      if show-result is on, popup shows final text below
 """
 from PyQt6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, pyqtSignal,
+    Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, QEvent, pyqtSignal,
 )
 from PyQt6.QtGui import QPainter, QColor, QPainterPath, QPen, QAction, QFont
 from PyQt6.QtWidgets import (
@@ -357,9 +357,14 @@ class MiniRecordingWindow(QWidget):
         self._btn_polish.setFixedSize(26, 26)
         self._btn_polish.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_polish.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_polish.clicked.connect(self._toggle_polish)
+        self._btn_polish.installEventFilter(self)
         self._top_layout.addWidget(self._btn_polish)
         self._update_polish_style()
+
+        self._polish_press_timer = QTimer(self)
+        self._polish_press_timer.setSingleShot(True)
+        self._polish_press_timer.setInterval(350)
+        self._polish_press_timer.timeout.connect(self._show_prompt_menu)
 
         self._btn_show_result = QPushButton("◳")
         self._btn_show_result.setFixedSize(26, 26)
@@ -395,13 +400,25 @@ class MiniRecordingWindow(QWidget):
                 bg=Theme.BG_BUTTON.name(), fg="#ffffff",
                 r=13, hover=Theme.BG_BUTTON_HOVER.name(),
             ))
-            self._btn_polish.setToolTip("润色: 开")
+            self._btn_polish.setToolTip("润色: 开 | 长按选择提示词")
         else:
             self._btn_polish.setStyleSheet(_BTN_STYLE.format(
                 bg=Theme.BG_BUTTON.name(), fg=Theme.TEXT_SECONDARY.name(),
                 r=13, hover=Theme.BG_BUTTON_HOVER.name(),
             ))
-            self._btn_polish.setToolTip("润色: 关")
+            self._btn_polish.setToolTip("润色: 关 | 长按选择提示词")
+
+    def eventFilter(self, obj, event):
+        if obj is self._btn_polish:
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._polish_press_timer.start()
+                return True
+            if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                if self._polish_press_timer.isActive():
+                    self._polish_press_timer.stop()
+                    self._toggle_polish()
+                return True
+        return super().eventFilter(obj, event)
 
     def _toggle_polish(self):
         cfg = self._engine.config
@@ -410,6 +427,58 @@ class MiniRecordingWindow(QWidget):
         self._update_polish_style()
         self.mode_changed.emit(cfg.mode)
         logger.info(f"[MiniWin] Mode toggled → {cfg.mode}")
+
+    def _show_prompt_menu(self):
+        cfg = self._engine.config
+        if not cfg.custom_prompts:
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {Theme.BG_PRIMARY.name()}; color: #fff;
+                border: 1px solid rgba(255,255,255,30); border-radius: 8px;
+                padding: 4px 0; font-size: 12px;
+            }}
+            QMenu::item {{
+                padding: 6px 20px 6px 12px; border-radius: 4px;
+                margin: 1px 4px;
+            }}
+            QMenu::item:selected {{ background: {Theme.BG_BUTTON.name()}; }}
+            QMenu::item:disabled {{ color: #666; }}
+            QMenu::separator {{
+                height: 1px; background: rgba(255,255,255,20); margin: 3px 8px;
+            }}
+        """)
+
+        act_none = QAction("默认提示词", menu)
+        act_none.setCheckable(True)
+        act_none.setChecked(not cfg.active_prompt_id)
+        act_none.triggered.connect(lambda: self._set_prompt(""))
+        menu.addAction(act_none)
+        menu.addSeparator()
+
+        for p in cfg.custom_prompts:
+            pid, name = p["id"], p.get("name", "未命名")
+            act = QAction(name, menu)
+            act.setCheckable(True)
+            act.setChecked(cfg.active_prompt_id == pid)
+            act.triggered.connect(lambda checked, _id=pid: self._set_prompt(_id))
+            menu.addAction(act)
+
+        pos = self._btn_polish.mapToGlobal(self._btn_polish.rect().bottomLeft())
+        menu.exec(pos)
+
+    def _set_prompt(self, prompt_id: str):
+        cfg = self._engine.config
+        cfg.active_prompt_id = prompt_id
+        cfg.save()
+        name = ""
+        for p in cfg.custom_prompts:
+            if p["id"] == prompt_id:
+                name = p.get("name", "")
+                break
+        logger.info(f"[MiniWin] Active prompt → {name or '(default)'}")
 
     def sync_mode(self):
         """Refresh polish button style after external mode change."""

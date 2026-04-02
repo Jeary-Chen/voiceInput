@@ -5,11 +5,12 @@ import threading
 import time
 
 from PyQt6.QtCore import Qt, QEvent, QObject, QThread, pyqtSignal, QTimer, QUrl
-from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence
+from PyQt6.QtGui import QAction, QBrush, QDesktopServices, QKeySequence
 from PyQt6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication,
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QTextEdit,
+    QLineEdit, QTextEdit, QListWidget, QListWidgetItem,
+    QStyledItemDelegate, QStyleOptionViewItem,
 )
 
 from config import Config
@@ -782,42 +783,54 @@ class _ApiKeyDialog(QDialog):
         return self._result
 
 
-class _PolishExtraPromptDialog(QDialog):
-    """编辑智能润色时附加在用户文本上的风格/格式要求（写入 config.custom_prompt）。"""
+class _PromptEditDialog(QDialog):
+    """新增或编辑单条润色提示词。"""
 
-    def __init__(self, current: str, parent=None):
+    def __init__(self, name: str = "", content: str = "", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("润色附加要求")
+        self.setWindowTitle("编辑提示词" if name else "新增提示词")
         self.setWindowIcon(icons.app_icon())
-        self.setMinimumSize(480, 320)
+        self.setMinimumSize(440, 300)
         self.setStyleSheet("background:#1e1e1e; color:#fff;")
-        self._saved: str | None = None
+        self._result: dict | None = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        hint = QLabel(
-            "在下方设置你的润色提示词，会和默认提示词一起追加到系统提示中。例：把所有的标点换成空格。"
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("font-size:12px; color:#aaa;")
-        layout.addWidget(hint)
+        lbl_name = QLabel("名称：")
+        lbl_name.setStyleSheet("font-size:13px;")
+        layout.addWidget(lbl_name)
 
-        self._edit = QTextEdit()
-        self._edit.setPlainText(current or "")
-        self._edit.setPlaceholderText("留空以使用默认的润色提示词")
-        self._edit.setStyleSheet("""
+        self._name_input = QLineEdit(name)
+        self._name_input.setPlaceholderText("例：学术论文风格")
+        self._name_input.setStyleSheet("""
+            QLineEdit {
+                background:#2a2a2a; color:#fff; border:1px solid #555;
+                border-radius:6px; padding:8px; font-size:13px;
+            }
+            QLineEdit:focus { border:1px solid #007aff; }
+        """)
+        layout.addWidget(self._name_input)
+
+        lbl_content = QLabel("内容：")
+        lbl_content.setStyleSheet("font-size:13px;")
+        layout.addWidget(lbl_content)
+
+        self._content_edit = QTextEdit()
+        self._content_edit.setPlainText(content)
+        self._content_edit.setPlaceholderText("输入润色提示词内容，例：把所有的标点换成空格")
+        self._content_edit.setStyleSheet("""
             QTextEdit {
                 background:#2a2a2a; color:#fff; border:1px solid #555;
                 border-radius:6px; padding:8px; font-size:13px;
             }
             QTextEdit:focus { border:1px solid #007aff; }
         """)
-        layout.addWidget(self._edit)
+        layout.addWidget(self._content_edit)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        btn_ok = QPushButton("保存")
+        btn_ok = QPushButton("确定")
         btn_ok.setFixedWidth(80)
         btn_ok.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_ok.setStyleSheet("""
@@ -825,7 +838,7 @@ class _PolishExtraPromptDialog(QDialog):
                           border-radius:6px; padding:6px; font-size:13px; }
             QPushButton:hover { background:#0066dd; }
         """)
-        btn_ok.clicked.connect(self._accept_save)
+        btn_ok.clicked.connect(self._do_accept)
         btn_row.addWidget(btn_ok)
         btn_cancel = QPushButton("取消")
         btn_cancel.setFixedWidth(80)
@@ -839,13 +852,290 @@ class _PolishExtraPromptDialog(QDialog):
         btn_row.addWidget(btn_cancel)
         layout.addLayout(btn_row)
 
-    def _accept_save(self):
-        self._saved = self._edit.toPlainText()
+    def _do_accept(self):
+        name = self._name_input.text().strip()
+        content = self._content_edit.toPlainText().strip()
+        if not name:
+            self._name_input.setFocus()
+            self._name_input.setStyleSheet("""
+                QLineEdit {
+                    background:#2a2a2a; color:#fff; border:1px solid #ff3b30;
+                    border-radius:6px; padding:8px; font-size:13px;
+                }
+            """)
+            return
+        if not content:
+            self._content_edit.setFocus()
+            self._content_edit.setStyleSheet("""
+                QTextEdit {
+                    background:#2a2a2a; color:#fff; border:1px solid #ff3b30;
+                    border-radius:6px; padding:8px; font-size:13px;
+                }
+            """)
+            return
+        self._result = {"name": name, "content": content}
         self.accept()
 
     @property
-    def prompt_text(self) -> str:
-        return (self._saved or "").strip()
+    def result(self) -> dict | None:
+        return self._result
+
+
+class _KeepForegroundDelegate(QStyledItemDelegate):
+    """Preserve per-item foreground color when selected (prevent palette override)."""
+
+    def initStyleOption(self, option: QStyleOptionViewItem, index):
+        super().initStyleOption(option, index)
+        fg = index.data(Qt.ItemDataRole.ForegroundRole)
+        if fg is not None:
+            brush = QBrush(fg) if not isinstance(fg, QBrush) else fg
+            option.palette.setColor(option.palette.ColorRole.Text, brush.color())
+            option.palette.setColor(option.palette.ColorRole.HighlightedText, brush.color())
+
+
+class _PolishExtraPromptDialog(QDialog):
+    """管理润色附加要求：列表展示、增删改查、选中激活。"""
+
+    def __init__(self, prompts: list, active_id: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("润色附加要求")
+        self.setWindowIcon(icons.app_icon())
+        self.setMinimumSize(520, 420)
+        self.setStyleSheet("background:#1e1e1e; color:#fff;")
+
+        import copy
+        self._prompts: list[dict] = copy.deepcopy(prompts) if prompts else []
+        self._active_id: str = active_id or ""
+        self._accepted = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        self._hint = QLabel()
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet("font-size:12px; color:#aaa;")
+        layout.addWidget(self._hint)
+
+        _btn_style = """
+            QPushButton { background:#333; color:#fff; border:1px solid #555;
+                          border-radius:6px; padding:5px 10px; font-size:12px; }
+            QPushButton:hover { background:#444; border-color:#666; }
+            QPushButton:disabled { color:#555; border-color:#444; }
+        """
+        _btn_primary = """
+            QPushButton { background:#007aff; color:#fff; border:none;
+                          border-radius:6px; padding:5px 10px; font-size:12px; }
+            QPushButton:hover { background:#0066dd; }
+            QPushButton:disabled { background:#333; color:#555; }
+        """
+        _btn_danger = """
+            QPushButton { background:transparent; color:#ff6b60; border:1px solid #553030;
+                          border-radius:6px; padding:5px 10px; font-size:12px; }
+            QPushButton:hover { background:#3a1a1a; border-color:#ff3b30; }
+            QPushButton:disabled { color:#553030; border-color:#444; }
+        """
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+
+        btn_add = QPushButton("+ 新增")
+        btn_add.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_add.setStyleSheet(_btn_style)
+        btn_add.clicked.connect(self._add_item)
+        toolbar.addWidget(btn_add)
+
+        self._btn_edit = QPushButton("编辑")
+        self._btn_edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_edit.setStyleSheet(_btn_style)
+        self._btn_edit.clicked.connect(self._edit_current)
+        toolbar.addWidget(self._btn_edit)
+
+        self._btn_activate = QPushButton("激活")
+        self._btn_activate.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_activate.setStyleSheet(_btn_primary)
+        self._btn_activate.clicked.connect(self._toggle_activate)
+        toolbar.addWidget(self._btn_activate)
+
+        toolbar.addStretch()
+
+        self._btn_delete = QPushButton("删除")
+        self._btn_delete.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_delete.setStyleSheet(_btn_danger)
+        self._btn_delete.clicked.connect(self._delete_item)
+        toolbar.addWidget(self._btn_delete)
+
+        layout.addLayout(toolbar)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet("""
+            QListWidget {
+                background:#2a2a2a; border:1px solid #555; border-radius:6px;
+                padding:4px; font-size:13px; color:#fff; outline:none;
+            }
+            QListWidget::item {
+                padding:8px 10px; border-radius:4px; margin:2px 0;
+                border:1px solid transparent;
+            }
+            QListWidget::item:selected {
+                background:transparent; border:1px solid #007aff;
+            }
+            QListWidget::item:hover:!selected {
+                background:#333;
+            }
+        """)
+        self._list.setItemDelegate(_KeepForegroundDelegate(self._list))
+        self._list.itemDoubleClicked.connect(self._edit_item)
+        layout.addWidget(self._list)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_save = QPushButton("保存")
+        btn_save.setFixedWidth(80)
+        btn_save.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_save.setStyleSheet("""
+            QPushButton { background:#007aff; color:#fff; border:none;
+                          border-radius:6px; padding:6px; font-size:13px; }
+            QPushButton:hover { background:#0066dd; }
+        """)
+        btn_save.clicked.connect(self._do_save)
+        btn_row.addWidget(btn_save)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFixedWidth(80)
+        btn_cancel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_cancel.setStyleSheet("""
+            QPushButton { background:transparent; color:#999; border:1px solid #444;
+                          border-radius:6px; padding:6px; font-size:13px; }
+            QPushButton:hover { background:#2a2a2a; color:#fff; }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        self._list.currentRowChanged.connect(self._on_selection_changed)
+        self._refresh_list()
+        self._update_hint()
+        self._on_selection_changed()
+
+    def _update_hint(self):
+        if self._active_id:
+            name = ""
+            for p in self._prompts:
+                if p["id"] == self._active_id:
+                    name = p.get("name", "")
+                    break
+            self._hint.setText(f"当前激活：{name}")
+            self._hint.setStyleSheet("font-size:12px; color:#4cd9e0;")
+        else:
+            self._hint.setText("没有激活项，将仅使用默认的润色提示词。")
+            self._hint.setStyleSheet("font-size:12px; color:#aaa;")
+
+    def _refresh_list(self):
+        self._list.clear()
+        for p in self._prompts:
+            is_active = (p["id"] == self._active_id)
+            prefix = "● " if is_active else "   "
+            display = prefix + p.get("name", "未命名")
+            item = QListWidgetItem(display)
+            item.setData(Qt.ItemDataRole.UserRole, p["id"])
+            if is_active:
+                item.setForeground(Qt.GlobalColor.cyan)
+            self._list.addItem(item)
+        if not self._prompts:
+            item = QListWidgetItem("  (暂无提示词，点击「+ 新增」添加)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setForeground(Qt.GlobalColor.darkGray)
+            self._list.addItem(item)
+
+    def _on_selection_changed(self):
+        has_sel = self._list.currentRow() >= 0 and bool(self._prompts)
+        self._btn_edit.setEnabled(has_sel)
+        self._btn_delete.setEnabled(has_sel)
+        self._btn_activate.setEnabled(has_sel)
+        if has_sel:
+            item = self._list.currentItem()
+            pid = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if pid == self._active_id:
+                self._btn_activate.setText("取消激活")
+            else:
+                self._btn_activate.setText("激活")
+
+    def _add_item(self):
+        import uuid
+        dlg = _PromptEditDialog(parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result:
+            return
+        pid = uuid.uuid4().hex[:8]
+        entry = {"id": pid, **dlg.result}
+        self._prompts.append(entry)
+        self._refresh_list()
+        self._update_hint()
+        self._list.setCurrentRow(len(self._prompts) - 1)
+
+    def _edit_current(self):
+        row = self._list.currentRow()
+        if row < 0 or row >= len(self._prompts):
+            return
+        self._edit_at(row)
+
+    def _edit_item(self, item):
+        row = self._list.row(item)
+        if row < 0 or row >= len(self._prompts):
+            return
+        self._edit_at(row)
+
+    def _edit_at(self, row: int):
+        p = self._prompts[row]
+        dlg = _PromptEditDialog(name=p.get("name", ""), content=p.get("content", ""), parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result:
+            return
+        p["name"] = dlg.result["name"]
+        p["content"] = dlg.result["content"]
+        self._refresh_list()
+        self._update_hint()
+        self._list.setCurrentRow(row)
+
+    def _toggle_activate(self):
+        row = self._list.currentRow()
+        if row < 0 or row >= len(self._prompts):
+            return
+        pid = self._prompts[row]["id"]
+        if self._active_id == pid:
+            self._active_id = ""
+        else:
+            self._active_id = pid
+        self._refresh_list()
+        self._update_hint()
+        self._list.setCurrentRow(row)
+        self._on_selection_changed()
+
+    def _delete_item(self):
+        row = self._list.currentRow()
+        if row < 0 or row >= len(self._prompts):
+            return
+        removed = self._prompts.pop(row)
+        if self._active_id == removed["id"]:
+            self._active_id = ""
+        self._refresh_list()
+        self._update_hint()
+        if self._prompts:
+            self._list.setCurrentRow(min(row, len(self._prompts) - 1))
+        self._on_selection_changed()
+
+    def _do_save(self):
+        self._accepted = True
+        self.accept()
+
+    @property
+    def prompts(self) -> list:
+        return self._prompts if self._accepted else []
+
+    @property
+    def active_id(self) -> str:
+        return self._active_id if self._accepted else ""
+
+    @property
+    def accepted(self) -> bool:
+        return self._accepted
 
 
 MENU_STYLE = """
@@ -880,6 +1170,7 @@ class VoiceTray(QSystemTrayIcon):
         self._engine = engine
         self._mini = mini
         self._config = config
+        self._prompt_dlg: _PolishExtraPromptDialog | None = None
 
         self._audio = AudioCues()
         self._audio.set_enabled(config.play_sounds)
@@ -948,6 +1239,17 @@ class VoiceTray(QSystemTrayIcon):
 
         menu.addSeparator()
 
+        self._device_menu = QMenu("输入设备", menu)
+        self._device_menu.setStyleSheet(MENU_STYLE)
+        self._device_menu.aboutToShow.connect(self._on_device_menu_show)
+        self._cached_default_name = ""
+        self._cached_devices: list[dict] = []
+        self._dev_refresh_running = False
+        self._dev_refresh_scheduled = False
+        self._dev_refresh_repeat = False
+        self._dev_refresh_ready = False
+        menu.addMenu(self._device_menu)
+
         self._mode_menu = QMenu("切换模式", menu)
         self._mode_menu.setStyleSheet(MENU_STYLE)
         for mode_id, mode_name in [("transcribe", "纯转录"), ("polish", "智能润色")]:
@@ -974,22 +1276,14 @@ class VoiceTray(QSystemTrayIcon):
             self._polish_model_menu.addAction(act)
         menu.addMenu(self._polish_model_menu)
 
-        self._device_menu = QMenu("输入设备", menu)
-        self._device_menu.setStyleSheet(MENU_STYLE)
-        self._device_menu.aboutToShow.connect(self._on_device_menu_show)
-        self._cached_default_name = ""
-        self._cached_devices: list[dict] = []
-        self._dev_refresh_running = False
-        self._dev_refresh_scheduled = False
-        self._dev_refresh_repeat = False
-        self._dev_refresh_ready = False
-        menu.addMenu(self._device_menu)
-
         menu.addSeparator()
 
-        act_polish_extra = QAction("润色附加要求…", menu)
-        act_polish_extra.triggered.connect(self._configure_polish_extra)
-        menu.addAction(act_polish_extra)
+        self._prompt_menu = QMenu("自定义提示词", menu)
+        self._prompt_menu.setStyleSheet(MENU_STYLE)
+        self._prompt_menu.aboutToShow.connect(self._rebuild_prompt_menu)
+        menu.addMenu(self._prompt_menu)
+
+        menu.addSeparator()
 
         self._act_show_result_text = QAction("显示识别原文", menu)
         self._act_show_result_text.setCheckable(True)
@@ -1229,14 +1523,74 @@ class VoiceTray(QSystemTrayIcon):
             mode_name_map = {"纯转录": "transcribe", "智能润色": "polish"}
             act.setChecked(mode_name_map.get(act.text(), "") == self._config.mode)
 
-    def _configure_polish_extra(self):
-        dlg = _PolishExtraPromptDialog(self._config.custom_prompt, self._menu_parent())
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+    def _rebuild_prompt_menu(self):
+        self._prompt_menu.clear()
+
+        act_config = QAction("配置提示词", self._prompt_menu)
+        act_config.triggered.connect(self._configure_polish_extra)
+        self._prompt_menu.addAction(act_config)
+        self._prompt_menu.addSeparator()
+
+        if not self._config.custom_prompts:
+            act_empty = QAction("(暂无提示词)", self._prompt_menu)
+            act_empty.setEnabled(False)
+            self._prompt_menu.addAction(act_empty)
             return
-        self._config.custom_prompt = dlg.prompt_text
+
+        act_none = QAction("默认提示词", self._prompt_menu)
+        act_none.setCheckable(True)
+        act_none.setChecked(not self._config.active_prompt_id)
+        act_none.triggered.connect(lambda: self._set_active_prompt(""))
+        self._prompt_menu.addAction(act_none)
+
+        for p in self._config.custom_prompts:
+            pid, name = p["id"], p.get("name", "未命名")
+            act = QAction(name, self._prompt_menu)
+            act.setCheckable(True)
+            act.setChecked(self._config.active_prompt_id == pid)
+            act.triggered.connect(lambda checked, _id=pid: self._set_active_prompt(_id))
+            self._prompt_menu.addAction(act)
+
+    def _set_active_prompt(self, prompt_id: str):
+        self._config.active_prompt_id = prompt_id
         self._config.save()
-        logger.info("[Tray] Polish extra prompt updated "
-                    f"({len(self._config.custom_prompt)} chars)")
+        name = ""
+        for p in self._config.custom_prompts:
+            if p["id"] == prompt_id:
+                name = p.get("name", "")
+                break
+        logger.info(f"[Tray] Active prompt → {name or '(none)'}")
+
+    def _configure_polish_extra(self):
+        if self._prompt_dlg is not None:
+            self._prompt_dlg.raise_()
+            self._prompt_dlg.activateWindow()
+            return
+        dlg = _PolishExtraPromptDialog(
+            self._config.custom_prompts,
+            self._config.active_prompt_id,
+        )
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.finished.connect(self._on_prompt_dlg_finished)
+        self._prompt_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_prompt_dlg_finished(self, result: int):
+        dlg = self._prompt_dlg
+        self._prompt_dlg = None
+        if dlg is None or result != QDialog.DialogCode.Accepted or not dlg.accepted:
+            return
+        self._config.custom_prompts = dlg.prompts
+        self._config.active_prompt_id = dlg.active_id
+        self._config.save()
+        self._rebuild_prompt_menu()
+        active_text = self._config.active_prompt_text
+        logger.info(f"[Tray] Polish prompts updated "
+                    f"({len(self._config.custom_prompts)} items, "
+                    f"active={'yes' if active_text else 'none'})")
 
     def _menu_parent(self):
         """Parent for modal dialogs so they stay above the tray context."""
