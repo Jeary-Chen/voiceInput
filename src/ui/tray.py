@@ -2600,6 +2600,7 @@ class VoiceTray(QSystemTrayIcon):
             5000,
         )
         self._restore_idle_icon()
+        self._start_async_refresh()
 
     def _restore_idle_icon(self):
         if self._engine.state in ("recording", "processing"):
