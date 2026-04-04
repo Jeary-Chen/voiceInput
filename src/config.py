@@ -20,6 +20,7 @@ class Config:
     mode: str = "transcribe"
     custom_prompts: list = field(default_factory=list)
     active_prompt_id: str = ""
+    prompts_initialized: bool = False
     language: str = "auto"
 
     api_key: str = ""
@@ -73,6 +74,15 @@ class Config:
             pid = uuid.uuid4().hex[:8]
             cfg.custom_prompts = [{"id": pid, "name": "自定义提示词", "content": old_text}]
             cfg.active_prompt_id = pid
+            cfg.prompts_initialized = True
+
+        if cfg.custom_prompts:
+            cfg.prompts_initialized = True
+        elif not cfg.prompts_initialized:
+            from core.prompt_templates import seed_default_prompt_templates
+
+            seed_default_prompt_templates(cfg)
+            cfg.prompts_initialized = True
 
         if not cfg.api_key:
             cfg.api_key = os.environ.get("DASHSCOPE_API_KEY", "")

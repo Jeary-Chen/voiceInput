@@ -7,24 +7,24 @@ from core.log import logger
 
 _TAG = "[Polisher]"
 
-_SYSTEM_PROMPT = (
-    "将给你的语音识别的原始文本修正为书面语。"
-    "默认要求：不增删内容，保持原有语句顺序，只修正错别字、补标点、去口语化。"
-    "输出格式：用户会用 ```text 代码块包裹需要润色的内容。"
+DEFAULT_INSTRUCTIONS = (
+    "修正为书面语，不增删内容，保持原有的语句顺序，只修正错别字、补标点、去口语化。")
+
+_TASK_PREAMBLE="将给你的语音识别原始文本按照要求润色。"
+
+_OUTPUT_FORMAT = (
+    "【输出格式】：用户会用 ```text 代码块包裹需要润色的内容。"
     "你也必须用 ```text 代码块包裹润色结果输出。"
     "如果代码块内容为空，则什么都不输出。"
+    "任何时候不得违反【输出格式】要求。"
 )
 
-_EXTRA_PROMPT_SUFFIX = (
-    "\n\n用户期望优先于默认要求，在不违反输出格式的前提下，优先满足用户期望。"
-    "但任何时候不得违反输出格式的要求。用户期望如下：\n"
-)
 
-def _build_system_prompt(extra_instructions: str) -> str:
-    extra = (extra_instructions or "").strip()
-    if not extra:
-        return _SYSTEM_PROMPT
-    return _SYSTEM_PROMPT + _EXTRA_PROMPT_SUFFIX + extra
+def _build_system_prompt(custom_instructions: str) -> str:
+    custom = (custom_instructions or "").strip()
+    if custom:
+        return _TASK_PREAMBLE + "要求：" + custom + _OUTPUT_FORMAT
+    return _TASK_PREAMBLE + "要求：" + DEFAULT_INSTRUCTIONS + _OUTPUT_FORMAT
 
 
 def _extract_from_codeblock(text: str) -> str:
@@ -59,9 +59,10 @@ class TextPolisher:
         self._model = model
         logger.info(f"{_TAG} Model changed: {old} → {model}")
 
-    def polish(self, raw_text: str, extra_instructions: str = "") -> str:
+    def polish(self, raw_text: str, extra_instructions: str = "") -> tuple[bool, str]:
+        """Returns (api_ok, text). api_ok is False only when the request raised."""
         if not raw_text.strip():
-            return raw_text
+            return True, raw_text
         try:
             system_content = _build_system_prompt(extra_instructions)
             user_content = f"```text\n{raw_text}\n```"
@@ -78,7 +79,7 @@ class TextPolisher:
             raw_result = content.strip() if isinstance(content, str) else str(content).strip()
             result = _extract_from_codeblock(raw_result)
             logger.info(f"{_TAG} Result: {result[:80]}{'…' if len(result) > 80 else ''}")
-            return result or raw_text
+            return True, (result or raw_text)
         except Exception as e:
             logger.error(f"{_TAG} Failed: {e}")
-            return raw_text
+            return False, raw_text

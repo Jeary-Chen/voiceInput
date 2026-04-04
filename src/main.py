@@ -21,6 +21,7 @@ from core.engine import VoiceEngine
 from ui import icons
 from ui.mini_window import MiniRecordingWindow
 from ui.tray import VoiceTray
+from ui.user_notification_hub import UserNotificationHub
 
 _APP_KEY = "VoiceInput_SingleInstance_Lock"
 
@@ -59,6 +60,7 @@ def main():
     engine = VoiceEngine(config)
     mini = MiniRecordingWindow(engine)
     tray = VoiceTray(engine, mini, config)
+    UserNotificationHub(engine, tray, parent=app)
 
     hotkey_display = config.hotkey.replace("+", " + ").title()
     logger.success(f"VoiceInput started. Press {hotkey_display} to record.")

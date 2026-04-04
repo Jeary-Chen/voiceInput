@@ -39,6 +39,7 @@ class _TranscribeWorker(QThread):
 
 class _PolishWorker(QThread):
     result_ready = pyqtSignal(str)
+    polish_failed = pyqtSignal(str)
 
     def __init__(self, polisher: TextPolisher, raw_text: str, config: Config):
         super().__init__()
@@ -47,14 +48,14 @@ class _PolishWorker(QThread):
         self._config = config
 
     def run(self):
-        # 在真正请求模型时读取 custom_prompt，与 polish_model 一致；录音中保存也会在 ASR
-        # 完成后、本线程调用 API 前读到最新润色附加要求。
         extra = (self._config.active_prompt_text or "").strip()
         logger.info(f"[Polisher] Polishing {len(self._raw)} chars (model: {self._polisher._model})")
         t0 = time.perf_counter()
-        result = self._polisher.polish(self._raw, extra)
+        ok, result = self._polisher.polish(self._raw, extra)
         elapsed = time.perf_counter() - t0
         logger.info(f"[Polisher] Done in {elapsed:.1f}s → {len(result)} chars")
+        if not ok:
+            self.polish_failed.emit("润色失败，已使用原文")
         self.result_ready.emit(result)
 
 
@@ -63,9 +64,10 @@ class VoiceEngine(QObject):
     audio_data = pyqtSignal(bytes)         # raw PCM chunks for waveform
     live_text = pyqtSignal(str)            # status text for expanded panel
     transcription_done = pyqtSignal(str)   # final text
+    # All user-visible failures; presentation: ui.user_notification_hub + core.user_errors
     error_occurred = pyqtSignal(str)
-    api_key_invalid = pyqtSignal()         # 401 or missing key
-    mic_unavailable = pyqtSignal()         # no microphone or open failed
+    # Device/mic failures (tray balloon)
+    mic_unavailable = pyqtSignal(str)
     _max_reached = pyqtSignal()            # thread-safe auto-stop trigger
     _mic_error = pyqtSignal()              # mic issue detected during recording
 
@@ -139,7 +141,7 @@ class VoiceEngine(QObject):
         logger.info(f"{_TAG} Start recording (mode={self.config.mode})")
         if self.recorder.no_device:
             logger.warning(f"{_TAG} No input device available")
-            self.mic_unavailable.emit()
+            self.mic_unavailable.emit("未找到输入设备")
             return
         self._record_t0 = time.monotonic()
         try:
@@ -159,8 +161,7 @@ class VoiceEngine(QObject):
                 )
             except Exception as e2:
                 logger.error(f"{_TAG} Failed to open microphone: {e2}")
-                self.error_occurred.emit(f"无法打开麦克风: {e2}")
-                self.mic_unavailable.emit()
+                self.mic_unavailable.emit(f"无法打开麦克风: {e2}")
                 self._set_state("ready")
                 return
 
@@ -181,8 +182,7 @@ class VoiceEngine(QObject):
             return
         logger.error(f"{_TAG} Mic error during recording, auto-stopping")
         self.recorder.stop()
-        self.error_occurred.emit("录音过程中发现麦克风异常，已自动停止")
-        self.mic_unavailable.emit()
+        self.mic_unavailable.emit("录音过程中发现麦克风异常，已自动停止")
         self._set_state("ready")
 
     def _check_recording_health(self):
@@ -194,8 +194,7 @@ class VoiceEngine(QObject):
                          f"(no callback for >{self.recorder.STALL_TIMEOUT}s), "
                          f"device likely disconnected")
             self.recorder.stop()
-            self.error_occurred.emit("麦克风似乎已断开连接，录音已自动停止")
-            self.mic_unavailable.emit()
+            self.mic_unavailable.emit("麦克风似乎已断开连接，录音已自动停止")
             self._set_state("ready")
 
     def _stop_recording(self):
@@ -215,6 +214,7 @@ class VoiceEngine(QObject):
         if self.recorder.is_silent():
             logger.info(f"{_TAG} Audio silent (peak={self.recorder.peak_amplitude}), "
                         f"skipping ASR")
+            self.error_occurred.emit("未检测到语音")
             self._set_state("ready")
             return
 
@@ -251,6 +251,7 @@ class VoiceEngine(QObject):
             self.live_text.emit(f"[原文] {text}")
             self._polish_worker = _PolishWorker(self.polisher, text, self.config)
             self._polish_worker.result_ready.connect(lambda polished: self._inject_and_save(polished, pcm))
+            self._polish_worker.polish_failed.connect(self.error_occurred)
             self._polish_worker.finished.connect(self._cleanup_polish_worker)
             self._polish_worker.start()
         else:
@@ -277,6 +278,4 @@ class VoiceEngine(QObject):
     def _on_transcribe_error(self, msg: str):
         logger.error(f"{_TAG} Transcription error: {msg}")
         self.error_occurred.emit(msg)
-        if "API 401:" in msg:
-            self.api_key_invalid.emit()
         self._set_state("ready")

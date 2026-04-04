@@ -6,6 +6,7 @@ Emits a Qt signal whenever devices are added, removed, or the default changes.
 from __future__ import annotations
 
 import comtypes
+from _ctypes import COMError
 from comtypes import COMMETHOD, GUID, HRESULT, COMObject
 from ctypes import POINTER, Structure, c_int, c_uint, c_ushort, c_wchar_p
 from ctypes.wintypes import DWORD, LPCWSTR
@@ -15,6 +16,9 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from core.log import logger
 
 _TAG = "[DeviceWatcher]"
+
+# GetDefaultAudioEndpoint returns this when no device is assigned (normal during replug / empty set).
+_HRESULT_NOTFOUND = -2147023728  # 0x80070490 E_NOTFOUND
 
 # ── Struct / COM interface definitions ─────────────────────────────────
 
@@ -170,6 +174,13 @@ def get_default_capture_device_name() -> str | None:
         store = device.OpenPropertyStore(_STGM_READ)
         pv = store.GetValue(_PKEY_Device_FriendlyName)
         return pv.pwszVal if pv.pwszVal else None
+    except COMError as e:
+        hr = e.args[0] if e.args else 0
+        if hr == _HRESULT_NOTFOUND or (hr & 0xFFFFFFFF) == 0x80070490:
+            logger.debug(f"{_TAG} No default capture endpoint (transient or none configured)")
+            return None
+        logger.opt(exception=True).warning(f"{_TAG} COM error getting default capture device")
+        return None
     except Exception:
         logger.opt(exception=True).warning(f"{_TAG} Failed to get default capture device name")
         return None
