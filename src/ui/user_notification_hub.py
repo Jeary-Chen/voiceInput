@@ -37,13 +37,20 @@ class UserNotificationHub(QObject):
         ctx = classify_user_error(message)
         logger.debug(f"{_TAG} error domain={ctx.domain.name} msg={ctx.message[:80]!r}")
 
-        api_cred = ctx.domain == UserErrorDomain.API_CREDENTIALS
-        if api_cred:
+        if ctx.domain == UserErrorDomain.API_CREDENTIALS:
             self._tray.set_key_warning(True)
             now = time.monotonic()
             if now - self._last_api_tray_at >= _API_TOAST_COOLDOWN_SEC:
                 self._last_api_tray_at = now
                 self._tray.show_api_key_invalid_notice()
+            return
+
+        _SILENT_DOMAINS = (
+            UserErrorDomain.SPEECH_EMPTY,
+            UserErrorDomain.SPEECH_SILENT,
+        )
+        if ctx.domain in _SILENT_DOMAINS:
+            logger.info(f"{_TAG} Suppressed notification (domain={ctx.domain.name})")
             return
 
         body = f"处理失败：{single_line_preview(ctx.message)}"

@@ -18,6 +18,7 @@ class UserErrorDomain(Enum):
     API_CREDENTIALS = auto()
     CAPTURE = auto()
     SPEECH_EMPTY = auto()
+    SPEECH_SILENT = auto()
     GENERAL = auto()
 
 
@@ -40,6 +41,8 @@ def classify_user_error(message: str) -> UserErrorContext:
         return UserErrorContext(UserErrorDomain.CAPTURE, m)
     if m == "识别结果为空":
         return UserErrorContext(UserErrorDomain.SPEECH_EMPTY, m)
+    if m == "未检测到语音":
+        return UserErrorContext(UserErrorDomain.SPEECH_SILENT, m)
 
     return UserErrorContext(UserErrorDomain.GENERAL, m)
 
