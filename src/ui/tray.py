@@ -805,6 +805,59 @@ class _KeepWhiteTextDelegate(QStyledItemDelegate):
         option.palette.setColor(option.palette.ColorRole.HighlightedText, QColor("#fff"))
 
 
+class _DragReorderListWidget(QListWidget):
+    """QListWidget with live drag-to-reorder: items swap as the cursor passes over them.
+
+    Row 0 (默认提示词) is pinned and cannot be dragged or swapped into.
+    Emits *orderChanged(int, int)* after each swap with (from_row, to_row).
+    """
+
+    orderChanged = pyqtSignal(int, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_row: int = -1
+        self._dragging = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            row = self.row(self.itemAt(event.pos()))
+            if row >= 1:
+                self._drag_row = row
+                self._dragging = True
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._drag_row >= 1:
+            target = self.row(self.itemAt(event.pos()))
+            if target >= 1 and target != self._drag_row:
+                self._swap_rows(self._drag_row, target)
+                self._drag_row = target
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self._drag_row = -1
+        super().mouseReleaseEvent(event)
+
+    def _swap_rows(self, a: int, b: int):
+        if a < 1 or b < 1:
+            return
+        item_a = self.item(a)
+        item_b = self.item(b)
+        if item_a is None or item_b is None:
+            return
+        text_a, data_a = item_a.text(), item_a.data(Qt.ItemDataRole.UserRole)
+        text_b, data_b = item_b.text(), item_b.data(Qt.ItemDataRole.UserRole)
+        item_a.setText(text_b)
+        item_a.setData(Qt.ItemDataRole.UserRole, data_b)
+        item_b.setText(text_a)
+        item_b.setData(Qt.ItemDataRole.UserRole, data_a)
+        self.orderChanged.emit(a, b)
+        self.setCurrentRow(b)
+
+
 _DEFAULT_PROMPT_ID = "__default__"
 # QAction.data 标记「默认提示词」项，用于仅同步勾选而不 clear 子菜单（避免首次弹出错位）
 _TRAY_MENU_DEFAULT_PROMPT = "__tray_default_prompt__"
@@ -964,6 +1017,10 @@ class _PolishPromptDialog(QDialog):
 
     Left: prompt list (click = browse, double-click or button = activate).
     Right: inline name + content editor.
+
+    数据约定：`_prompts` 为自定义条目的有序列表；列表第 0 行为内置「默认提示词」
+    （不在 `_prompts` 内）。右侧编辑区始终绑定 `_editing_prompt_id` 所指的 dict；
+    写回内存时只按 id 查找，绝不使用「行号 − 1」当下标，以免拖拽重排后错位。
     """
 
     _BTN_SAVE_CLEAN = f"""
@@ -995,6 +1052,7 @@ class _PolishPromptDialog(QDialog):
     def __init__(self, prompts: list, active_id: str, default_text: str = "",
                  config: Config | None = None, parent=None,
                  on_active_applied: Callable[[], None] | None = None,
+                 on_prompts_saved: Callable[[], None] | None = None,
                  run_modal_with_hotkey_paused: Callable[
                      [Callable[[], Any]], Any] | None = None):
         super().__init__(parent)
@@ -1008,10 +1066,12 @@ class _PolishPromptDialog(QDialog):
         self._default_text: str = default_text
         self._config_ref: Config | None = config
         self._on_active_applied = on_active_applied
+        self._on_prompts_saved = on_prompts_saved
         self._run_modal_with_hotkey_paused = run_modal_with_hotkey_paused
         self._accepted = False
         self._switching = False
         self._last_row: int = -1
+        self._editing_prompt_id: str = ""
 
         root = QVBoxLayout(self)
         root.setSpacing(8)
@@ -1027,9 +1087,10 @@ class _PolishPromptDialog(QDialog):
         left_lay.setContentsMargins(0, 0, 4, 0)
         left_lay.setSpacing(6)
 
-        self._list = QListWidget()
+        self._list = _DragReorderListWidget()
         self._list.setStyleSheet(_LIST_STYLE)
         self._list.setItemDelegate(_KeepWhiteTextDelegate(self._list))
+        self._list.orderChanged.connect(self._on_list_order_swapped)
         left_lay.addWidget(self._list)
 
         left_btns = QHBoxLayout()
@@ -1124,7 +1185,7 @@ class _PolishPromptDialog(QDialog):
         right_btns = QHBoxLayout()
         right_btns.setSpacing(8)
         right_btns.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-        self._btn_restore_factory = QPushButton("恢复出厂默认")
+        self._btn_restore_factory = QPushButton("恢复默认模板")
         self._btn_restore_factory.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_restore_factory.setStyleSheet(_BTN)
         self._btn_restore_factory.clicked.connect(self._restore_factory_defaults)
@@ -1165,11 +1226,10 @@ class _PolishPromptDialog(QDialog):
     # ── 底部「保存」= 全局写入名称/内容/列表；「当前使用项」单独立即写入磁盘，不计入未保存 ──
 
     def _prompt_data_differs_from_disk(self) -> bool:
-        """与磁盘不一致时视为未保存：仅名称、提示词内容、增删列表；不含 active_prompt_id。"""
+        """与磁盘不一致时视为未保存：仅名称、提示词内容、增删列表；不含 active_prompt_id。
+        调用方须已调用过 flush 将编辑区写回 _prompts。"""
         if self._config_ref is None:
             return False
-        # 先把当前选中行对应的编辑区写回 _prompts（与 _last_row 对齐，避免未亮起/误判）
-        self._flush_editor_to_current_row()
         disk = self._config_ref.custom_prompts
         if len(self._prompts) != len(disk):
             return True
@@ -1245,8 +1305,10 @@ class _PolishPromptDialog(QDialog):
         return f"{prefix}{name}{mark}"
 
     def _update_prompt_list_labels(self):
-        """同步左侧列表文案（名称、未保存 *），不整表 clear，避免闪烁。"""
-        self._flush_editor_to_current_row()
+        """同步左侧列表文案（名称、未保存 *），不整表 clear，避免闪烁。
+
+        调用方须已调用过 flush 将编辑区写回 _prompts。
+        """
         if self._list.count() != 1 + len(self._prompts):
             self._refresh_list()
             return
@@ -1258,14 +1320,14 @@ class _PolishPromptDialog(QDialog):
         self._switching = False
 
     def _update_right_unsaved_hint(self):
-        row = self._list.currentRow()
+        """刷新右侧编辑区的未保存标记。使用 _last_row，调用方须已 flush。"""
+        row = self._last_row
         try:
             if row < 0:
                 self._lbl_row_unsaved.setVisible(False)
                 self._lbl_name_star.setVisible(False)
                 self._lbl_content_star.setVisible(False)
                 return
-            self._flush_editor_to_current_row()
             if self._is_default_row(row):
                 self._lbl_name_star.setVisible(False)
                 self._lbl_content_star.setVisible(False)
@@ -1286,15 +1348,14 @@ class _PolishPromptDialog(QDialog):
 
     def _update_revert_row_button(self):
         """「还原此项」可点击当且仅当：自定义项、磁盘已有该条、本条相对磁盘未保存。
-        保持 QPushButton 为 enabled，用样式区分可点/灰显。"""
-        row = self._list.currentRow()
+        保持 QPushButton 为 enabled，用样式区分可点/灰显。调用方须已 flush。"""
+        row = self._last_row
         if self._config_ref is None or row < 0:
             self._btn_revert_row.setStyleSheet(self._BTN_REVERT_INACTIVE)
             return
         if self._is_default_row(row):
             self._btn_revert_row.setStyleSheet(self._BTN_REVERT_INACTIVE)
             return
-        self._flush_editor_to_current_row()
         pid = self._selected_prompt_id(row)
         if not pid:
             self._btn_revert_row.setStyleSheet(self._BTN_REVERT_INACTIVE)
@@ -1331,7 +1392,7 @@ class _PolishPromptDialog(QDialog):
         """托盘等处已更新 config 时，将当前使用中的提示词与列表展示同步到磁盘状态。"""
         if self._config_ref is None:
             return
-        self._flush_editor_to_current_row()
+        self._flush_editing_prompt()
         self._active_id = self._config_ref.active_prompt_id or ""
         self._refresh_list()
         self._select_active_row()
@@ -1340,7 +1401,7 @@ class _PolishPromptDialog(QDialog):
     def _on_editor_changed(self):
         if self._switching:
             return
-        self._flush_editor_to_current_row()
+        self._flush_editing_prompt()
         self._update_prompt_list_labels()
         self._update_right_unsaved_hint()
         self._update_save_button()
@@ -1348,9 +1409,9 @@ class _PolishPromptDialog(QDialog):
     # ── list ──
 
     def _refresh_list(self):
+        """重建左侧列表项。不修改 _last_row——由调用方在操作完成后显式设置。"""
         self._switching = True
         prev = self._list.currentRow()
-        self._flush_editor_to_current_row()
         self._list.clear()
         item = QListWidgetItem(self._format_row_text(0))
         item.setData(Qt.ItemDataRole.UserRole, _DEFAULT_PROMPT_ID)
@@ -1363,9 +1424,6 @@ class _PolishPromptDialog(QDialog):
             self._list.addItem(it)
         if prev >= 0 and prev < self._list.count():
             self._list.setCurrentRow(prev)
-        cr = self._list.currentRow()
-        if cr >= 0:
-            self._last_row = cr
         self._switching = False
 
     def _select_active_row(self):
@@ -1401,15 +1459,36 @@ class _PolishPromptDialog(QDialog):
     def _on_row_changed(self, row: int):
         if self._switching:
             return
-        self._flush_editor_to_last_row()
+        self._flush_editing_prompt()
         self._last_row = row
         self._load_editor(row)
+        self._update_save_button()
+
+    def _on_list_order_swapped(self, row_a: int, row_b: int):
+        """Visual rows swapped — rebuild _prompts order from the list widget."""
+        self._flush_editing_prompt()
+        id_to_prompt = {p["id"]: p for p in self._prompts}
+        new_order: list[dict] = []
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it is None:
+                continue
+            pid = it.data(Qt.ItemDataRole.UserRole)
+            if pid == _DEFAULT_PROMPT_ID:
+                continue
+            p = id_to_prompt.get(pid)
+            if p is not None:
+                new_order.append(p)
+        self._prompts = new_order
+        self._persist_order_to_disk()
+        self._update_prompt_list_labels()
         self._update_save_button()
 
     def _load_editor(self, row: int):
         self._switching = True
         is_default = self._is_default_row(row)
         if is_default:
+            self._editing_prompt_id = _DEFAULT_PROMPT_ID
             self._name_input.setText("默认提示词")
             self._content_edit.setPlainText(self._default_text)
             self._name_input.setReadOnly(True)
@@ -1417,9 +1496,10 @@ class _PolishPromptDialog(QDialog):
             self._name_input.setStyleSheet(_INPUT_READONLY_STYLE)
             self._content_edit.setStyleSheet(_TEXTEDIT_READONLY_STYLE)
         else:
-            idx = row - 1
-            if 0 <= idx < len(self._prompts):
-                p = self._prompts[idx]
+            pid = self._selected_prompt_id(row)
+            self._editing_prompt_id = pid or ""
+            p = next((x for x in self._prompts if x["id"] == pid), None) if pid else None
+            if p is not None:
                 self._name_input.setText(p.get("name", ""))
                 self._content_edit.setPlainText(p.get("content", ""))
             self._name_input.setReadOnly(False)
@@ -1447,27 +1527,38 @@ class _PolishPromptDialog(QDialog):
             self._btn_activate.setStyleSheet(self._BTN_ACTIVATE_OFF)
             self._btn_activate.setEnabled(True)
 
-    def _flush_editor_to_row(self, row: int) -> None:
-        if row < 0 or self._is_default_row(row):
-            return
-        idx = row - 1
-        if idx < 0 or idx >= len(self._prompts):
+    def _flush_editing_prompt(self) -> None:
+        """将右侧编辑区写回 `_editing_prompt_id` 在 `_prompts` 中对应条目。
+
+        唯一写回入口：行切换、重排、保存、关闭等凡需落内存处均调用本方法，
+        不根据 QListWidget 行号当下标，避免拖拽后顺序与下标不一致。
+        """
+        pid = self._editing_prompt_id
+        if not pid or pid == _DEFAULT_PROMPT_ID:
             return
         name = self._name_input.text().strip()
         content = self._content_edit.toPlainText().strip()
-        self._prompts[idx]["name"] = name
-        self._prompts[idx]["content"] = content
+        for p in self._prompts:
+            if p["id"] == pid:
+                p["name"] = name
+                p["content"] = content
+                return
 
-    def _flush_editor_to_last_row(self) -> None:
-        """行切换前调用：将旧 _last_row 写入 _prompts（此时列表 currentRow 已是新行）。"""
-        self._flush_editor_to_row(self._last_row)
+    def _persist_order_to_disk(self) -> None:
+        """将当前内存中的条目顺序写盘，但保留磁盘版的 name/content。
 
-    def _flush_editor_to_current_row(self) -> None:
-        """将当前选中行对应的编辑区写入 _prompts，并同步 _last_row。"""
-        row = self._list.currentRow()
-        self._flush_editor_to_row(row)
-        if row >= 0:
-            self._last_row = row
+        - 磁盘已有的条目：按内存 _prompts 的新顺序排列，name/content 保持磁盘值不变。
+        - 磁盘没有的条目（新增未保存）：不写入磁盘，等用户手动保存。
+        - 磁盘有但内存已删除的条目：不写入磁盘（删除的效果随拖拽生效）。
+        """
+        if self._config_ref is None:
+            return
+        disk_map = {p["id"]: p for p in self._config_ref.custom_prompts}
+        reordered = [disk_map[p["id"]] for p in self._prompts if p["id"] in disk_map]
+        self._config_ref.custom_prompts = reordered
+        self._config_ref.save()
+        if self._on_prompts_saved is not None:
+            self._on_prompts_saved()
 
     def _run_modal_guarding_hotkey(self, fn: Callable[[], _T_modal]) -> _T_modal:
         """经 VoiceTray.run_modal_with_hotkey_paused：模态框期间卸全局热键，避免 pynput 与 Qt 抢键。"""
@@ -1480,7 +1571,7 @@ class _PolishPromptDialog(QDialog):
 
     def _activate_selected(self):
         row = self._list.currentRow()
-        self._flush_editor_to_current_row()
+        self._flush_editing_prompt()
 
         if self._is_default_row(row):
             new_active = ""
@@ -1539,12 +1630,10 @@ class _PolishPromptDialog(QDialog):
     # ── add / delete / restore ──
 
     def _add_item(self):
-        self._flush_editor_to_current_row()
+        self._flush_editing_prompt()
         pid = uuid.uuid4().hex[:8]
         self._prompts.append({"id": pid, "name": "新提示词", "content": ""})
         new_row = len(self._prompts)
-        # 勿在 _refresh_list 之前把 _last_row 设为新行：其开头会 flush，而编辑器仍显示上一行，
-        # 会把旧文案写入新槽位，看起来像「以当前项为模板」。
         self._refresh_list()
         self._switching = True
         self._list.setCurrentRow(new_row)
@@ -1556,7 +1645,7 @@ class _PolishPromptDialog(QDialog):
         self._update_save_button()
 
     def _duplicate_item(self):
-        self._flush_editor_to_current_row()
+        self._flush_editing_prompt()
         row = self._list.currentRow()
         if self._is_default_row(row):
             return
@@ -1573,7 +1662,6 @@ class _PolishPromptDialog(QDialog):
             },
         )
         new_row = len(self._prompts)
-        # 与 _add_item 相同：复制项落在列表底部；勿在 _refresh_list 之前设 _last_row。
         self._refresh_list()
         self._switching = True
         self._list.setCurrentRow(new_row)
@@ -1585,9 +1673,12 @@ class _PolishPromptDialog(QDialog):
         self._update_save_button()
 
     def _delete_item(self):
-        # 先 flush：与 _last_row 对齐后再取要删的行，避免焦点在右侧编辑区时 currentRow 漂移导致误删底部项
-        self._flush_editor_to_current_row()
-        row = self._last_row if self._last_row >= 0 else self._list.currentRow()
+        """删除列表中蓝框选中的那条自定义提示词。
+
+        以 QListWidget.currentRow() 为唯一行号来源（删除按钮 focusPolicy=NoFocus，
+        点击它不会改变列表选中项）。不依赖 _last_row，避免其被其他路径污染。
+        """
+        row = self._list.currentRow()
         if row < 0 or self._is_default_row(row):
             return
         idx = row - 1
@@ -1598,13 +1689,11 @@ class _PolishPromptDialog(QDialog):
         if self._active_id == removed["id"]:
             self._active_id = ""
         len_after = len(self._prompts)
-        # 优先选中「下一项」（删除后同一行号上滑入的原下方项）；若无则选中上一行
         if idx < len_before - 1:
             target_row = row
         else:
             target_row = row - 1
         target_row = max(0, min(target_row, len_after))
-        # 删除后勿让 _refresh_list 内 flush 仍用旧行号写到已滑动的条目上
         self._last_row = -1
         self._refresh_list()
         self._switching = True
@@ -1616,10 +1705,10 @@ class _PolishPromptDialog(QDialog):
 
     def _revert_current_row_from_disk(self):
         """仅将当前选中自定义项的名称与内容恢复为磁盘 config 中的版本。"""
-        row = self._list.currentRow()
+        self._flush_editing_prompt()
+        row = self._last_row
         if row < 0 or self._is_default_row(row):
             return
-        self._flush_editor_to_current_row()
         idx = row - 1
         if idx < 0 or idx >= len(self._prompts):
             return
@@ -1637,7 +1726,7 @@ class _PolishPromptDialog(QDialog):
         """将提示词列表与名称/内容恢复为磁盘 config 中最后一次保存的状态。"""
         if self._config_ref is None:
             return
-        self._flush_editor_to_current_row()
+        self._flush_editing_prompt()
         if not self._prompt_data_differs_from_disk():
             return
 
@@ -1667,9 +1756,9 @@ class _PolishPromptDialog(QDialog):
     def _restore_factory_defaults(self):
         def _ask_restore():
             box = QMessageBox(self)
-            box.setWindowTitle("恢复出厂默认")
+            box.setWindowTitle("恢复默认模板")
             box.setText(
-                "将提示词列表恢复为出厂默认，当前编辑将丢失。是否继续？")
+                "将提示词列表恢复为默认模板，当前编辑将丢失。是否继续？")
             box.setIcon(QMessageBox.Icon.Warning)
             btn_yes = box.addButton("是", QMessageBox.ButtonRole.AcceptRole)
             btn_no = box.addButton("否", QMessageBox.ButtonRole.RejectRole)
@@ -1695,18 +1784,21 @@ class _PolishPromptDialog(QDialog):
     # ── save / close ──
 
     def _do_save(self):
-        self._flush_editor_to_current_row()
+        self._flush_editing_prompt()
         self._accepted = True
         if self._config_ref is not None:
             self._config_ref.custom_prompts = copy.deepcopy(self._prompts)
             self._config_ref.active_prompt_id = self._active_id
             self._config_ref.save()
             logger.info("[PromptDlg] Saved prompts to config")
+            if self._on_prompts_saved is not None:
+                self._on_prompts_saved()
         self._refresh_list()
         self._update_save_button()
         self._update_right_unsaved_hint()
 
     def closeEvent(self, event):
+        self._flush_editing_prompt()
         if self._prompt_data_differs_from_disk():
             def _ask_close():
                 box = QMessageBox(self)
@@ -2202,6 +2294,7 @@ class VoiceTray(QSystemTrayIcon):
             default_text=DEFAULT_INSTRUCTIONS,
             config=self._config,
             on_active_applied=self._sync_prompt_menu_checks,
+            on_prompts_saved=self._rebuild_prompt_menu,
             run_modal_with_hotkey_paused=self.run_modal_with_hotkey_paused,
         )
         dlg.setWindowModality(Qt.WindowModality.NonModal)
