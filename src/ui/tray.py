@@ -282,13 +282,17 @@ class _PynputHotkeyGrabWorker(threading.Thread):
             if msg not in (0x0100, 0x0101, 0x0104, 0x0105):
                 return True
             name = _VK_TO_NAME.get(data.vkCode)
+            if not name:
+                logger.debug("[HotkeyGrab] pass-through unmapped vk=0x%02X", data.vkCode)
+                return True
             try:
-                if msg in (0x0100, 0x0104) and name:
+                if msg in (0x0100, 0x0104):
                     self_ref._sigs.key_down.emit(name)
-                elif msg in (0x0101, 0x0105) and name:
+                elif msg in (0x0101, 0x0105):
                     self_ref._sigs.key_up.emit(name)
             except RuntimeError:
                 # 对话框已关、_grab_sig 已删时 emit 失败；勿 suppress，否则按键整桌失效
+                logger.debug("[HotkeyGrab] emit failed (dialog closed?), vk=0x%02X — passing through", data.vkCode)
                 return False
             self_ref._kb_listener.suppress_event()
 
