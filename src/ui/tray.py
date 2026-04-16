@@ -150,6 +150,13 @@ def _pyn_key(key) -> str | None:
             return _VK_TO_NAME.get(key.vk)
     return None
 
+
+# KBDLLHOOKSTRUCT.flags 位：事件由 SendInput/keybd_event 合成（非物理按键）。
+# pynput Controller 使用 SendInput，TextInjector 的 Shift+Insert 粘贴会置此位；
+# 过滤器命中此位时直接放行，避免钩子拦截自家注入事件导致修饰键残留。
+_LLKHF_INJECTED = 0x10
+
+
 class ComboHotkeyThread(QThread):
     """Global hotkey — order-independent combo detection with key suppression."""
     triggered = pyqtSignal()
@@ -201,6 +208,8 @@ class ComboHotkeyThread(QThread):
             return
 
         def kb_filter(msg, data):
+            if data.flags & _LLKHF_INJECTED:
+                return
             name = _VK_TO_NAME.get(data.vkCode)
             if not name:
                 return
@@ -280,6 +289,8 @@ class _PynputHotkeyGrabWorker(threading.Thread):
 
         def kb_filter(msg, data):
             if msg not in (0x0100, 0x0101, 0x0104, 0x0105):
+                return True
+            if data.flags & _LLKHF_INJECTED:
                 return True
             name = _VK_TO_NAME.get(data.vkCode)
             if not name:
