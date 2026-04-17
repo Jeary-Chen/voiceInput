@@ -13,6 +13,7 @@ for _pv in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     os.environ.pop(_pv, None)
 os.environ["NO_PROXY"] = "*"
 
+from PyQt6.QtCore import Qt, QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -29,6 +30,7 @@ _APP_MUTEX_NAME = "VoiceInput_InstallAware_Mutex"
 _SHUTDOWN_EVENT_NAME = "VoiceInput_Shutdown_Event"
 _app_mutex_handle = None
 _shutdown_event_handle = None
+_shutdown_bridge = None
 
 
 def _is_already_running() -> bool:
@@ -78,9 +80,18 @@ def _release_shutdown_event():
     _shutdown_event_handle = None
 
 
-def _start_shutdown_watcher(app: QApplication):
-    """Background thread that waits for the shutdown event and triggers app quit."""
+class _ShutdownBridge(QObject):
+    """Bridges the shutdown event from a background thread to the main thread via Qt signal."""
+    shutdown_requested = pyqtSignal()
+
+
+def _start_shutdown_watcher(quit_fn):
+    """Background thread that waits for the shutdown event, then invokes quit on the main thread."""
+    global _shutdown_bridge
     import threading
+
+    _shutdown_bridge = _ShutdownBridge()
+    _shutdown_bridge.shutdown_requested.connect(quit_fn, Qt.ConnectionType.QueuedConnection)
 
     def _watch():
         if not _shutdown_event_handle:
@@ -88,7 +99,7 @@ def _start_shutdown_watcher(app: QApplication):
         INFINITE = 0xFFFFFFFF
         ctypes.windll.kernel32.WaitForSingleObject(_shutdown_event_handle, INFINITE)
         logger.info("[Main] Shutdown event received from installer")
-        app.quit()
+        _shutdown_bridge.shutdown_requested.emit()
 
     t = threading.Thread(target=_watch, name="ShutdownWatcher", daemon=True)
     t.start()
@@ -110,7 +121,6 @@ def main():
     server.listen(_APP_KEY)
     _create_app_mutex()
     _create_shutdown_event()
-    _start_shutdown_watcher(app)
     app.aboutToQuit.connect(_release_app_mutex)
     app.aboutToQuit.connect(_release_shutdown_event)
 
@@ -125,6 +135,7 @@ def main():
     mini = MiniRecordingWindow(engine)
     tray = VoiceTray(engine, mini, config)
     UserNotificationHub(engine, tray, parent=app)
+    _start_shutdown_watcher(tray._quit)
 
     hotkey_display = config.hotkey.replace("+", " + ").title()
     logger.success(f"VoiceInput started. Press {hotkey_display} to record.")

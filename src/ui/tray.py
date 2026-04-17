@@ -2059,14 +2059,6 @@ class VoiceTray(QSystemTrayIcon):
 
         menu.addSeparator()
 
-        self._act_autostart = QAction("开机自启", menu)
-        self._act_autostart.setCheckable(True)
-        self._act_autostart.setChecked(self._config.autostart_enabled)
-        self._act_autostart.triggered.connect(self._toggle_autostart)
-        menu.addAction(self._act_autostart)
-
-        menu.addSeparator()
-
         self._act_show_result_text = QAction("显示识别原文", menu)
         self._act_show_result_text.setCheckable(True)
         self._act_show_result_text.setChecked(self._config.show_result_text)
@@ -2082,6 +2074,14 @@ class VoiceTray(QSystemTrayIcon):
         act_reset_pos = QAction("重置指示器位置", menu)
         act_reset_pos.triggered.connect(self._reset_mini_position)
         menu.addAction(act_reset_pos)
+
+        menu.addSeparator()
+
+        self._act_autostart = QAction("开机自启", menu)
+        self._act_autostart.setCheckable(True)
+        self._act_autostart.setChecked(self._config.autostart_enabled)
+        self._act_autostart.triggered.connect(self._toggle_autostart)
+        menu.addAction(self._act_autostart)
 
         menu.addSeparator()
 
@@ -2535,12 +2535,6 @@ class VoiceTray(QSystemTrayIcon):
         self._config.autostart_enabled = checked
         self._config.save()
         logger.info(f"[Tray] Autostart → {'on' if checked else 'off'}")
-        self.showMessage(
-            "VoiceInput",
-            f"开机自启已{'开启' if checked else '关闭'}",
-            QSystemTrayIcon.MessageIcon.Information,
-            2000,
-        )
 
     def _set_default_device(self):
         self._config.mic_index = None
