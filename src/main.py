@@ -1,6 +1,7 @@
 import sys
 import os
 import signal
+import ctypes
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -24,6 +25,8 @@ from ui.tray import VoiceTray
 from ui.user_notification_hub import UserNotificationHub
 
 _APP_KEY = "VoiceInput_SingleInstance_Lock"
+_APP_MUTEX_NAME = "VoiceInput_InstallAware_Mutex"
+_app_mutex_handle = None
 
 
 def _is_already_running() -> bool:
@@ -33,6 +36,26 @@ def _is_already_running() -> bool:
     connected = sock.waitForConnected(200)
     sock.close()
     return connected
+
+
+def _create_app_mutex():
+    """Create a named Win32 mutex so installers can detect a running app."""
+    global _app_mutex_handle
+    if sys.platform != "win32":
+        return
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, _APP_MUTEX_NAME)
+    if not handle:
+        logger.warning("Failed to create install-aware app mutex")
+        return
+    _app_mutex_handle = handle
+
+
+def _release_app_mutex():
+    global _app_mutex_handle
+    if not _app_mutex_handle:
+        return
+    ctypes.windll.kernel32.CloseHandle(_app_mutex_handle)
+    _app_mutex_handle = None
 
 
 def main():
@@ -49,6 +72,8 @@ def main():
     server = QLocalServer()
     server.removeServer(_APP_KEY)
     server.listen(_APP_KEY)
+    _create_app_mutex()
+    app.aboutToQuit.connect(_release_app_mutex)
 
     config = Config.load()
 

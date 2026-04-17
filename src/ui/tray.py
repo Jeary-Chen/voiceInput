@@ -112,6 +112,10 @@ def _hotkey_display(combo: str) -> str:
     return " + ".join(_DISPLAY.get(p, p.upper()) for p in parts)
 
 
+_AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_VALUE_NAME = "VoiceInput"
+
+
 _PYN_KEYS: dict = {}
 
 
@@ -1942,6 +1946,7 @@ class VoiceTray(QSystemTrayIcon):
         self._key_warning = not config.api_key
         self._mic_warning = False
         self._pending_device_apply = False
+        self._sync_autostart_state(save_if_changed=True)
         if self._key_warning:
             self.setIcon(icons.icon_key_invalid())
             self._update_tooltip("API Key 未配置，右键点击配置")
@@ -2065,6 +2070,12 @@ class VoiceTray(QSystemTrayIcon):
         self._act_hide_idle_mini.setChecked(self._config.hide_mini_window_when_idle)
         self._act_hide_idle_mini.triggered.connect(self._toggle_hide_idle_mini)
         menu.addAction(self._act_hide_idle_mini)
+
+        self._act_autostart = QAction("开机自启", menu)
+        self._act_autostart.setCheckable(True)
+        self._act_autostart.setChecked(self._config.autostart_enabled)
+        self._act_autostart.triggered.connect(self._toggle_autostart)
+        menu.addAction(self._act_autostart)
 
         act_reset_pos = QAction("重置指示器位置", menu)
         act_reset_pos.triggered.connect(self._reset_mini_position)
@@ -2440,6 +2451,95 @@ class VoiceTray(QSystemTrayIcon):
         self._config.save()
         self._mini.sync_show_result()
         logger.info(f"[Tray] Show result text → {'on' if checked else 'off'}")
+
+    def _sync_autostart_state(self, save_if_changed: bool = False):
+        actual = self._read_autostart_enabled()
+        changed = self._config.autostart_enabled != actual
+        self._config.autostart_enabled = actual
+        if save_if_changed and changed:
+            self._config.save()
+        if hasattr(self, "_act_autostart"):
+            self._act_autostart.blockSignals(True)
+            self._act_autostart.setChecked(actual)
+            self._act_autostart.blockSignals(False)
+
+    def _read_autostart_enabled(self) -> bool:
+        if sys.platform != "win32":
+            return False
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                _AUTOSTART_RUN_KEY,
+                0,
+                winreg.KEY_QUERY_VALUE,
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, _AUTOSTART_VALUE_NAME)
+            return bool(str(value).strip())
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+    def _resolve_autostart_command(self) -> str | None:
+        app_path = QCoreApplication.applicationFilePath()
+        if not app_path:
+            return None
+        app_path = os.path.abspath(app_path)
+        if os.path.basename(app_path).lower() != "voiceinput.exe":
+            return None
+        if not os.path.exists(app_path):
+            return None
+        return f'"{app_path}"'
+
+    def _write_autostart_enabled(self, enabled: bool):
+        if sys.platform != "win32":
+            raise RuntimeError("当前平台不支持开机自启")
+
+        import winreg
+
+        if enabled:
+            command = self._resolve_autostart_command()
+            if not command:
+                raise RuntimeError("当前运行方式无法确定启动命令，请使用安装包版本后再设置")
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_RUN_KEY) as key:
+                winreg.SetValueEx(key, _AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, command)
+            return
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                _AUTOSTART_RUN_KEY,
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                winreg.DeleteValue(key, _AUTOSTART_VALUE_NAME)
+        except FileNotFoundError:
+            return
+
+    def _toggle_autostart(self, checked: bool):
+        try:
+            self._write_autostart_enabled(checked)
+        except Exception as e:
+            logger.warning(f"[Tray] Autostart toggle failed: {e}")
+            self.showMessage(
+                "VoiceInput",
+                f"设置开机自启失败：{e}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                4000,
+            )
+            self._sync_autostart_state()
+            return
+
+        self._config.autostart_enabled = checked
+        self._config.save()
+        logger.info(f"[Tray] Autostart → {'on' if checked else 'off'}")
+        self.showMessage(
+            "VoiceInput",
+            f"开机自启已{'开启' if checked else '关闭'}",
+            QSystemTrayIcon.MessageIcon.Information,
+            2000,
+        )
 
     def _set_default_device(self):
         self._config.mic_index = None

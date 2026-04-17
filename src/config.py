@@ -41,6 +41,7 @@ class Config:
     save_audio: bool = False
     hide_mini_window_when_idle: bool = False
     show_result_text: bool = False
+    autostart_enabled: bool = False
 
     mini_window_x: int | None = None
 
