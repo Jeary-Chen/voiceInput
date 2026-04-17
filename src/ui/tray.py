@@ -2013,14 +2013,6 @@ class VoiceTray(QSystemTrayIcon):
 
         menu.addSeparator()
 
-        self._act_autostart = QAction("开机自启", menu)
-        self._act_autostart.setCheckable(True)
-        self._act_autostart.setChecked(self._config.autostart_enabled)
-        self._act_autostart.triggered.connect(self._toggle_autostart)
-        menu.addAction(self._act_autostart)
-
-        menu.addSeparator()
-
         self._device_menu = QMenu("输入设备", menu)
         self._device_menu.setStyleSheet(MENU_STYLE)
         self._device_menu.aboutToShow.connect(self._on_device_menu_show)
@@ -2064,6 +2056,14 @@ class VoiceTray(QSystemTrayIcon):
         self._prompt_menu.setStyleSheet(MENU_STYLE)
         self._prompt_menu.aboutToShow.connect(self._sync_prompt_menu_checks)
         menu.addMenu(self._prompt_menu)
+
+        menu.addSeparator()
+
+        self._act_autostart = QAction("开机自启", menu)
+        self._act_autostart.setCheckable(True)
+        self._act_autostart.setChecked(self._config.autostart_enabled)
+        self._act_autostart.triggered.connect(self._toggle_autostart)
+        menu.addAction(self._act_autostart)
 
         menu.addSeparator()
 
