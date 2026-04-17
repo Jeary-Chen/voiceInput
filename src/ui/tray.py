@@ -2013,6 +2013,14 @@ class VoiceTray(QSystemTrayIcon):
 
         menu.addSeparator()
 
+        self._act_autostart = QAction("开机自启", menu)
+        self._act_autostart.setCheckable(True)
+        self._act_autostart.setChecked(self._config.autostart_enabled)
+        self._act_autostart.triggered.connect(self._toggle_autostart)
+        menu.addAction(self._act_autostart)
+
+        menu.addSeparator()
+
         self._device_menu = QMenu("输入设备", menu)
         self._device_menu.setStyleSheet(MENU_STYLE)
         self._device_menu.aboutToShow.connect(self._on_device_menu_show)
@@ -2070,12 +2078,6 @@ class VoiceTray(QSystemTrayIcon):
         self._act_hide_idle_mini.setChecked(self._config.hide_mini_window_when_idle)
         self._act_hide_idle_mini.triggered.connect(self._toggle_hide_idle_mini)
         menu.addAction(self._act_hide_idle_mini)
-
-        self._act_autostart = QAction("开机自启", menu)
-        self._act_autostart.setCheckable(True)
-        self._act_autostart.setChecked(self._config.autostart_enabled)
-        self._act_autostart.triggered.connect(self._toggle_autostart)
-        menu.addAction(self._act_autostart)
 
         act_reset_pos = QAction("重置指示器位置", menu)
         act_reset_pos.triggered.connect(self._reset_mini_position)
@@ -2482,15 +2484,14 @@ class VoiceTray(QSystemTrayIcon):
             return False
 
     def _resolve_autostart_command(self) -> str | None:
-        app_path = QCoreApplication.applicationFilePath()
-        if not app_path:
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        app_root = os.path.dirname(src_dir)
+        if os.path.basename(app_root).lower() == "src":
+            app_root = os.path.dirname(app_root)
+        exe = os.path.join(app_root, "VoiceInput.exe")
+        if not os.path.isfile(exe):
             return None
-        app_path = os.path.abspath(app_path)
-        if os.path.basename(app_path).lower() != "voiceinput.exe":
-            return None
-        if not os.path.exists(app_path):
-            return None
-        return f'"{app_path}"'
+        return f'"{exe}"'
 
     def _write_autostart_enabled(self, enabled: bool):
         if sys.platform != "win32":

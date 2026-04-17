@@ -26,7 +26,9 @@ from ui.user_notification_hub import UserNotificationHub
 
 _APP_KEY = "VoiceInput_SingleInstance_Lock"
 _APP_MUTEX_NAME = "VoiceInput_InstallAware_Mutex"
+_SHUTDOWN_EVENT_NAME = "VoiceInput_Shutdown_Event"
 _app_mutex_handle = None
+_shutdown_event_handle = None
 
 
 def _is_already_running() -> bool:
@@ -58,6 +60,40 @@ def _release_app_mutex():
     _app_mutex_handle = None
 
 
+def _create_shutdown_event():
+    global _shutdown_event_handle
+    if sys.platform != "win32":
+        return
+    handle = ctypes.windll.kernel32.CreateEventW(None, True, False, _SHUTDOWN_EVENT_NAME)
+    if not handle:
+        return
+    _shutdown_event_handle = handle
+
+
+def _release_shutdown_event():
+    global _shutdown_event_handle
+    if not _shutdown_event_handle:
+        return
+    ctypes.windll.kernel32.CloseHandle(_shutdown_event_handle)
+    _shutdown_event_handle = None
+
+
+def _start_shutdown_watcher(app: QApplication):
+    """Background thread that waits for the shutdown event and triggers app quit."""
+    import threading
+
+    def _watch():
+        if not _shutdown_event_handle:
+            return
+        INFINITE = 0xFFFFFFFF
+        ctypes.windll.kernel32.WaitForSingleObject(_shutdown_event_handle, INFINITE)
+        logger.info("[Main] Shutdown event received from installer")
+        app.quit()
+
+    t = threading.Thread(target=_watch, name="ShutdownWatcher", daemon=True)
+    t.start()
+
+
 def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -73,7 +109,10 @@ def main():
     server.removeServer(_APP_KEY)
     server.listen(_APP_KEY)
     _create_app_mutex()
+    _create_shutdown_event()
+    _start_shutdown_watcher(app)
     app.aboutToQuit.connect(_release_app_mutex)
+    app.aboutToQuit.connect(_release_shutdown_event)
 
     config = Config.load()
 
