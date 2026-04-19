@@ -25,6 +25,7 @@ class HistoryEntry:
     mode: str
     timestamp: float
     has_audio: bool = False
+    processing_info: dict | None = None
 
     @property
     def datetime_str(self) -> str:
@@ -35,6 +36,14 @@ class HistoryEntry:
         return self.text[:50] + ("..." if len(self.text) > 50 else "")
 
 
+_ENTRY_FIELDS = {f.name for f in HistoryEntry.__dataclass_fields__.values()}
+
+
+def _load_entry(data: dict) -> HistoryEntry:
+    filtered = {k: v for k, v in data.items() if k in _ENTRY_FIELDS}
+    return HistoryEntry(**filtered)
+
+
 class HistoryManager:
     MAX_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 
@@ -43,7 +52,8 @@ class HistoryManager:
         self._enforce_size_limit()
 
     def save_entry(self, text: str, duration: float, mode: str,
-                   audio_data: Optional[bytes] = None) -> HistoryEntry:
+                   audio_data: Optional[bytes] = None,
+                   processing_info: Optional[dict] = None) -> HistoryEntry:
         entry_id = self._next_id()
         entry = HistoryEntry(
             id=entry_id,
@@ -52,11 +62,16 @@ class HistoryManager:
             mode=mode,
             timestamp=time.time(),
             has_audio=audio_data is not None,
+            processing_info=processing_info,
         )
+
+        data = asdict(entry)
+        if data.get("processing_info") is None:
+            del data["processing_info"]
 
         meta_path = self._dir / f"{entry_id}.json"
         with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(asdict(entry), f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
         if audio_data:
             wav_path = self._dir / f"{entry_id}.wav"
@@ -79,7 +94,7 @@ class HistoryManager:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                entries.append(HistoryEntry(**data))
+                entries.append(_load_entry(data))
             except Exception:
                 continue
         return entries
@@ -90,7 +105,7 @@ class HistoryManager:
             return None
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return HistoryEntry(**json.load(f))
+                return _load_entry(json.load(f))
         except Exception:
             return None
 

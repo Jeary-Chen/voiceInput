@@ -10,8 +10,12 @@ from core.asr import DashScopeASR
 from core.injector import TextInjector
 from core.history import HistoryManager
 from core.polisher import TextPolisher
+from core.silence_trim import trim_silence
+from core.chunked_asr import transcribe_chunked, MAX_CHUNK_SEC
 
 _TAG = "[Engine]"
+
+COUNTDOWN_SEC = 10
 
 
 class _TranscribeWorker(QThread):
@@ -23,6 +27,7 @@ class _TranscribeWorker(QThread):
         self._asr = asr
         self._pcm = pcm_data
         self._duration = duration
+        self.processing_info: dict | None = None
 
     def run(self):
         try:
@@ -34,6 +39,28 @@ class _TranscribeWorker(QThread):
             self.result_ready.emit(text)
         except Exception as e:
             logger.error(f"[ASR] Transcription failed: {e}")
+            self.error_occurred.emit(str(e))
+
+
+class _ChunkedTranscribeWorker(QThread):
+    result_ready = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, asr: DashScopeASR, pcm_data: bytes, duration: float):
+        super().__init__()
+        self._asr = asr
+        self._pcm = pcm_data
+        self._duration = duration
+        self.chunk_info: dict | None = None
+
+    def run(self):
+        try:
+            logger.info(f"[ASR] Chunked transcription of {self._duration:.1f}s audio "
+                        f"(model: {self._asr.model})")
+            text, self.chunk_info = transcribe_chunked(self._asr, self._pcm)
+            self.result_ready.emit(text)
+        except Exception as e:
+            logger.error(f"[ASR] Chunked transcription failed: {e}")
             self.error_occurred.emit(str(e))
 
 
@@ -64,12 +91,11 @@ class VoiceEngine(QObject):
     audio_data = pyqtSignal(bytes)         # raw PCM chunks for waveform
     live_text = pyqtSignal(str)            # status text for expanded panel
     transcription_done = pyqtSignal(str)   # final text
-    # All user-visible failures; presentation: ui.user_notification_hub + core.user_errors
+    countdown_tick = pyqtSignal(int)       # seconds remaining before auto-stop
     error_occurred = pyqtSignal(str)
-    # Device/mic failures (tray balloon)
     mic_unavailable = pyqtSignal(str)
-    _max_reached = pyqtSignal()            # thread-safe auto-stop trigger
-    _mic_error = pyqtSignal()              # mic issue detected during recording
+    _max_reached = pyqtSignal()
+    _mic_error = pyqtSignal()
 
     def __init__(self, config: Config):
         super().__init__()
@@ -97,8 +123,11 @@ class VoiceEngine(QObject):
             base_url=config.api_base_url,
         )
         self._state = "ready"
-        self._worker: _TranscribeWorker | None = None
+        self._worker: _TranscribeWorker | _ChunkedTranscribeWorker | None = None
         self._polish_worker: _PolishWorker | None = None
+        self._processing_info: dict | None = None
+        self._original_pcm: bytes = b""
+        self._countdown_active = False
         self._max_reached.connect(self._stop_recording)
         self._mic_error.connect(self._on_recording_mic_error)
         self._watchdog = QTimer(self)
@@ -111,11 +140,17 @@ class VoiceEngine(QObject):
     def state(self) -> str:
         return self._state
 
+    @property
+    def effective_max_duration(self) -> int:
+        return self.config.smart_chunk_max_duration_sec
+
     def _set_state(self, s: str):
         self._state = s
         if s == "recording":
+            self._countdown_active = False
             self._watchdog.start()
         else:
+            self._countdown_active = False
             self._watchdog.stop()
         logger.debug(f"{_TAG} State → {s}")
         self.state_changed.emit(s)
@@ -138,27 +173,26 @@ class VoiceEngine(QObject):
     # ── recording ──
 
     def _start_recording(self):
-        logger.info(f"{_TAG} Start recording (mode={self.config.mode})")
+        max_dur = self.effective_max_duration
+        logger.info(f"{_TAG} Start recording (mode={self.config.mode}, "
+                    f"max_duration={max_dur}s, silence_trim={self.config.silence_trim})")
         if self.recorder.no_device:
             logger.warning(f"{_TAG} No input device available")
             self.mic_unavailable.emit("未找到输入设备")
             return
         self._record_t0 = time.monotonic()
+        rec_kwargs = dict(
+            on_audio_data=self._on_audio_chunk,
+            on_max_reached=self._on_max_reached,
+            on_mic_error=self._on_mic_error,
+        )
         try:
-            self.recorder.start(
-                on_audio_data=self._on_audio_chunk,
-                on_max_reached=self._on_max_reached,
-                on_mic_error=self._on_mic_error,
-            )
+            self.recorder.start(**rec_kwargs)
         except Exception as e:
             logger.warning(f"{_TAG} Start failed ({e}), re-preparing...")
             try:
                 self.recorder.prepare()
-                self.recorder.start(
-                    on_audio_data=self._on_audio_chunk,
-                    on_max_reached=self._on_max_reached,
-                    on_mic_error=self._on_mic_error,
-                )
+                self.recorder.start(**rec_kwargs)
             except Exception as e2:
                 logger.error(f"{_TAG} Failed to open microphone: {e2}")
                 self.mic_unavailable.emit(f"无法打开麦克风: {e2}")
@@ -177,7 +211,6 @@ class VoiceEngine(QObject):
         self.audio_data.emit(data)
 
     def _on_recording_mic_error(self):
-        """Handle mic error detected during recording (from audio callback thread)."""
         if self._state != "recording":
             return
         logger.error(f"{_TAG} Mic error during recording, auto-stopping")
@@ -186,9 +219,10 @@ class VoiceEngine(QObject):
         self._set_state("ready")
 
     def _check_recording_health(self):
-        """Watchdog: detect stalled audio stream (e.g. Bluetooth disconnect)."""
+        """Watchdog: detect stalled stream + countdown auto-stop."""
         if self._state != "recording":
             return
+
         if self.recorder.is_stalled():
             logger.error(f"{_TAG} Audio stream stalled "
                          f"(no callback for >{self.recorder.STALL_TIMEOUT}s), "
@@ -196,6 +230,26 @@ class VoiceEngine(QObject):
             self.recorder.stop()
             self.mic_unavailable.emit("麦克风似乎已断开连接，录音已自动停止")
             self._set_state("ready")
+            return
+
+        elapsed = time.monotonic() - self._record_t0
+        max_dur = self.effective_max_duration
+        remaining = max_dur - elapsed
+
+        if remaining <= COUNTDOWN_SEC:
+            if not self._countdown_active:
+                self._countdown_active = True
+                logger.info(f"{_TAG} Countdown started: {int(remaining)}s remaining")
+            secs = max(0, int(remaining))
+            self.countdown_tick.emit(secs)
+            if secs <= 0:
+                logger.info(f"{_TAG} Auto-stop: max duration ({max_dur}s) reached")
+                self._stop_recording()
+        elif self._countdown_active:
+            self._countdown_active = False
+            self.countdown_tick.emit(-1)
+            logger.info(f"{_TAG} Countdown cancelled: limit changed, "
+                        f"{int(remaining)}s remaining")
 
     def _stop_recording(self):
         if self._state != "recording":
@@ -222,11 +276,34 @@ class VoiceEngine(QObject):
 
     def _start_batch_transcribe(self, pcm: bytes, duration: float):
         self._set_state("processing")
-        self._worker = _TranscribeWorker(self.asr, pcm, duration)
-        self._worker.result_ready.connect(lambda t: self._finalize(t, pcm))
+        self._original_pcm = pcm
+        self._processing_info = {}
+
+        asr_pcm = pcm
+        if self.config.silence_trim:
+            asr_pcm, trim_info = trim_silence(pcm)
+            self._processing_info["silence_trim"] = trim_info
+            duration = len(asr_pcm) / (16000 * 2)
+
+        needs_chunking = duration > MAX_CHUNK_SEC
+        logger.info(f"{_TAG} Pipeline: silence_trim={'on' if self.config.silence_trim else 'off'}, "
+                    f"chunking={'yes' if needs_chunking else 'no'} "
+                    f"(duration={duration:.1f}s)")
+
+        if needs_chunking:
+            self._worker = _ChunkedTranscribeWorker(self.asr, asr_pcm, duration)
+        else:
+            self._worker = _TranscribeWorker(self.asr, asr_pcm, duration)
+
+        self._worker.result_ready.connect(self._on_transcribe_done)
         self._worker.error_occurred.connect(self._on_transcribe_error)
         self._worker.finished.connect(self._cleanup_worker)
         self._worker.start()
+
+    def _on_transcribe_done(self, text: str):
+        if isinstance(self._worker, _ChunkedTranscribeWorker) and self._worker.chunk_info:
+            self._processing_info["chunk"] = self._worker.chunk_info
+        self._finalize(text)
 
     def _cleanup_worker(self):
         if self._worker:
@@ -238,7 +315,7 @@ class VoiceEngine(QObject):
             self._polish_worker.deleteLater()
             self._polish_worker = None
 
-    def _finalize(self, text: str, pcm: bytes):
+    def _finalize(self, text: str):
         if not text:
             logger.warning(f"{_TAG} Empty transcription result")
             self.error_occurred.emit("识别结果为空")
@@ -250,14 +327,14 @@ class VoiceEngine(QObject):
             self._set_state("processing")
             self.live_text.emit(f"[原文] {text}")
             self._polish_worker = _PolishWorker(self.polisher, text, self.config)
-            self._polish_worker.result_ready.connect(lambda polished: self._inject_and_save(polished, pcm))
+            self._polish_worker.result_ready.connect(self._inject_and_save)
             self._polish_worker.polish_failed.connect(self.error_occurred)
             self._polish_worker.finished.connect(self._cleanup_polish_worker)
             self._polish_worker.start()
         else:
-            self._inject_and_save(text, pcm)
+            self._inject_and_save(text)
 
-    def _inject_and_save(self, text: str, pcm: bytes):
+    def _inject_and_save(self, text: str):
         if self.config.paste_result:
             self.injector.inject(text, restore_clipboard=self.config.restore_clipboard)
             logger.info(f"{_TAG} Pasted {len(text)} chars")
@@ -265,17 +342,24 @@ class VoiceEngine(QObject):
             self.injector.copy_only(text)
             logger.info(f"{_TAG} Copied {len(text)} chars to clipboard")
 
-        duration = len(pcm) / (16000 * 2)
+        original_pcm = self._original_pcm
+        duration = len(original_pcm) / (16000 * 2)
+        proc_info = self._processing_info if self._processing_info else None
         self.history.save_entry(
             text=text,
             duration=duration,
             mode=self.config.mode,
-            audio_data=pcm if self.config.save_audio else None,
+            audio_data=original_pcm if self.config.save_audio else None,
+            processing_info=proc_info,
         )
+        self._original_pcm = b""
+        self._processing_info = None
         self.transcription_done.emit(text)
         self._set_state("ready")
 
     def _on_transcribe_error(self, msg: str):
         logger.error(f"{_TAG} Transcription error: {msg}")
+        self._original_pcm = b""
+        self._processing_info = None
         self.error_occurred.emit(msg)
         self._set_state("ready")

@@ -277,6 +277,53 @@ class _StatusPopup(QWidget):
         pass
 
 
+class _CountdownPopup(QWidget):
+    """Floating countdown label shown before auto-stop."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._label = QLabel()
+        self._label.setFont(Theme.font(11))
+        self._label.setStyleSheet(f"""
+            color: #ff3b30;
+            background: {Theme.BG_PRIMARY.name()};
+            border: 1px solid rgba(255,60,48,60);
+            border-radius: 8px;
+            padding: 5px 10px;
+        """)
+        layout.addWidget(self._label)
+
+    def show_countdown(self, seconds: int, anchor: QWidget):
+        self._label.setText(f"录音将在 {seconds}s 后自动停止")
+        self.adjustSize()
+        pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            x = pos.x() + (anchor.width() - self.width()) // 2
+            x = max(geo.x(), min(x, geo.x() + geo.width() - self.width()))
+        else:
+            x = pos.x()
+        self.move(x, pos.y() + 3)
+        self.show()
+
+    def paintEvent(self, event):
+        pass
+
+
 class MiniRecordingWindow(QWidget):
     request_record = pyqtSignal()
     request_stop = pyqtSignal()
@@ -307,6 +354,7 @@ class MiniRecordingWindow(QWidget):
 
         self._result_popup = _ResultPopup()
         self._status_popup = _StatusPopup()
+        self._countdown_popup = _CountdownPopup()
 
         self._build_ui()
         self._set_widgets_for_mode("idle")
@@ -321,10 +369,12 @@ class MiniRecordingWindow(QWidget):
         self._deferred_shrink_timer = QTimer(self)
         self._deferred_shrink_timer.setSingleShot(True)
         self._deferred_shrink_timer.timeout.connect(self._shrink_to_idle)
+        self._rec_status_timer: QTimer | None = None
 
         engine.state_changed.connect(self._on_engine_state)
         engine.audio_data.connect(self._on_audio)
         engine.transcription_done.connect(self._on_done)
+        engine.countdown_tick.connect(self._on_countdown_tick)
 
     # ── UI build ──
 
@@ -480,7 +530,25 @@ class MiniRecordingWindow(QWidget):
         self._btn_rec_stop.start_external_hold(skip_click_threshold=True)
 
     def _show_recording_status(self):
+        self._update_recording_status()
+        if not self._rec_status_timer:
+            self._rec_status_timer = QTimer(self)
+            self._rec_status_timer.setInterval(1000)
+            self._rec_status_timer.timeout.connect(self._update_recording_status)
+        self._rec_status_timer.start()
+
+    def _update_recording_status(self):
         items: list[str] = []
+        elapsed = self._engine.get_duration()
+        max_dur = self._engine.effective_max_duration
+        remaining = max(0, max_dur - elapsed)
+        e_min, e_sec = int(elapsed) // 60, int(elapsed) % 60
+        r_min, r_sec = int(remaining) // 60, int(remaining) % 60
+        if self._engine._countdown_active and self._engine.config.show_countdown:
+            items.append(f"⏱ {int(remaining)}s 后自动停止")
+            self._countdown_popup.hide()
+        else:
+            items.append(f"⏱ {e_min}:{e_sec:02d} / {r_min}:{r_sec:02d}")
         dev = self._engine.recorder.device_name
         if dev:
             items.append(f"🎤 {dev}")
@@ -498,6 +566,8 @@ class MiniRecordingWindow(QWidget):
         self._status_popup.show_status(items, self)
 
     def _hide_recording_status(self):
+        if self._rec_status_timer:
+            self._rec_status_timer.stop()
         self._status_popup.hide()
 
     def _cancel_deferred_shrink(self):
@@ -656,14 +726,24 @@ class MiniRecordingWindow(QWidget):
         if state == "recording":
             self._apply_recording()
         elif state == "processing":
+            self._countdown_popup.hide()
             self._apply_processing()
         elif state == "ready":
+            self._countdown_popup.hide()
             if self._mode in ("recording", "processing"):
                 self._shrink_to_idle()
 
     def _on_audio(self, data: bytes):
         if self._mode == "recording":
             self._waveform.update_data(data)
+
+    def _on_countdown_tick(self, seconds: int):
+        if self._mode == "recording" and seconds >= 0 \
+                and self._engine.config.show_countdown \
+                and not self._status_popup.isVisible():
+            self._countdown_popup.show_countdown(seconds, self)
+        else:
+            self._countdown_popup.hide()
 
     def _on_done(self, text: str):
         self._apply_done()

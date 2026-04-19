@@ -79,6 +79,18 @@ def _gen_confirm(volume: float = 0.3) -> bytes:
     return _gen_pcm(samples)
 
 
+def _gen_tick(volume: float = 0.25) -> bytes:
+    """Short 40ms tick at 880 Hz (A5) with fast decay — countdown beep."""
+    n = int(_SAMPLE_RATE * 0.04)
+    samples = []
+    for i in range(n):
+        t = i / _SAMPLE_RATE
+        progress = i / n
+        envelope = (1.0 - progress) ** 3
+        samples.append(math.sin(2 * math.pi * 880 * t) * envelope * volume)
+    return _gen_pcm(samples)
+
+
 class AudioCues:
     """Manages playback of UI sound effects.
 
@@ -93,6 +105,7 @@ class AudioCues:
             "start": _gen_chirp(80, 800, 1200, 0.35),
             "stop": _gen_chirp(80, 1000, 600, 0.35),
             "done": _gen_confirm(0.3),
+            "tick": _gen_tick(),
         }
         self._pa: pyaudio.PyAudio | None = None
         self._stream: pyaudio.Stream | None = None
@@ -194,3 +207,7 @@ class AudioCues:
     def play_done(self):
         if self._enabled:
             self._play("done", self._sounds["done"])
+
+    def play_tick(self):
+        if self._enabled:
+            self._play("tick", self._sounds["tick"])

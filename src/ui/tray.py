@@ -1962,6 +1962,7 @@ class VoiceTray(QSystemTrayIcon):
         engine.state_changed.connect(self._on_state)
         engine.transcription_done.connect(self._on_done)
         engine.mic_unavailable.connect(self._on_mic_unavailable)
+        engine.countdown_tick.connect(self._on_countdown_tick)
 
         mini.request_record.connect(self._on_tray_click)
         mini.request_stop.connect(self._on_tray_click)
@@ -1994,6 +1995,15 @@ class VoiceTray(QSystemTrayIcon):
         self._act_record = QAction("开始录音", menu)
         self._act_record.triggered.connect(self._on_tray_click)
         menu.addAction(self._act_record)
+
+        self._act_rec_info = QAction("", menu)
+        self._act_rec_info.setEnabled(False)
+        self._act_rec_info.setVisible(False)
+        menu.addAction(self._act_rec_info)
+
+        self._rec_info_timer = QTimer(self)
+        self._rec_info_timer.setInterval(1000)
+        self._rec_info_timer.timeout.connect(self._update_rec_info)
 
         menu.addSeparator()
 
@@ -2056,6 +2066,36 @@ class VoiceTray(QSystemTrayIcon):
         self._prompt_menu.setStyleSheet(MENU_STYLE)
         self._prompt_menu.aboutToShow.connect(self._sync_prompt_menu_checks)
         menu.addMenu(self._prompt_menu)
+
+        menu.addSeparator()
+
+        self._act_silence_trim = QAction("静音压缩", menu)
+        self._act_silence_trim.setCheckable(True)
+        self._act_silence_trim.setChecked(self._config.silence_trim)
+        self._act_silence_trim.triggered.connect(self._toggle_silence_trim)
+        menu.addAction(self._act_silence_trim)
+
+        self._act_show_countdown = QAction("显示最后倒计时", menu)
+        self._act_show_countdown.setCheckable(True)
+        self._act_show_countdown.setChecked(self._config.show_countdown)
+        self._act_show_countdown.triggered.connect(self._toggle_show_countdown)
+        menu.addAction(self._act_show_countdown)
+
+        self._duration_menu = QMenu("录音上限", menu)
+        self._duration_menu.setStyleSheet(MENU_STYLE)
+        self._duration_presets = [
+            (300, "5 分钟"),
+            (600, "10 分钟"),
+            (1200, "20 分钟"),
+        ]
+        for dur_sec, display in self._duration_presets:
+            act = QAction(display, self._duration_menu)
+            act.setCheckable(True)
+            act.setChecked(self._config.smart_chunk_max_duration_sec == dur_sec)
+            act.triggered.connect(
+                lambda checked, d=dur_sec: self._set_max_duration(d))
+            self._duration_menu.addAction(act)
+        menu.addMenu(self._duration_menu)
 
         menu.addSeparator()
 
@@ -2442,6 +2482,23 @@ class VoiceTray(QSystemTrayIcon):
         self._config.save()
         logger.info(f"[Tray] Save audio → {'on' if checked else 'off'}")
 
+    def _toggle_silence_trim(self, checked: bool):
+        self._config.silence_trim = checked
+        self._config.save()
+        logger.info(f"[Tray] Silence trim → {'on' if checked else 'off'}")
+
+    def _toggle_show_countdown(self, checked: bool):
+        self._config.show_countdown = checked
+        self._config.save()
+        logger.info(f"[Tray] Show countdown → {'on' if checked else 'off'}")
+
+    def _set_max_duration(self, seconds: int):
+        self._config.smart_chunk_max_duration_sec = seconds
+        self._config.save()
+        for i, (dur_sec, _) in enumerate(self._duration_presets):
+            self._duration_menu.actions()[i].setChecked(dur_sec == seconds)
+        logger.info(f"[Tray] Max recording duration → {seconds}s")
+
     def _toggle_hide_idle_mini(self, checked: bool):
         self._config.hide_mini_window_when_idle = checked
         self._config.save()
@@ -2662,12 +2719,35 @@ class VoiceTray(QSystemTrayIcon):
         self._sync_tray_icon_with_engine()
         if state == "recording":
             self._act_record.setText("停止录音")
+            self._act_rec_info.setVisible(True)
+            self._update_rec_info()
+            self._rec_info_timer.start()
         elif state == "processing":
             self._act_record.setText("处理中...")
             self._act_record.setEnabled(False)
+            self._act_rec_info.setVisible(False)
+            self._rec_info_timer.stop()
         elif state == "ready":
             self._act_record.setText("开始录音")
             self._act_record.setEnabled(True)
+            self._act_rec_info.setVisible(False)
+            self._rec_info_timer.stop()
+
+    def _update_rec_info(self):
+        if self._engine.state != "recording":
+            return
+        elapsed = self._engine.get_duration()
+        max_dur = self._engine.effective_max_duration
+        remaining = max(0, max_dur - elapsed)
+        e_min, e_sec = int(elapsed) // 60, int(elapsed) % 60
+        r_min, r_sec = int(remaining) // 60, int(remaining) % 60
+        self._act_rec_info.setText(
+            f"已录 {e_min}:{e_sec:02d} / 剩余 {r_min}:{r_sec:02d}"
+        )
+
+    def _on_countdown_tick(self, seconds: int):
+        if seconds >= 0 and self._config.show_countdown:
+            self._audio.play_tick()
 
     def _on_done(self, text: str):
         self._audio.play_done()

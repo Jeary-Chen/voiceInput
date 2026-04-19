@@ -52,8 +52,7 @@ def _mix_to_mono(data: bytes, channels: int) -> bytes:
 class VoiceRecorder:
     TARGET_RATE = 16000
     CHANNELS = 1
-    MAX_DURATION = 600       # 10 min hard cap
-    SILENCE_THRESHOLD = 200  # peak int16 amplitude below this = silence
+    SILENCE_THRESHOLD = 200     # peak int16 amplitude below this = silence
 
     def __init__(self, device_index: int | None = None, preferred_name: str = ""):
         self._device_index = device_index
@@ -435,13 +434,6 @@ class VoiceRecorder:
 
         if self._on_audio_data:
             self._on_audio_data(in_data)
-
-        elapsed = time.monotonic() - self._start_time
-        if elapsed >= self.MAX_DURATION:
-            logger.warning(f"{_TAG} Max duration ({self.MAX_DURATION}s) reached")
-            self._recording = False
-            if self._on_max_reached:
-                self._on_max_reached()
 
         return (None, pyaudio.paContinue)
 

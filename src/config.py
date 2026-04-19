@@ -43,6 +43,10 @@ class Config:
     show_result_text: bool = False
     autostart_enabled: bool = False
 
+    smart_chunk_max_duration_sec: int = 600
+    silence_trim: bool = True
+    show_countdown: bool = True
+
     mini_window_x: int | None = None
 
     @property
