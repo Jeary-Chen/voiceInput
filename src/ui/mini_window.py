@@ -570,6 +570,20 @@ class MiniRecordingWindow(QWidget):
             self._rec_status_timer.stop()
         self._status_popup.hide()
 
+    def _reposition_popups(self):
+        """Reposition visible popups to follow the mini bar during drag."""
+        for popup in (self._status_popup, self._countdown_popup):
+            if popup.isVisible():
+                pos = self.mapToGlobal(self.rect().bottomLeft())
+                screen = QApplication.primaryScreen()
+                if screen:
+                    geo = screen.availableGeometry()
+                    x = pos.x() + (self.width() - popup.width()) // 2
+                    x = max(geo.x(), min(x, geo.x() + geo.width() - popup.width()))
+                else:
+                    x = pos.x()
+                popup.move(x, pos.y() + 3)
+
     def _cancel_deferred_shrink(self):
         self._deferred_shrink_timer.stop()
 
@@ -811,6 +825,7 @@ class MiniRecordingWindow(QWidget):
             new_pos = event.globalPosition().toPoint() - self._drag_pos
             self.move(new_pos)
             self._anchor_x = new_pos.x() + self.width() // 2
+            self._reposition_popups()
 
     def mouseReleaseEvent(self, event):
         if self._drag_pos is not None and self._anchor_x is not None:
