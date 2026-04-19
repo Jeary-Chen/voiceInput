@@ -46,6 +46,7 @@ class Config:
     smart_chunk_max_duration_sec: int = 600
     silence_trim: bool = True
     show_countdown: bool = True
+    mini_bar_show_timer: bool = True
 
     mini_window_x: int | None = None
 

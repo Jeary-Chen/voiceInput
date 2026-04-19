@@ -2111,6 +2111,12 @@ class VoiceTray(QSystemTrayIcon):
         self._act_hide_idle_mini.triggered.connect(self._toggle_hide_idle_mini)
         menu.addAction(self._act_hide_idle_mini)
 
+        self._act_mini_bar_timer = QAction("显示磁吸栏倒计时", menu)
+        self._act_mini_bar_timer.setCheckable(True)
+        self._act_mini_bar_timer.setChecked(self._config.mini_bar_show_timer)
+        self._act_mini_bar_timer.triggered.connect(self._toggle_mini_bar_timer)
+        menu.addAction(self._act_mini_bar_timer)
+
         act_reset_pos = QAction("重置指示器位置", menu)
         act_reset_pos.triggered.connect(self._reset_mini_position)
         menu.addAction(act_reset_pos)
@@ -2491,6 +2497,11 @@ class VoiceTray(QSystemTrayIcon):
         self._config.show_countdown = checked
         self._config.save()
         logger.info(f"[Tray] Show countdown → {'on' if checked else 'off'}")
+
+    def _toggle_mini_bar_timer(self, checked: bool):
+        self._config.mini_bar_show_timer = checked
+        self._config.save()
+        logger.info(f"[Tray] Mini bar show timer → {'on' if checked else 'off'}")
 
     def _set_max_duration(self, seconds: int):
         self._config.smart_chunk_max_duration_sec = seconds
