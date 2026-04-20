@@ -351,6 +351,7 @@ class MiniRecordingWindow(QWidget):
         self._geom_anim = QPropertyAnimation(self, b"geometry")
         self._geom_anim.finished.connect(self._on_anim_finished)
         self._target_size = (IDLE_W, IDLE_H)
+        self._anim_interrupting = False
 
         self._result_popup = _ResultPopup()
         self._status_popup = _StatusPopup()
@@ -636,28 +637,38 @@ class MiniRecordingWindow(QWidget):
         screen = QApplication.primaryScreen()
         if not screen:
             return
-        # Expanding from hidden: show first, keep idle-sized start rect, then animate.
         if not self.isVisible():
             self.show()
             if self.width() < 2 or self.height() < 2:
                 self._position_at(IDLE_W, IDLE_H)
+
+        if self._geom_anim.state() == QPropertyAnimation.State.Running:
+            start = self._geom_anim.currentValue()
+        else:
+            start = self.geometry()
+
+        self._anim_interrupting = True
+        self._geom_anim.stop()
+        self._anim_interrupting = False
+
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        self.setGeometry(start)
 
         geo = screen.availableGeometry()
         x = self._get_x_for_width(w)
         y = geo.y() + 4
         target = QRect(x, y, w, h)
 
-        self.setMinimumSize(0, 0)
-        self.setMaximumSize(16777215, 16777215)
-
-        self._geom_anim.stop()
         self._geom_anim.setEasingCurve(easing)
         self._geom_anim.setDuration(duration)
-        self._geom_anim.setStartValue(self.geometry())
+        self._geom_anim.setStartValue(start)
         self._geom_anim.setEndValue(target)
         self._geom_anim.start()
 
     def _on_anim_finished(self):
+        if self._anim_interrupting:
+            return
         w, h = self._target_size
         self.setFixedSize(w, h)
         if self._mode == "shrinking":
@@ -687,7 +698,7 @@ class MiniRecordingWindow(QWidget):
         self._update_polish_style()
         self._update_show_result_style()
         self._set_widgets_for_mode("hover")
-        self._animate_to(HOVER_W, HOVER_H, 300,
+        self._animate_to(HOVER_W, HOVER_H, 220,
                          QEasingCurve.Type.InOutQuart)
 
     def _apply_recording(self):
@@ -730,7 +741,7 @@ class MiniRecordingWindow(QWidget):
         self._mode = "shrinking"
         self._hide_recording_status()
         self._set_widgets_for_mode("idle")
-        self._animate_to(IDLE_W, IDLE_H, 280,
+        self._animate_to(IDLE_W, IDLE_H, 200,
                          QEasingCurve.Type.InOutQuart)
         self.show()
 

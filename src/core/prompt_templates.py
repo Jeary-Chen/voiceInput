@@ -15,16 +15,11 @@ def default_prompt_templates() -> list[dict]:
             "name": "翻译为英语",
             "content": "翻译为英语",
         },
-        {
-            "id": "__tpl_dedup",
-            "name": "删除重复",
-            "content": "删除语句中的重复，去口语化",
-        },
     ]
 
 
 def seed_default_prompt_templates(cfg) -> None:
-    """Populate empty custom_prompts with defaults and activate the first entry."""
+    """Populate empty custom_prompts with defaults (no prompt active by default)."""
     tpls = default_prompt_templates()
     cfg.custom_prompts = copy.deepcopy(tpls)
-    cfg.active_prompt_id = tpls[0]["id"]
+    cfg.active_prompt_id = ""

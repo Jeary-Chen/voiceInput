@@ -2005,22 +2005,7 @@ class VoiceTray(QSystemTrayIcon):
         self._rec_info_timer.setInterval(1000)
         self._rec_info_timer.timeout.connect(self._update_rec_info)
 
-        menu.addSeparator()
-
-        act_history = QAction("打开历史记录", menu)
-        act_history.triggered.connect(self._open_history)
-        menu.addAction(act_history)
-
-        act_log = QAction("查看处理日志", menu)
-        act_log.triggered.connect(self._open_log)
-        menu.addAction(act_log)
-
-        self._act_save_audio = QAction("保存录音文件", menu)
-        self._act_save_audio.setCheckable(True)
-        self._act_save_audio.setChecked(self._config.save_audio)
-        self._act_save_audio.triggered.connect(self._toggle_save_audio)
-        menu.addAction(self._act_save_audio)
-
+        # ── 设备与模式 ──
         menu.addSeparator()
 
         self._device_menu = QMenu("输入设备", menu)
@@ -2060,26 +2045,13 @@ class VoiceTray(QSystemTrayIcon):
             self._polish_model_menu.addAction(act)
         menu.addMenu(self._polish_model_menu)
 
-        menu.addSeparator()
-
         self._prompt_menu = QMenu("自定义提示词", menu)
         self._prompt_menu.setStyleSheet(MENU_STYLE)
         self._prompt_menu.aboutToShow.connect(self._sync_prompt_menu_checks)
         menu.addMenu(self._prompt_menu)
 
+        # ── 录音参数 ──
         menu.addSeparator()
-
-        self._act_silence_trim = QAction("静音压缩", menu)
-        self._act_silence_trim.setCheckable(True)
-        self._act_silence_trim.setChecked(self._config.silence_trim)
-        self._act_silence_trim.triggered.connect(self._toggle_silence_trim)
-        menu.addAction(self._act_silence_trim)
-
-        self._act_show_countdown = QAction("显示最后倒计时", menu)
-        self._act_show_countdown.setCheckable(True)
-        self._act_show_countdown.setChecked(self._config.show_countdown)
-        self._act_show_countdown.triggered.connect(self._toggle_show_countdown)
-        menu.addAction(self._act_show_countdown)
 
         self._duration_menu = QMenu("录音上限", menu)
         self._duration_menu.setStyleSheet(MENU_STYLE)
@@ -2097,30 +2069,61 @@ class VoiceTray(QSystemTrayIcon):
             self._duration_menu.addAction(act)
         menu.addMenu(self._duration_menu)
 
+        self._act_silence_trim = QAction("静音压缩", menu)
+        self._act_silence_trim.setCheckable(True)
+        self._act_silence_trim.setChecked(self._config.silence_trim)
+        self._act_silence_trim.triggered.connect(self._toggle_silence_trim)
+        menu.addAction(self._act_silence_trim)
+
+        self._act_show_countdown = QAction("录音结束倒计时", menu)
+        self._act_show_countdown.setCheckable(True)
+        self._act_show_countdown.setChecked(self._config.show_countdown)
+        self._act_show_countdown.triggered.connect(self._toggle_show_countdown)
+        menu.addAction(self._act_show_countdown)
+
+        # ── 界面显示 ──
         menu.addSeparator()
 
-        self._act_show_result_text = QAction("显示识别原文", menu)
+        self._act_show_result_text = QAction("识别后显示原文", menu)
         self._act_show_result_text.setCheckable(True)
         self._act_show_result_text.setChecked(self._config.show_result_text)
         self._act_show_result_text.triggered.connect(self._toggle_show_result_text)
         menu.addAction(self._act_show_result_text)
 
-        self._act_hide_idle_mini = QAction("空闲时隐藏顶部磁吸栏", menu)
-        self._act_hide_idle_mini.setCheckable(True)
-        self._act_hide_idle_mini.setChecked(self._config.hide_mini_window_when_idle)
-        self._act_hide_idle_mini.triggered.connect(self._toggle_hide_idle_mini)
-        menu.addAction(self._act_hide_idle_mini)
-
-        self._act_mini_bar_timer = QAction("显示磁吸栏倒计时", menu)
+        self._act_mini_bar_timer = QAction("悬停显示录音计时", menu)
         self._act_mini_bar_timer.setCheckable(True)
         self._act_mini_bar_timer.setChecked(self._config.mini_bar_show_timer)
         self._act_mini_bar_timer.triggered.connect(self._toggle_mini_bar_timer)
         menu.addAction(self._act_mini_bar_timer)
 
-        act_reset_pos = QAction("重置指示器位置", menu)
+        self._act_hide_idle_mini = QAction("空闲时隐藏磁吸栏", menu)
+        self._act_hide_idle_mini.setCheckable(True)
+        self._act_hide_idle_mini.setChecked(self._config.hide_mini_window_when_idle)
+        self._act_hide_idle_mini.triggered.connect(self._toggle_hide_idle_mini)
+        menu.addAction(self._act_hide_idle_mini)
+
+        act_reset_pos = QAction("重置磁吸栏位置", menu)
         act_reset_pos.triggered.connect(self._reset_mini_position)
         menu.addAction(act_reset_pos)
 
+        # ── 记录与日志 ──
+        menu.addSeparator()
+
+        act_history = QAction("打开历史记录", menu)
+        act_history.triggered.connect(self._open_history)
+        menu.addAction(act_history)
+
+        act_log = QAction("查看日志", menu)
+        act_log.triggered.connect(self._open_log)
+        menu.addAction(act_log)
+
+        self._act_save_audio = QAction("保存录音文件", menu)
+        self._act_save_audio.setCheckable(True)
+        self._act_save_audio.setChecked(self._config.save_audio)
+        self._act_save_audio.triggered.connect(self._toggle_save_audio)
+        menu.addAction(self._act_save_audio)
+
+        # ── 系统设置 ──
         menu.addSeparator()
 
         self._act_autostart = QAction("开机自启", menu)
@@ -2128,8 +2131,6 @@ class VoiceTray(QSystemTrayIcon):
         self._act_autostart.setChecked(self._config.autostart_enabled)
         self._act_autostart.triggered.connect(self._toggle_autostart)
         menu.addAction(self._act_autostart)
-
-        menu.addSeparator()
 
         hotkey_display = _hotkey_display(self._config.hotkey)
         self._act_hotkey = QAction(f"快捷键: {hotkey_display}", menu)
