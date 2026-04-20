@@ -541,15 +541,15 @@ class MiniRecordingWindow(QWidget):
         items: list[str] = []
         cfg = self._engine.config
         if cfg.mini_bar_show_timer:
-            elapsed = self._engine.get_duration()
-            max_dur = self._engine.effective_max_duration
-            remaining = max(0, max_dur - elapsed)
-            e_min, e_sec = int(elapsed) // 60, int(elapsed) % 60
-            r_min, r_sec = int(remaining) // 60, int(remaining) % 60
             if self._engine._countdown_active and cfg.show_countdown:
-                items.append(f"⏱ {int(remaining)}s 后自动停止")
+                items.append(f"⏱ {self._engine._countdown_secs}s 后自动停止")
                 self._countdown_popup.hide()
             else:
+                elapsed = self._engine.get_duration()
+                max_dur = self._engine.effective_max_duration
+                remaining = max(0, max_dur - elapsed)
+                e_min, e_sec = int(elapsed) // 60, int(elapsed) % 60
+                r_min, r_sec = int(remaining) // 60, int(remaining) % 60
                 items.append(f"⏱ {e_min}:{e_sec:02d} / {r_min}:{r_sec:02d}")
         dev = self._engine.recorder.device_name
         if dev:
@@ -812,6 +812,10 @@ class MiniRecordingWindow(QWidget):
         elif self._mode == "recording":
             self._btn_rec_stop.setVisible(False)
             self._animate_to(REC_W, REC_H, 150)
+            if self._engine._countdown_active \
+                    and self._engine.config.show_countdown:
+                self._countdown_popup.show_countdown(
+                    self._engine._countdown_secs, self)
         self.update()
 
     def mousePressEvent(self, event):

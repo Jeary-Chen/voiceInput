@@ -60,11 +60,11 @@ class VoiceRecorder:
         self._pa: pyaudio.PyAudio | None = None
         self._stream: pyaudio.Stream | None = None
         self._audio_chunks: list[bytes] = []
+        self._total_bytes: int = 0
         self._recording = False
         self._on_audio_data: Callable[[bytes], None] | None = None
         self._on_max_reached: Callable[[], None] | None = None
         self._on_mic_error: Callable[[], None] | None = None
-        self._start_time: float = 0.0
         self._chunk_count = 0
         self._peak_amplitude: int = 0
         self._status_errors: int = 0
@@ -175,10 +175,10 @@ class VoiceRecorder:
               on_max_reached: Callable[[], None] | None = None,
               on_mic_error: Callable[[], None] | None = None):
         self._audio_chunks = []
+        self._total_bytes = 0
         self._on_audio_data = on_audio_data
         self._on_max_reached = on_max_reached
         self._on_mic_error = on_mic_error
-        self._start_time = time.monotonic()
         self._chunk_count = 0
         self._peak_amplitude = 0
         self._status_errors = 0
@@ -240,6 +240,7 @@ class VoiceRecorder:
         self._recording = False
         self._stop_stream()
         self._audio_chunks = []
+        self._total_bytes = 0
         logger.info(f"{_TAG} Recording cancelled, chunks discarded")
 
     # ── stream management ──
@@ -307,8 +308,7 @@ class VoiceRecorder:
         return result
 
     def get_duration(self) -> float:
-        total_bytes = sum(len(c) for c in self._audio_chunks)
-        return total_bytes / (self._stream_rate * 2)
+        return self._total_bytes / (self._stream_rate * 2)
 
     def is_silent(self) -> bool:
         return self._peak_amplitude < self.SILENCE_THRESHOLD
@@ -426,6 +426,7 @@ class VoiceRecorder:
             self._peak_amplitude = chunk_peak
 
         self._audio_chunks.append(in_data)
+        self._total_bytes += len(in_data)
         self._chunk_count += 1
 
         if self._chunk_count == 1:

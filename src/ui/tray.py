@@ -2748,10 +2748,14 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state != "recording":
             return
         elapsed = self._engine.get_duration()
-        max_dur = self._engine.effective_max_duration
-        remaining = max(0, max_dur - elapsed)
         e_min, e_sec = int(elapsed) // 60, int(elapsed) % 60
-        r_min, r_sec = int(remaining) // 60, int(remaining) % 60
+        if self._engine._countdown_active:
+            secs = max(0, self._engine._countdown_secs)
+            r_min, r_sec = secs // 60, secs % 60
+        else:
+            max_dur = self._engine.effective_max_duration
+            remaining = max(0, max_dur - elapsed)
+            r_min, r_sec = int(remaining) // 60, int(remaining) % 60
         self._act_rec_info.setText(
             f"已录 {e_min}:{e_sec:02d} / 剩余 {r_min}:{r_sec:02d}"
         )

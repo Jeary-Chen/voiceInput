@@ -15,6 +15,7 @@ import numpy as np
 
 from config import Config
 from core.log import logger
+from core.recorder import VoiceRecorder
 
 _TAG = "[History]"
 
@@ -93,7 +94,7 @@ class HistoryManager:
             with wave.open(str(wav_path), "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
-                wf.setframerate(16000)
+                wf.setframerate(VoiceRecorder.TARGET_RATE)
                 wf.writeframes(audio_data)
 
         logger.info(f"{_TAG} Saved entry {entry_id} "

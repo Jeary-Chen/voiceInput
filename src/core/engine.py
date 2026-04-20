@@ -180,7 +180,6 @@ class VoiceEngine(QObject):
             logger.warning(f"{_TAG} No input device available")
             self.mic_unavailable.emit("未找到输入设备")
             return
-        self._record_t0 = time.monotonic()
         rec_kwargs = dict(
             on_audio_data=self._on_audio_chunk,
             on_max_reached=self._on_max_reached,
@@ -232,7 +231,7 @@ class VoiceEngine(QObject):
             self._set_state("ready")
             return
 
-        elapsed = time.monotonic() - self._record_t0
+        elapsed = self.get_duration()
         max_dur = self.effective_max_duration
         remaining = max_dur - elapsed
 
@@ -244,15 +243,19 @@ class VoiceEngine(QObject):
                 self._countdown_active = False
                 self.countdown_tick.emit(-1)
             self._stop_recording()
-        elif remaining <= COUNTDOWN_SEC:
+        elif remaining < COUNTDOWN_SEC + 1:
             if not self._countdown_active:
                 self._countdown_active = True
-                logger.info(f"{_TAG} Countdown started: {int(remaining)}s remaining")
-            secs = int(remaining)
-            self.countdown_tick.emit(secs)
-            if secs <= 0:
-                logger.info(f"{_TAG} Auto-stop: max duration ({max_dur}s) reached")
-                self._stop_recording()
+                self._countdown_secs = COUNTDOWN_SEC
+                logger.info(f"{_TAG} Countdown started: {self._countdown_secs}s remaining")
+                self.countdown_tick.emit(self._countdown_secs)
+            else:
+                self._countdown_secs -= 1
+                secs = max(0, self._countdown_secs)
+                self.countdown_tick.emit(secs)
+                if secs <= 0:
+                    logger.info(f"{_TAG} Auto-stop: max duration ({max_dur}s) reached")
+                    self._stop_recording()
         elif self._countdown_active:
             self._countdown_active = False
             self.countdown_tick.emit(-1)
@@ -262,15 +265,15 @@ class VoiceEngine(QObject):
     def _stop_recording(self):
         if self._state != "recording":
             return
-        wall_duration = time.monotonic() - self._record_t0
         pcm = self.recorder.stop()
         if not pcm:
-            logger.warning(f"{_TAG} No audio captured after {wall_duration:.1f}s")
+            logger.warning(f"{_TAG} No audio captured")
             self.error_occurred.emit("未录到音频，请重试")
             self._set_state("ready")
             return
 
-        logger.info(f"{_TAG} Recording stopped — {wall_duration:.1f}s, "
+        duration = len(pcm) / (VoiceRecorder.TARGET_RATE * 2)
+        logger.info(f"{_TAG} Recording stopped — {duration:.1f}s, "
                     f"PCM {len(pcm)} bytes")
 
         if self.recorder.is_silent():
@@ -280,7 +283,7 @@ class VoiceEngine(QObject):
             self._set_state("ready")
             return
 
-        self._start_batch_transcribe(pcm, wall_duration)
+        self._start_batch_transcribe(pcm, duration)
 
     def _start_batch_transcribe(self, pcm: bytes, duration: float):
         self._set_state("processing")
@@ -291,7 +294,7 @@ class VoiceEngine(QObject):
         if self.config.silence_trim:
             asr_pcm, trim_info = trim_silence(pcm)
             self._processing_info["silence_trim"] = trim_info
-            duration = len(asr_pcm) / (16000 * 2)
+            duration = len(asr_pcm) / (VoiceRecorder.TARGET_RATE * 2)
 
         needs_chunking = duration > MAX_CHUNK_SEC
         logger.info(f"{_TAG} Pipeline: silence_trim={'on' if self.config.silence_trim else 'off'}, "
@@ -351,7 +354,7 @@ class VoiceEngine(QObject):
             logger.info(f"{_TAG} Copied {len(text)} chars to clipboard")
 
         original_pcm = self._original_pcm
-        duration = len(original_pcm) / (16000 * 2)
+        duration = len(original_pcm) / (VoiceRecorder.TARGET_RATE * 2)
         proc_info = self._processing_info if self._processing_info else None
         self.history.save_entry(
             text=text,
