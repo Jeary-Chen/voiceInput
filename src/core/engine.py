@@ -236,11 +236,19 @@ class VoiceEngine(QObject):
         max_dur = self.effective_max_duration
         remaining = max_dur - elapsed
 
-        if remaining <= COUNTDOWN_SEC:
+        if remaining <= 0:
+            # Limit already exceeded (e.g. user lowered the limit mid-recording)
+            logger.info(f"{_TAG} Auto-stop: limit ({max_dur}s) already exceeded "
+                        f"(elapsed={elapsed:.0f}s)")
+            if self._countdown_active:
+                self._countdown_active = False
+                self.countdown_tick.emit(-1)
+            self._stop_recording()
+        elif remaining <= COUNTDOWN_SEC:
             if not self._countdown_active:
                 self._countdown_active = True
                 logger.info(f"{_TAG} Countdown started: {int(remaining)}s remaining")
-            secs = max(0, int(remaining))
+            secs = int(remaining)
             self.countdown_tick.emit(secs)
             if secs <= 0:
                 logger.info(f"{_TAG} Auto-stop: max duration ({max_dur}s) reached")

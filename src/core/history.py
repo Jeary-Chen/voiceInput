@@ -11,10 +11,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 from config import Config
 from core.log import logger
 
 _TAG = "[History]"
+
+
+class _SafeEncoder(json.JSONEncoder):
+    """Convert numpy scalars to native Python types for JSON serialization."""
+
+    def default(self, o):
+        if isinstance(o, np.integer):
+            return int(o)
+        if isinstance(o, np.floating):
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return super().default(o)
 
 
 @dataclass
@@ -71,7 +86,7 @@ class HistoryManager:
 
         meta_path = self._dir / f"{entry_id}.json"
         with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2, cls=_SafeEncoder)
 
         if audio_data:
             wav_path = self._dir / f"{entry_id}.wav"

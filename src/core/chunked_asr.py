@@ -13,8 +13,8 @@ from core.log import logger
 
 _TAG = "[Chunk]"
 
-MAX_CHUNK_SEC = 240       # 4 min — safe API limit (5 min / 10 MB)
-MIN_CHUNK_SEC = 120       # 2 min — avoid overly short leading chunks
+MAX_CHUNK_SEC = 180       # 3 min — safe margin for API limit (5 min / 10 MB)
+MIN_CHUNK_SEC = 90        # 1.5 min — avoid overly short leading chunks
 WINDOW_MS = 50            # energy analysis window
 SMOOTH_MS = 300           # moving-average smoothing window
 QUIET_PERCENTILE = 10     # pick split from quietest 10% of windows
@@ -54,7 +54,7 @@ def transcribe_chunked(
 
         for fut in as_completed(futures):
             idx = futures[fut]
-            result = fut.result()  # raises on error
+            result = fut.result()
             chunk_results[idx] = result
             logger.info(f"{_TAG} Chunk {idx + 1}/{len(chunks)} done in "
                         f"{result['asr_time_sec']:.1f}s → {result['char_count']} chars")
@@ -150,7 +150,7 @@ def find_silence_splits(pcm: bytes, sample_rate: int = 16000) -> list[int]:
         quietest = sorted_indices[:n_candidates]
 
         best_win_local = quietest[np.argmax(quietest)]
-        best_win_global = ss_win + best_win_local
+        best_win_global = int(ss_win + best_win_local)
         best_sample = best_win_global * win_samples
         split_at = best_sample * bytes_per_sample
 
