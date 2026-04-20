@@ -1791,13 +1791,13 @@ class _PolishPromptDialog(QDialog):
         if not self._run_modal_guarding_hotkey(_ask_restore):
             return
         self._prompts = copy.deepcopy(default_prompt_templates())
-        self._active_id = self._prompts[0]["id"]
-        self._last_row = 1
+        self._active_id = ""
+        self._last_row = 0
         self._refresh_list()
         self._switching = True
-        self._list.setCurrentRow(1)
+        self._list.setCurrentRow(0)
         self._switching = False
-        self._load_editor(1)
+        self._load_editor(0)
         self._update_save_button()
 
     # ── save / close ──

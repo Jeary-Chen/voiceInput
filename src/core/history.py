@@ -41,6 +41,7 @@ class HistoryEntry:
     mode: str
     timestamp: float
     has_audio: bool = False
+    raw_text: str = ""
     processing_info: dict | None = None
 
     @property
@@ -69,6 +70,7 @@ class HistoryManager:
 
     def save_entry(self, text: str, duration: float, mode: str,
                    audio_data: Optional[bytes] = None,
+                   raw_text: str = "",
                    processing_info: Optional[dict] = None) -> HistoryEntry:
         entry_id = self._next_id()
         entry = HistoryEntry(
@@ -78,10 +80,13 @@ class HistoryManager:
             mode=mode,
             timestamp=time.time(),
             has_audio=audio_data is not None,
+            raw_text=raw_text,
             processing_info=processing_info,
         )
 
         data = asdict(entry)
+        if not data.get("raw_text"):
+            del data["raw_text"]
         if data.get("processing_info") is None:
             del data["processing_info"]
 

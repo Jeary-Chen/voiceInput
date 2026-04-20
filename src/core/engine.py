@@ -127,6 +127,7 @@ class VoiceEngine(QObject):
         self._polish_worker: _PolishWorker | None = None
         self._processing_info: dict | None = None
         self._original_pcm: bytes = b""
+        self._raw_text: str = ""
         self._countdown_active = False
         self._max_reached.connect(self._stop_recording)
         self._mic_error.connect(self._on_recording_mic_error)
@@ -335,6 +336,7 @@ class VoiceEngine(QObject):
 
         if self.config.mode == "polish":
             logger.info(f"{_TAG} Entering polish pipeline")
+            self._raw_text = text
             self._set_state("processing")
             self.live_text.emit(f"[原文] {text}")
             self._polish_worker = _PolishWorker(self.polisher, text, self.config)
@@ -343,6 +345,7 @@ class VoiceEngine(QObject):
             self._polish_worker.finished.connect(self._cleanup_polish_worker)
             self._polish_worker.start()
         else:
+            self._raw_text = ""
             self._inject_and_save(text)
 
     def _inject_and_save(self, text: str):
@@ -361,10 +364,12 @@ class VoiceEngine(QObject):
             duration=duration,
             mode=self.config.mode,
             audio_data=original_pcm if self.config.save_audio else None,
+            raw_text=self._raw_text,
             processing_info=proc_info,
         )
         self._original_pcm = b""
         self._processing_info = None
+        self._raw_text = ""
         self.transcription_done.emit(text)
         self._set_state("ready")
 
