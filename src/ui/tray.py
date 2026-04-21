@@ -2151,6 +2151,7 @@ class VoiceTray(QSystemTrayIcon):
         self.setContextMenu(menu)
 
         self._rebuild_prompt_menu()
+        self._skip_pa_release = True
         self._start_async_refresh()
 
     # ── device refresh (background thread) ──
@@ -2171,9 +2172,12 @@ class VoiceTray(QSystemTrayIcon):
             self._dev_refresh_repeat = True
             return
         self._dev_refresh_running = True
-        worker = _DeviceRefreshWorker(
-            self._release_recorder_pa, self._audio.release,
-        )
+        skip = getattr(self, '_skip_pa_release', False)
+        self._skip_pa_release = False
+        self._skip_pa_restore = skip
+        release_rec = (lambda: None) if skip else self._release_recorder_pa
+        release_audio = (lambda: None) if skip else self._audio.release
+        worker = _DeviceRefreshWorker(release_rec, release_audio)
         worker.finished.connect(self._on_refresh_result)
         worker.finished.connect(worker.deleteLater)
         self._dev_refresh_worker = worker
@@ -2185,7 +2189,9 @@ class VoiceTray(QSystemTrayIcon):
         self._dev_refresh_ready = True
         logger.info(f"[Tray] Device refresh done: "
                     f"default='{default_name}', {len(devices)} device(s)")
-        self._restore_all_pa()
+        if not self._skip_pa_restore:
+            self._restore_all_pa()
+        self._skip_pa_restore = False
         self._sync_system_default_device()
         self._auto_fallback_if_device_gone()
         self._rebuild_device_menu()
