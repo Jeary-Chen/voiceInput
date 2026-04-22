@@ -1,4 +1,4 @@
-"""ASR backend — batch transcription via DashScope (qwen3-asr-flash)."""
+"""ASR backend — batch transcription via DashScope (qwen3-asr-flash series)."""
 import base64
 import io
 import wave
@@ -13,7 +13,7 @@ _TAG = "[ASR]"
 class DashScopeASR:
     """Batch ASR — records everything, then transcribes in one shot."""
 
-    def __init__(self, api_key: str, model: str = "qwen3-asr-flash",
+    def __init__(self, api_key: str, model: str = "qwen3-asr-flash-2026-02-10",
                  base_url: str = "https://dashscope.aliyuncs.com/api/v1"):
         self.api_key = api_key
         self.model = model

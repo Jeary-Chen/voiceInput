@@ -13,6 +13,9 @@ def _config_path() -> Path:
     return _config_dir() / "config.json"
 
 
+LATEST_ASR_MODEL = "qwen3-asr-flash-2026-02-10"
+
+
 @dataclass
 class Config:
     hotkey: str = "lctrl+lshift+r"
@@ -25,8 +28,8 @@ class Config:
 
     api_key: str = ""
     api_base_url: str = "https://dashscope.aliyuncs.com/api/v1"
-    asr_model: str = "qwen3-asr-flash"
-    polish_model: str = "qwen3.5-flash"
+    asr_model: str = LATEST_ASR_MODEL
+    polish_model: str = "qwen3.6-flash"
 
     mic_index: int | None = None
     mic_name: str = ""
@@ -92,6 +95,8 @@ class Config:
 
         if not cfg.api_key:
             cfg.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+
+        cfg.asr_model = LATEST_ASR_MODEL
 
         _VALID_KEYS = set("abcdefghijklmnopqrstuvwxyz")
         _VALID_KEYS |= {str(i) for i in range(10)}

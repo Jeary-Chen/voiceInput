@@ -28,6 +28,11 @@ _T_modal = TypeVar("_T_modal")
 from core.log import logger
 from core.engine import VoiceEngine
 from core.polisher import DEFAULT_INSTRUCTIONS
+POLISH_MODELS: list[tuple[str, str]] = [
+    ("qwen3.6-flash", "Qwen3.6 Flash"),
+    ("qwen3.6-plus",  "Qwen3.6 Plus"),
+    ("qwen3-max",     "Qwen3 Max"),
+]
 from core.prompt_templates import default_prompt_templates
 from ui.mini_window import MiniRecordingWindow
 from ui.sounds import AudioCues
@@ -1931,6 +1936,7 @@ class _DeviceRefreshWorker(QThread):
 
 
 class VoiceTray(QSystemTrayIcon):
+
     def __init__(self, engine: VoiceEngine, mini: MiniRecordingWindow, config: Config):
         super().__init__()
         self._engine = engine
@@ -2031,18 +2037,8 @@ class VoiceTray(QSystemTrayIcon):
 
         self._polish_model_menu = QMenu("润色模型", menu)
         self._polish_model_menu.setStyleSheet(MENU_STYLE)
-        self._polish_models = [
-            ("qwen3.5-flash", "Qwen3.5 Flash"),
-            ("qwen-flash", "Qwen Flash"),
-            ("qwen-plus", "Qwen Plus"),
-            ("qwen-max", "Qwen Max"),
-        ]
-        for model_id, display_name in self._polish_models:
-            act = QAction(display_name, self._polish_model_menu)
-            act.setCheckable(True)
-            act.setChecked(self._config.polish_model == model_id)
-            act.triggered.connect(lambda checked, m=model_id: self._set_polish_model(m))
-            self._polish_model_menu.addAction(act)
+        self._polish_models = list(POLISH_MODELS)
+        self._populate_polish_menu()
         menu.addMenu(self._polish_model_menu)
 
         self._prompt_menu = QMenu("自定义提示词", menu)
@@ -2142,6 +2138,11 @@ class VoiceTray(QSystemTrayIcon):
         menu.addAction(act_apikey)
 
         menu.addSeparator()
+
+        from _version import VERSION
+        act_ver = QAction(f"v{VERSION}", menu)
+        act_ver.setEnabled(False)
+        menu.addAction(act_ver)
 
         act_quit = QAction("退出", menu)
         act_quit.triggered.connect(self._quit)
@@ -2437,6 +2438,19 @@ class VoiceTray(QSystemTrayIcon):
         """供提示词等对话框在 QMessageBox.exec 等模态调用外包裹，与 hotkey_paused 同一套 refcount。"""
         with self.hotkey_paused():
             return fn()
+
+    def _populate_polish_menu(self):
+        self._polish_model_menu.clear()
+        current = self._config.polish_model
+        found_current = any(mid == current for mid, _ in self._polish_models)
+        if not found_current:
+            self._polish_models.insert(0, (current, current))
+        for model_id, display_name in self._polish_models:
+            act = QAction(display_name, self._polish_model_menu)
+            act.setCheckable(True)
+            act.setChecked(model_id == current)
+            act.triggered.connect(lambda checked, m=model_id: self._set_polish_model(m))
+            self._polish_model_menu.addAction(act)
 
     def _set_polish_model(self, model_id: str):
         self._config.polish_model = model_id

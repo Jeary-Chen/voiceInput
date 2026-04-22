@@ -27,11 +27,14 @@ def _build_system_prompt(custom_instructions: str) -> str:
 
 
 def _extract_from_codeblock(text: str) -> str:
-    """从 markdown 代码块中提取内容，解析失败则返回原文。"""
+    """从 markdown 代码块中提取内容，兼容各种残缺格式。"""
     match = re.search(r"```(?:\w*)\n(.*?)```", text, re.DOTALL)
     if match:
         return match.group(1).strip()
-    return text.strip()
+    cleaned = text.strip()
+    cleaned = re.sub(r"^`{1,3}\s*\w*\n?", "", cleaned)
+    cleaned = re.sub(r"\n?`{1,3}\s*$", "", cleaned)
+    return cleaned.strip()
 
 
 def _to_compatible_url(base_url: str) -> str:
@@ -42,7 +45,7 @@ def _to_compatible_url(base_url: str) -> str:
 
 
 class TextPolisher:
-    def __init__(self, api_key: str, model: str = "qwen3.5-flash",
+    def __init__(self, api_key: str, model: str = "qwen3.6-flash",
                  base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"):
         self._model = model
         self._base_url = _to_compatible_url(base_url)
