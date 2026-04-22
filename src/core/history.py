@@ -43,6 +43,8 @@ class HistoryEntry:
     has_audio: bool = False
     raw_text: str = ""
     processing_info: dict | None = None
+    failed: bool = False
+    error_msg: str = ""
 
     @property
     def datetime_str(self) -> str:
@@ -50,6 +52,8 @@ class HistoryEntry:
 
     @property
     def short_text(self) -> str:
+        if self.failed:
+            return "[转录失败]"
         return self.text[:50] + ("..." if len(self.text) > 50 else "")
 
 
@@ -71,8 +75,11 @@ class HistoryManager:
     def save_entry(self, text: str, duration: float, mode: str,
                    audio_data: Optional[bytes] = None,
                    raw_text: str = "",
-                   processing_info: Optional[dict] = None) -> HistoryEntry:
-        entry_id = self._next_id()
+                   processing_info: Optional[dict] = None,
+                   failed: bool = False,
+                   error_msg: str = "") -> HistoryEntry:
+        base_id = self._next_id()
+        entry_id = f"{base_id}_failed" if failed else base_id
         entry = HistoryEntry(
             id=entry_id,
             text=text,
@@ -82,6 +89,8 @@ class HistoryManager:
             has_audio=audio_data is not None,
             raw_text=raw_text,
             processing_info=processing_info,
+            failed=failed,
+            error_msg=error_msg,
         )
 
         data = asdict(entry)
@@ -89,6 +98,10 @@ class HistoryManager:
             del data["raw_text"]
         if data.get("processing_info") is None:
             del data["processing_info"]
+        if not data.get("failed"):
+            del data["failed"]
+        if not data.get("error_msg"):
+            del data["error_msg"]
 
         meta_path = self._dir / f"{entry_id}.json"
         with open(meta_path, "w", encoding="utf-8") as f:
@@ -104,6 +117,7 @@ class HistoryManager:
 
         logger.info(f"{_TAG} Saved entry {entry_id} "
                     f"({duration:.1f}s, mode={mode}"
+                    f"{', failed' if failed else ''}"
                     f"{', +wav' if audio_data else ''})")
         self._enforce_size_limit()
         return entry
@@ -159,13 +173,18 @@ class HistoryManager:
 
     def _next_id(self) -> str:
         base = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        if not (self._dir / f"{base}.json").exists():
+        if not self._id_taken(base):
             return base
         for seq in range(2, 100):
             candidate = f"{base}_{seq}"
-            if not (self._dir / f"{candidate}.json").exists():
+            if not self._id_taken(candidate):
                 return candidate
         return f"{base}_{int(time.time() * 1000) % 10000}"
+
+    def _id_taken(self, base: str) -> bool:
+        """Return True if base or base_failed entry files already exist."""
+        return ((self._dir / f"{base}.json").exists()
+                or (self._dir / f"{base}_failed.json").exists())
 
     def _enforce_size_limit(self):
         """Delete oldest entries until total size is under MAX_SIZE_BYTES."""

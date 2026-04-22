@@ -327,9 +327,26 @@ class VoiceEngine(QObject):
             self._polish_worker.deleteLater()
             self._polish_worker = None
 
+    def _save_failed_audio(self, error_msg: str = ""):
+        """Save a failed entry to history (JSON always; WAV only when save_audio is on)."""
+        if not self._original_pcm:
+            return
+        duration = len(self._original_pcm) / (VoiceRecorder.TARGET_RATE * 2)
+        self.history.save_entry(
+            text="",
+            duration=duration,
+            mode=self.config.mode,
+            audio_data=self._original_pcm if self.config.save_audio else None,
+            failed=True,
+            error_msg=error_msg,
+        )
+
     def _finalize(self, text: str):
         if not text:
             logger.warning(f"{_TAG} Empty transcription result")
+            self._save_failed_audio(error_msg="识别结果为空")
+            self._original_pcm = b""
+            self._processing_info = None
             self.error_occurred.emit("识别结果为空")
             self._set_state("ready")
             return
@@ -375,6 +392,7 @@ class VoiceEngine(QObject):
 
     def _on_transcribe_error(self, msg: str):
         logger.error(f"{_TAG} Transcription error: {msg}")
+        self._save_failed_audio(error_msg=msg)
         self._original_pcm = b""
         self._processing_info = None
         self.error_occurred.emit(msg)
