@@ -6,6 +6,9 @@ Behavior:
   - Recording: capsule with waveform (stop button on hover)
   - Done:      if show-result is on, popup shows final text below
 """
+import ctypes
+import sys
+
 from PyQt6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, pyqtSignal,
 )
@@ -376,6 +379,42 @@ class MiniRecordingWindow(QWidget):
         engine.audio_data.connect(self._on_audio)
         engine.transcription_done.connect(self._on_done)
         engine.countdown_tick.connect(self._on_countdown_tick)
+
+        self._winevent_hook = None
+        self._winevent_cb_ref = None
+        if sys.platform == "win32":
+            self._install_foreground_hook()
+
+    # ── Win32 topmost enforcement ──
+
+    _SWP_FLAGS = 0x0002 | 0x0001 | 0x0010  # NOMOVE | NOSIZE | NOACTIVATE
+
+    def _install_foreground_hook(self):
+        from ctypes import wintypes
+        WINEVENTPROC = ctypes.WINFUNCTYPE(
+            None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
+            ctypes.c_long, ctypes.c_long, wintypes.DWORD, wintypes.DWORD,
+        )
+        self._winevent_cb_ref = WINEVENTPROC(self._on_foreground_change)
+        EVENT_SYSTEM_FOREGROUND = 0x0003
+        WINEVENT_OUTOFCONTEXT = 0x0000
+        self._winevent_hook = ctypes.windll.user32.SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+            0, self._winevent_cb_ref, 0, 0, WINEVENT_OUTOFCONTEXT,
+        )
+
+    def _on_foreground_change(self, hook, event, hwnd, id_obj, id_child, tid, time):
+        my_hwnd = int(self.winId()) if self.isVisible() else 0
+        if my_hwnd and hwnd != my_hwnd:
+            ctypes.windll.user32.SetWindowPos(
+                my_hwnd, -1, 0, 0, 0, 0, self._SWP_FLAGS,
+            )
+
+    def closeEvent(self, event):
+        if self._winevent_hook:
+            ctypes.windll.user32.UnhookWinEvent(self._winevent_hook)
+            self._winevent_hook = None
+        super().closeEvent(event)
 
     # ── UI build ──
 
