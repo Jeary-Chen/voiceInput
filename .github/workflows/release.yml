@@ -21,16 +21,22 @@ jobs:
       - name: Install build dependencies
         run: |
           pip install pyinstaller
-          pip install -r src/requirements.txt
+          pip install PyQt6 numpy dashscope openai loguru pynput pyperclip tzdata comtypes
+          pip install pyaudio --only-binary=:all:
 
-      - name: Build all artifacts
-        run: python _scripts/build.py --all
+      - name: Build single-file exe
+        run: python _scripts/build.py --onefile
+
+      - name: Rename artifact with version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION).Trim()
+          $src = "dist/VoiceInput.exe"
+          $dst = "dist/VoiceInput-${version}-portable.exe"
+          if (Test-Path $src) { Rename-Item $src $dst }
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/VoiceInput-*-portable.exe
-            dist/VoiceInput-*-portable.zip
-            dist/VoiceInput-*-setup.exe
+          files: dist/VoiceInput-*-portable.exe
           generate_release_notes: true
