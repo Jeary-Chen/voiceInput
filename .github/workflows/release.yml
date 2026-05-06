@@ -13,6 +13,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Sync VERSION from tag
         shell: pwsh
@@ -40,25 +42,53 @@ jobs:
       - name: Build all artifacts
         run: python scripts/build.py --all
 
+      - name: Generate release body
+        id: notes
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $prev_tag = git describe --tags --abbrev=0 HEAD^ 2>$null
+          if ($prev_tag) {
+            $logs = git log --pretty=format:"%s" "$prev_tag..HEAD" | Where-Object { $_ -notmatch "^chore: release" }
+          } else {
+            $logs = git log --pretty=format:"%s" | Where-Object { $_ -notmatch "^chore: release" }
+          }
+
+          $feats = @($logs | Where-Object { $_ -match "^feat" } | ForEach-Object { $_ -replace "^feat(\(.+?\))?:\s*", "" })
+          $fixes = @($logs | Where-Object { $_ -match "^fix" } | ForEach-Object { $_ -replace "^fix(\(.+?\))?:\s*", "" })
+
+          $body = "## VoiceInput v${version}`n"
+          if ($feats.Count -gt 0) {
+            $body += "`n### 新增`n"
+            foreach ($f in $feats) { $body += "- ${f}`n" }
+          }
+          if ($fixes.Count -gt 0) {
+            $body += "`n### 修复`n"
+            foreach ($f in $fixes) { $body += "- ${f}`n" }
+          }
+          $body += @"
+
+          ### 下载
+
+          | 文件 | 说明 |
+          |------|------|
+          | ``VoiceInput-${version}-setup.exe`` | 安装包（推荐） |
+          | ``VoiceInput-${version}-portable.zip`` | 便携版（解压即用） |
+          | ``VoiceInput-${version}-portable.exe`` | 单文件版（体积较大，启动较慢） |
+
+          ---
+          **系统要求**：Windows 10/11 64-bit
+          "@
+
+          $body = $body -replace "(?m)^          ", ""
+          $body | Out-File -FilePath release_body.md -Encoding utf8
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          name: VoiceInput v${{ github.ref_name }}
-          body: |
-            ## VoiceInput ${{ github.ref_name }}
-
-            ### 下载
-
-            | 文件 | 说明 |
-            |------|------|
-            | `VoiceInput-*-setup.exe` | 安装包（推荐） |
-            | `VoiceInput-*-portable.zip` | 便携版（解压即用） |
-            | `VoiceInput-*-portable.exe` | 单文件版（体积较大，启动较慢） |
-
-            ---
-            **系统要求**：Windows 10/11 64-bit
+          name: "VoiceInput ${{ github.ref_name }}"
+          body_path: release_body.md
           files: |
             dist/VoiceInput-*-portable.exe
             dist/VoiceInput-*-portable.zip
             dist/VoiceInput-*-setup.exe
-          generate_release_notes: true
