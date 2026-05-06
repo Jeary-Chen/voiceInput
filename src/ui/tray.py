@@ -231,7 +231,8 @@ class ComboHotkeyThread(QThread):
                     self._active_time = time.monotonic()
                     self.triggered.emit()
                 if combo_key and self._combo_fully_pressed():
-                    self._hook_suppressed.add(name)
+                    if was_new:
+                        self._hook_suppressed.add(name)
                     self._kb_listener.suppress_event()
             elif msg in (0x0101, 0x0105):
                 if self._active and combo_key:
