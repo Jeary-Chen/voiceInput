@@ -1,0 +1,36 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          pip install pyinstaller
+          pip install -r src/requirements.txt
+
+      - name: Build all artifacts
+        run: python _scripts/build.py --all
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/VoiceInput-*-portable.exe
+            dist/VoiceInput-*-portable.zip
+            dist/VoiceInput-*-setup.exe
+          generate_release_notes: true

@@ -27,6 +27,7 @@ from config import Config
 _T_modal = TypeVar("_T_modal")
 from core.log import logger
 from core.engine import VoiceEngine
+from core.updater import UpdateChecker, UpdateInfo
 from core.polisher import DEFAULT_INSTRUCTIONS
 POLISH_MODELS: list[tuple[str, str]] = [
     ("qwen3.6-flash", "Qwen3.6 Flash"),
@@ -1993,6 +1994,9 @@ class VoiceTray(QSystemTrayIcon):
         self._device_watcher.signals.changed.connect(self._device_change_timer.start)
         self._device_watcher.start()
 
+        self._updater = UpdateChecker()
+        self._updater.start(self._on_update_available)
+
         self.show()
 
     def _build_menu(self):
@@ -2141,9 +2145,10 @@ class VoiceTray(QSystemTrayIcon):
         menu.addSeparator()
 
         from _version import VERSION
-        act_ver = QAction(f"v{VERSION}", menu)
-        act_ver.setEnabled(False)
-        menu.addAction(act_ver)
+        self._act_version = QAction(f"v{VERSION}", menu)
+        self._act_version.setEnabled(False)
+        menu.addAction(self._act_version)
+        self._refresh_version_action()
 
         act_quit = QAction("退出", menu)
         act_quit.triggered.connect(self._quit)
@@ -2698,6 +2703,30 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "recording":
             self._audio.play_stop()
             self._engine.cancel()
+
+    # ── update ──
+
+    def _on_update_available(self, info: UpdateInfo):
+        self._refresh_version_action()
+        self.showMessage(
+            "发现新版本",
+            f"VoiceInput v{info.version} 已发布，右键菜单可查看详情",
+            QSystemTrayIcon.MessageIcon.Information,
+            5000,
+        )
+
+    def _refresh_version_action(self):
+        info = self._updater.latest
+        if info:
+            from _version import VERSION
+            self._act_version.setText(f"v{VERSION} → v{info.version} 🔴")
+            self._act_version.setEnabled(True)
+            try:
+                self._act_version.triggered.disconnect()
+            except TypeError:
+                pass
+            self._act_version.triggered.connect(
+                lambda: QDesktopServices.openUrl(QUrl(info.url)))
 
     def _on_hotkey(self):
         if self._engine.state == "processing":
