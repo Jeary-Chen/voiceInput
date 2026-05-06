@@ -25,7 +25,7 @@ jobs:
           pip install pyaudio --only-binary=:all:
 
       - name: Build single-file exe
-        run: python _scripts/build.py --onefile
+        run: python scripts/build.py --onefile
 
       - name: Rename artifact with version
         shell: pwsh

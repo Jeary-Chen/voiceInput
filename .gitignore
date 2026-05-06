@@ -15,9 +15,8 @@ launcher.log
 *.pem
 *.secret
 
-# 内部文档、脚本、实验、参考代码
+# 内部文档、实验、参考代码
 _docs/
-_scripts/
 _experiments/
 _reference/
 _release/
