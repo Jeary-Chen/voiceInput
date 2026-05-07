@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QTextEdit, QListWidget, QListWidgetItem,
     QStyledItemDelegate, QStyleOptionViewItem,
     QMessageBox, QSplitter, QWidget,
+    QWidgetAction, QProgressBar,
 )
 
 from typing import Any, TypeVar
@@ -1865,6 +1866,124 @@ class _PolishPromptDialog(QDialog):
         event.accept()
 
 
+class _UpdateWidget(QWidget):
+    """Custom widget embedded in tray menu via QWidgetAction."""
+
+    _CLR_DIMMED = "#666"
+    _CLR_ACCENT = "#4FC3F7"
+    _CLR_GREEN = "#66BB6A"
+    _CLR_BG = "#2a2a2a"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"background:{self._CLR_BG};")
+
+        from _version import VERSION
+        self._local_version = VERSION
+        self._on_action = None  # callback set by VoiceTray
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 8, 16, 8)
+        root.setSpacing(4)
+
+        row = QHBoxLayout()
+        row.setSpacing(0)
+        self._lbl_version = QLabel(f"v{VERSION}")
+        self._lbl_version.setStyleSheet(f"color:{self._CLR_DIMMED}; font-size:13px;")
+        row.addWidget(self._lbl_version)
+        row.addStretch()
+        self._lbl_action = QLabel("检查更新")
+        self._lbl_action.setStyleSheet(
+            f"color:{self._CLR_ACCENT}; font-size:13px;"
+        )
+        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lbl_action.mousePressEvent = self._on_label_click
+        row.addWidget(self._lbl_action)
+        root.addLayout(row)
+
+        self._progress = QProgressBar()
+        self._progress.setFixedHeight(6)
+        self._progress.setTextVisible(False)
+        self._progress.setRange(0, 100)
+        self._progress.setStyleSheet(f"""
+            QProgressBar {{
+                background: #3a3a3a; border: none; border-radius: 3px;
+            }}
+            QProgressBar::chunk {{
+                background: {self._CLR_ACCENT}; border-radius: 3px;
+            }}
+        """)
+        self._progress.hide()
+        root.addWidget(self._progress)
+
+        self._clickable = True
+
+    def bind(self, callback):
+        self._on_action = callback
+
+    def _on_label_click(self, _event):
+        if self._clickable and self._on_action:
+            self._on_action()
+
+    # ── state setters ──
+
+    def set_idle(self):
+        self._lbl_version.setText(f"v{self._local_version}")
+        self._lbl_action.setText("检查更新")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; font-size:13px;")
+        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lbl_action.show()
+        self._progress.hide()
+        self._clickable = True
+
+    def set_checking(self):
+        self._lbl_action.setText("检查中…")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_DIMMED}; font-size:13px;")
+        self._lbl_action.setCursor(Qt.CursorShape.ArrowCursor)
+        self._progress.hide()
+        self._clickable = False
+
+    def set_found(self, version: str):
+        self._lbl_version.setText(f"v{self._local_version}")
+        self._lbl_action.setText(f"v{version} 可用 \U0001F534")
+        self._lbl_action.setToolTip("点击更新")
+        self._lbl_action.setStyleSheet(f"color:#fff; font-size:13px;")
+        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._progress.hide()
+        self._clickable = True
+
+    def set_downloading(self, percent: int):
+        self._lbl_action.hide()
+        self._progress.show()
+        self._progress.setValue(percent)
+        self._clickable = False
+
+    def set_ready(self):
+        self._lbl_action.setText("✓ 安装并重启")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_GREEN}; font-size:13px;")
+        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lbl_action.setToolTip("")
+        self._lbl_action.show()
+        self._progress.hide()
+        self._clickable = True
+
+    def set_failed(self, is_download=False):
+        text = "下载失败，点击重试" if is_download else "检查失败，点击重试"
+        self._lbl_action.setText(text)
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; font-size:13px;")
+        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lbl_action.show()
+        self._progress.hide()
+        self._clickable = True
+
+    def set_no_update(self):
+        self._lbl_action.setText("已是最新版本")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_DIMMED}; font-size:13px;")
+        self._lbl_action.setCursor(Qt.CursorShape.ArrowCursor)
+        self._progress.hide()
+        self._clickable = False
+
+
 MENU_STYLE = """
     QMenu {
         background: #2a2a2a;
@@ -2151,14 +2270,11 @@ class VoiceTray(QSystemTrayIcon):
 
         menu.addSeparator()
 
-        from _version import VERSION
-        self._act_version = QAction(f"v{VERSION}", menu)
-        self._act_version.setEnabled(False)
-        menu.addAction(self._act_version)
-
-        self._act_update = QAction("检查更新", menu)
-        self._act_update.triggered.connect(self._on_update_click)
-        menu.addAction(self._act_update)
+        self._update_widget = _UpdateWidget()
+        self._update_widget.bind(self._on_update_click)
+        update_wa = QWidgetAction(menu)
+        update_wa.setDefaultWidget(self._update_widget)
+        menu.addAction(update_wa)
 
         act_quit = QAction("退出", menu)
         act_quit.triggered.connect(self._quit)
@@ -2728,51 +2844,37 @@ class VoiceTray(QSystemTrayIcon):
             return
         if self._updater.latest:
             logger.debug("[DEBUG] _on_update_click | → download_and_install()")
-            self._act_update.setText("⬇ 正在下载…")
-            self._act_update.setEnabled(False)
+            self._update_widget.set_downloading(0)
             self._updater.download_and_install()
             return
         logger.debug("[DEBUG] _on_update_click | → check_now()")
-        self._act_update.setText("正在检查…")
-        self._act_update.setEnabled(False)
+        self._update_widget.set_checking()
         self._updater.check_now()
 
     def _on_update_available(self, info: UpdateInfo):
-        from _version import VERSION
-        logger.debug(f"[DEBUG] _on_update_available | local={VERSION}, remote={info.version}")
-        self._act_version.setText(f"v{VERSION} → v{info.version} 可用")
-        self._act_update.setText("▸ 点击更新")
-        self._act_update.setEnabled(True)
+        logger.debug(f"[DEBUG] _on_update_available | remote={info.version}")
+        self._update_widget.set_found(info.version)
 
     def _on_no_update(self):
         logger.debug("[DEBUG] _on_no_update | already latest")
-        self._act_update.setText("已是最新版本")
-        self._act_update.setEnabled(False)
-        QTimer.singleShot(3000, self._reset_update_action)
+        self._update_widget.set_no_update()
+        QTimer.singleShot(3000, self._update_widget.set_idle)
 
     def _on_check_failed(self):
         logger.debug("[DEBUG] _on_check_failed | check failed")
-        self._act_update.setText("检查失败，点击重试")
-        self._act_update.setEnabled(True)
+        self._update_widget.set_failed(is_download=False)
 
     def _on_download_progress(self, percent: int):
-        self._act_update.setText(f"⬇ 正在下载… {percent}%")
+        self._update_widget.set_downloading(percent)
 
     def _on_download_done(self):
         logger.debug("[DEBUG] _on_download_done | download complete, ready to install")
-        self._act_update.setText("✓ 下载完成，点击安装")
-        self._act_update.setEnabled(True)
+        self._update_widget.set_ready()
 
     def _on_download_failed(self, msg: str):
         logger.debug(f"[DEBUG] _on_download_failed | msg={msg}")
-        self._act_update.setText("下载失败，点击重试")
-        self._act_update.setEnabled(True)
+        self._update_widget.set_failed(is_download=True)
         logger.warning(f"[Updater] Download failed: {msg}")
-
-    def _reset_update_action(self):
-        logger.debug("[DEBUG] _reset_update_action | resetting to '检查更新'")
-        self._act_update.setText("检查更新")
-        self._act_update.setEnabled(True)
 
     def _on_hotkey(self):
         if self._engine.state == "processing":
