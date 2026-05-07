@@ -1866,29 +1866,82 @@ class _PolishPromptDialog(QDialog):
         event.accept()
 
 
-def _make_menu_label(text: str, color: str = "#666", clickable: bool = False) -> QLabel:
-    """Create a QLabel styled like a menu item, for use inside QWidgetAction."""
-    lbl = QLabel(text)
-    lbl.setStyleSheet(
-        f"background:#2a2a2a; color:{color}; font-size:13px;"
-        f" padding:7px 28px 7px 16px;"
-    )
-    if clickable:
-        lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-    return lbl
+class _MenuLabel(QLabel):
+    """QLabel styled as a menu item with hover highlight, for QWidgetAction."""
+
+    _BG_NORMAL = "transparent"
+    _BG_HOVER = "#3a3a3a"
+    _PAD = "padding:7px 28px 7px 24px;"
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._color_css = ""
+        self._hover_enabled = True
+        self._swallow_clicks = False
+
+    def set_hover_enabled(self, on: bool):
+        self._hover_enabled = on
+        if not on:
+            self._apply(self._BG_NORMAL)
+
+    def set_swallow_clicks(self, on: bool):
+        self._swallow_clicks = on
+
+    def set_color(self, color: str):
+        self._color_css = f"color:{color};"
+        self._apply(self._BG_NORMAL)
+
+    def _apply(self, bg: str):
+        self.setStyleSheet(
+            f"font-size:13px; {self._PAD} {self._color_css}"
+            f" background:{bg}; border:none; outline:none;"
+        )
+
+    def enterEvent(self, event):
+        menu = self._find_parent_menu()
+        if menu is not None:
+            menu.setActiveAction(None)
+        if self._hover_enabled:
+            self._apply(self._BG_HOVER)
+        super().enterEvent(event)
+
+    def _find_parent_menu(self):
+        w = self.parentWidget()
+        while w is not None:
+            if isinstance(w, QMenu):
+                return w
+            w = w.parentWidget()
+        return None
+
+    def leaveEvent(self, event):
+        self._apply(self._BG_NORMAL)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if self._swallow_clicks:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._swallow_clicks:
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class _UpdateMenuHelper:
-    """Manages two QWidgetAction rows in the tray menu for update UI.
-
-    Row 1 (version):  v1.2.3                   ← gray, not clickable
-    Row 2 (action):   检查更新 / v1.3.0 可用 🔴 ← clickable
+    """Two QWidgetAction rows for update UI. Both use _MenuLabel so they
+    align with each other, don't close the menu, and support custom colors.
     """
 
     _CLR_DIMMED = "#666"
-    _CLR_ACCENT = "#4FC3F7"
+    _CLR_WHITE = "#fff"
     _CLR_GREEN = "#66BB6A"
-    _CSS = "background:#2a2a2a; font-size:13px; padding:7px 28px 7px 16px;"
+    _CLR_RED = "#EF5350"
+    _CLR_BLUE = "#42A5F5"
 
     def __init__(self, menu: QMenu):
         from _version import VERSION
@@ -1896,64 +1949,70 @@ class _UpdateMenuHelper:
         self._on_action = None
         self._clickable = True
 
-        self._lbl_version = _make_menu_label(f"v{VERSION}", self._CLR_DIMMED)
-        self._wa_version = QWidgetAction(menu)
-        self._wa_version.setDefaultWidget(self._lbl_version)
-        menu.addAction(self._wa_version)
+        self._lbl_ver = _MenuLabel(f"v{VERSION}")
+        self._lbl_ver.set_color(self._CLR_DIMMED)
+        self._lbl_ver.set_swallow_clicks(True)
+        self._lbl_ver.set_hover_enabled(False)
+        wa_ver = QWidgetAction(menu)
+        wa_ver.setDefaultWidget(self._lbl_ver)
+        menu.addAction(wa_ver)
 
-        self._lbl_action = _make_menu_label("检查更新", self._CLR_ACCENT, clickable=True)
-        self._lbl_action.mousePressEvent = self._on_label_click
-        self._wa_action = QWidgetAction(menu)
-        self._wa_action.setDefaultWidget(self._lbl_action)
-        menu.addAction(self._wa_action)
+        self._lbl_act = _MenuLabel("检查更新")
+        self._lbl_act.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_act.set_color(self._CLR_WHITE)
+        self._lbl_act.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lbl_act.set_swallow_clicks(True)
+        self._lbl_act.mousePressEvent = self._on_click
+        wa_act = QWidgetAction(menu)
+        wa_act.setDefaultWidget(self._lbl_act)
+        menu.addAction(wa_act)
 
     def bind(self, callback):
         self._on_action = callback
 
-    def _on_label_click(self, _event):
+    def _on_click(self, _event):
         if self._clickable and self._on_action:
             self._on_action()
 
-    def _set_action(self, text: str, color: str, clickable: bool, tooltip: str = "",
-                    rich: bool = False):
-        if rich:
-            self._lbl_action.setTextFormat(Qt.TextFormat.RichText)
-        else:
-            self._lbl_action.setTextFormat(Qt.TextFormat.PlainText)
-        self._lbl_action.setText(text)
-        self._lbl_action.setStyleSheet(f"{self._CSS} color:{color};")
-        self._lbl_action.setCursor(
-            Qt.CursorShape.PointingHandCursor if clickable else Qt.CursorShape.ArrowCursor
+    def _set_action(self, html: str, color: str, clickable: bool = True):
+        self._lbl_act.setText(html)
+        self._lbl_act.set_color(color)
+        self._lbl_act.set_hover_enabled(clickable)
+        self._lbl_act.setCursor(
+            Qt.CursorShape.PointingHandCursor if clickable
+            else Qt.CursorShape.ArrowCursor
         )
-        self._lbl_action.setToolTip(tooltip)
         self._clickable = clickable
 
     def set_idle(self):
-        self._lbl_version.setText(f"v{self._local_version}")
-        self._set_action("检查更新", self._CLR_ACCENT, True)
+        self._lbl_ver.setText(f"v{self._local_version}")
+        self._set_action("检查更新", self._CLR_WHITE)
 
     def set_checking(self):
-        self._set_action("正在检查…", self._CLR_DIMMED, False)
+        self._set_action("正在检查…", self._CLR_DIMMED, clickable=False)
 
     def set_found(self, version: str):
-        self._lbl_version.setText(f"v{self._local_version}")
-        dot = '<span style="color:#EF5350; font-size:8px;">●</span>'
-        self._set_action(
-            f'v{version} 可用 {dot}', "#fff", True, "点击更新", rich=True
-        )
+        self._lbl_ver.setText(f"v{self._local_version}")
+        dot = f'<span style="color:{self._CLR_RED}; font-size:9px;">\u25cf</span>'
+        self._set_action(f'v{version} 可用 {dot}', self._CLR_WHITE)
 
     def set_downloading(self, percent: int):
-        self._set_action(f"⬇ 正在下载… {percent}%", self._CLR_ACCENT, False)
+        self._set_action(
+            f'正在下载… {percent}%', self._CLR_BLUE, clickable=False
+        )
 
     def set_ready(self):
-        self._set_action("✓ 安装并重启", self._CLR_GREEN, True)
+        self._set_action(
+            f'<span style="color:{self._CLR_GREEN};">\u2713</span> 安装并重启',
+            self._CLR_GREEN,
+        )
 
     def set_failed(self, is_download=False):
         text = "下载失败，点击重试" if is_download else "检查失败，点击重试"
-        self._set_action(text, self._CLR_ACCENT, True)
+        self._set_action(text, self._CLR_WHITE)
 
     def set_no_update(self):
-        self._set_action("已是最新版本", self._CLR_DIMMED, False)
+        self._set_action("已是最新版本", self._CLR_DIMMED, clickable=False)
 
 
 MENU_STYLE = """

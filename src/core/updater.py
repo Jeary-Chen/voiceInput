@@ -43,19 +43,33 @@ def _is_newer(remote_tag: str, local_version: str) -> bool:
 
 
 def _is_installed_version() -> bool:
-    """Detect if running from an Inno Setup installed location."""
-    if not getattr(sys, "frozen", False):
+    """Detect if running from an Inno Setup installed location.
+
+    Checks the directory of the running code (not sys.frozen, which may be
+    False for embedded-Python builds) against known install paths.
+    """
+    try:
+        code_dir = Path(__file__).resolve().parent.parent.parent
+    except Exception:
         return False
-    exe = Path(sys.executable).resolve()
-    programs = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs"
-    program_files = Path(os.environ.get("PROGRAMFILES", ""))
-    program_files_x86 = Path(os.environ.get("PROGRAMFILES(X86)", ""))
-    for base in (programs, program_files, program_files_x86):
+    install_bases = []
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    if local_app:
+        install_bases.append(Path(local_app) / "Programs")
+    pf = os.environ.get("PROGRAMFILES", "")
+    if pf:
+        install_bases.append(Path(pf))
+    pf86 = os.environ.get("PROGRAMFILES(X86)", "")
+    if pf86:
+        install_bases.append(Path(pf86))
+    for base in install_bases:
         try:
-            if base.exists() and exe.is_relative_to(base):
+            if base.exists() and code_dir.is_relative_to(base):
+                logger.debug(f"[DEBUG] _is_installed_version | code_dir={code_dir} is under {base}")
                 return True
         except (ValueError, OSError):
             pass
+    logger.debug(f"[DEBUG] _is_installed_version | code_dir={code_dir} not under any install base")
     return False
 
 
@@ -236,42 +250,53 @@ class UpdateChecker:
             logger.debug("[DEBUG] UpdateChecker.install | no downloaded_path, returning")
             return
         path = self._downloaded_path
+        file_exists = Path(path).exists()
+        file_size = Path(path).stat().st_size if file_exists else 0
         logger.info(f"[Updater] Installing: {path}")
+        logger.debug(f"[DEBUG] UpdateChecker.install | file_exists={file_exists}, file_size={file_size}")
         if path.endswith("-setup.exe"):
-            logger.debug(f"[DEBUG] UpdateChecker.install | launching setup: {path} /VERYSILENT")
-            subprocess.Popen(
-                [path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
-                creationflags=subprocess.DETACHED_PROCESS,
-            )
+            cmd = [path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
+            logger.debug(f"[DEBUG] UpdateChecker.install | launching setup cmd={cmd}")
+            try:
+                proc = subprocess.Popen(cmd, creationflags=subprocess.DETACHED_PROCESS)
+                logger.debug(f"[DEBUG] UpdateChecker.install | setup Popen ok, pid={proc.pid}")
+            except Exception as e:
+                logger.error(f"[DEBUG] UpdateChecker.install | setup Popen FAILED: {type(e).__name__}: {e}")
+                return
         elif path.endswith(".zip"):
             logger.debug(f"[DEBUG] UpdateChecker.install | launching zip install: {path}")
-            self._install_zip(path)
+            try:
+                self._install_zip(path)
+            except Exception as e:
+                logger.error(f"[DEBUG] UpdateChecker.install | zip install FAILED: {type(e).__name__}: {e}")
+                return
         else:
             logger.debug(f"[DEBUG] UpdateChecker.install | unknown file type: {path}")
+            return
         logger.debug("[DEBUG] UpdateChecker.install | calling QApplication.quit()")
         from PyQt6.QtWidgets import QApplication
         QApplication.quit()
 
     def _install_zip(self, zip_path: str):
         """Extract zip over current app directory via a hidden PowerShell script."""
-        if getattr(sys, "frozen", False):
-            app_dir = Path(sys.executable).parent
-        else:
-            app_dir = Path(__file__).resolve().parent.parent.parent
+        app_dir = Path(__file__).resolve().parent.parent.parent
         script = Path(tempfile.gettempdir()) / "voiceinput_update.ps1"
         exe_path = app_dir / "VoiceInput.exe"
-        script.write_text(
+        logger.debug(f"[DEBUG] _install_zip | app_dir={app_dir}, exe_path={exe_path}, exe_exists={exe_path.exists()}")
+        ps_content = (
             f'Start-Sleep -Seconds 2\n'
             f'Expand-Archive -Path "{zip_path}" -DestinationPath "{app_dir}" -Force\n'
             f'Start-Process "{exe_path}"\n'
-            f'Remove-Item $MyInvocation.MyCommand.Path -Force\n',
-            encoding="utf-8",
+            f'Remove-Item $MyInvocation.MyCommand.Path -Force\n'
         )
-        subprocess.Popen(
-            ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
-             "-File", str(script)],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        script.write_text(ps_content, encoding="utf-8")
+        logger.debug(f"[DEBUG] _install_zip | script={script}, script_exists={script.exists()}")
+        logger.debug(f"[DEBUG] _install_zip | ps_content:\n{ps_content}")
+        cmd = ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+               "-File", str(script)]
+        logger.debug(f"[DEBUG] _install_zip | launching cmd={cmd}")
+        proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+        logger.debug(f"[DEBUG] _install_zip | Popen ok, pid={proc.pid}")
 
     def _on_check_result(self, result):
         logger.debug(f"[DEBUG] UpdateChecker._on_check_result | result type={type(result).__name__}, value={result!r}")

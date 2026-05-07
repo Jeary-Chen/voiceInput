@@ -52,12 +52,14 @@ def _create_app_mutex():
         logger.warning("Failed to create install-aware app mutex")
         return
     _app_mutex_handle = handle
+    logger.debug(f"[DEBUG] _create_app_mutex | handle={handle}, name={_APP_MUTEX_NAME}")
 
 
 def _release_app_mutex():
     global _app_mutex_handle
     if not _app_mutex_handle:
         return
+    logger.debug(f"[DEBUG] _release_app_mutex | closing handle={_app_mutex_handle}")
     ctypes.windll.kernel32.CloseHandle(_app_mutex_handle)
     _app_mutex_handle = None
 
@@ -68,8 +70,10 @@ def _create_shutdown_event():
         return
     handle = ctypes.windll.kernel32.CreateEventW(None, True, False, _SHUTDOWN_EVENT_NAME)
     if not handle:
+        logger.debug(f"[DEBUG] _create_shutdown_event | FAILED to create event, name={_SHUTDOWN_EVENT_NAME}")
         return
     _shutdown_event_handle = handle
+    logger.debug(f"[DEBUG] _create_shutdown_event | handle={handle}, name={_SHUTDOWN_EVENT_NAME}")
 
 
 def _release_shutdown_event():
@@ -95,10 +99,13 @@ def _start_shutdown_watcher(quit_fn):
 
     def _watch():
         if not _shutdown_event_handle:
+            logger.debug("[DEBUG] _watch | no shutdown_event_handle, watcher not started")
             return
+        logger.debug(f"[DEBUG] _watch | waiting for shutdown event, handle={_shutdown_event_handle}")
         INFINITE = 0xFFFFFFFF
         ctypes.windll.kernel32.WaitForSingleObject(_shutdown_event_handle, INFINITE)
         logger.info("[Main] Shutdown event received from installer")
+        logger.debug("[DEBUG] _watch | emitting shutdown_requested signal")
         _shutdown_bridge.shutdown_requested.emit()
 
     t = threading.Thread(target=_watch, name="ShutdownWatcher", daemon=True)
