@@ -451,7 +451,7 @@ begin
 end;
 
 [Run]
-Filename: "{{app}}\\VoiceInput.exe"; Description: "立即启动 VoiceInput"; Flags: nowait postinstall skipifsilent
+Filename: "{{app}}\\VoiceInput.exe"; Description: "立即启动 VoiceInput"; Flags: nowait postinstall
 """
 
     iss_path.write_text(iss_content, encoding="utf-8")

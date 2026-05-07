@@ -1,6 +1,7 @@
 """Background update checker with silent download and install."""
 
 import json
+import os
 import sys
 import subprocess
 import tempfile
@@ -41,13 +42,34 @@ def _is_newer(remote_tag: str, local_version: str) -> bool:
     return _parse_version(remote_tag) > _parse_version(local_version)
 
 
+def _is_installed_version() -> bool:
+    """Detect if running from an Inno Setup installed location."""
+    if not getattr(sys, "frozen", False):
+        return False
+    exe = Path(sys.executable).resolve()
+    programs = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs"
+    program_files = Path(os.environ.get("PROGRAMFILES", ""))
+    program_files_x86 = Path(os.environ.get("PROGRAMFILES(X86)", ""))
+    for base in (programs, program_files, program_files_x86):
+        try:
+            if base.exists() and exe.is_relative_to(base):
+                return True
+        except (ValueError, OSError):
+            pass
+    return False
+
+
 def _pick_asset(assets: list[dict], version: str) -> tuple[str, str, int] | None:
-    """Pick the best asset: prefer setup.exe, fallback to portable.zip."""
-    setup_name = f"VoiceInput-{version}-setup.exe"
-    zip_name = f"VoiceInput-{version}-portable.zip"
-    for preferred in (setup_name, zip_name):
+    """Pick the matching asset based on install type."""
+    installed = _is_installed_version()
+    logger.debug(f"[DEBUG] _pick_asset | is_installed={installed}")
+    if installed:
+        preferred = [f"VoiceInput-{version}-setup.exe", f"VoiceInput-{version}-portable.zip"]
+    else:
+        preferred = [f"VoiceInput-{version}-portable.zip", f"VoiceInput-{version}-setup.exe"]
+    for name in preferred:
         for a in assets:
-            if a.get("name") == preferred:
+            if a.get("name") == name:
                 return a["browser_download_url"], a["name"], a.get("size", 0)
     return None
 
