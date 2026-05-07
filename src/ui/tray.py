@@ -1866,45 +1866,46 @@ class _PolishPromptDialog(QDialog):
         event.accept()
 
 
-class _UpdateWidget(QWidget):
-    """Custom widget embedded in tray menu via QWidgetAction.
+def _make_menu_label(text: str, color: str = "#666", clickable: bool = False) -> QLabel:
+    """Create a QLabel styled like a menu item, for use inside QWidgetAction."""
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"background:#2a2a2a; color:{color}; font-size:13px;"
+        f" padding:7px 28px 7px 16px;"
+    )
+    if clickable:
+        lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+    return lbl
 
-    Layout (vertical, two rows):
-      Row 1:  v1.2.3                    ← version label (gray, disabled)
-      Row 2:  检查更新 / v1.3.0 可用 🔴  ← action label (clickable)
-              or ⬇ 正在下载… 47%         ← download progress text
-              or ✓ 安装并重启             ← ready to install
+
+class _UpdateMenuHelper:
+    """Manages two QWidgetAction rows in the tray menu for update UI.
+
+    Row 1 (version):  v1.2.3                   ← gray, not clickable
+    Row 2 (action):   检查更新 / v1.3.0 可用 🔴 ← clickable
     """
 
     _CLR_DIMMED = "#666"
     _CLR_ACCENT = "#4FC3F7"
     _CLR_GREEN = "#66BB6A"
-    _CLR_BG = "#2a2a2a"
-    _FONT = "font-size:13px;"
+    _CSS = "background:#2a2a2a; font-size:13px; padding:7px 28px 7px 16px;"
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setStyleSheet(f"background:{self._CLR_BG};")
-
+    def __init__(self, menu: QMenu):
         from _version import VERSION
         self._local_version = VERSION
         self._on_action = None
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 7, 28, 7)
-        layout.setSpacing(2)
-
-        self._lbl_version = QLabel(f"v{VERSION}")
-        self._lbl_version.setStyleSheet(f"color:{self._CLR_DIMMED}; {self._FONT}")
-        layout.addWidget(self._lbl_version)
-
-        self._lbl_action = QLabel("检查更新")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; {self._FONT}")
-        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._lbl_action.mousePressEvent = self._on_label_click
-        layout.addWidget(self._lbl_action)
-
         self._clickable = True
+
+        self._lbl_version = _make_menu_label(f"v{VERSION}", self._CLR_DIMMED)
+        self._wa_version = QWidgetAction(menu)
+        self._wa_version.setDefaultWidget(self._lbl_version)
+        menu.addAction(self._wa_version)
+
+        self._lbl_action = _make_menu_label("检查更新", self._CLR_ACCENT, clickable=True)
+        self._lbl_action.mousePressEvent = self._on_label_click
+        self._wa_action = QWidgetAction(menu)
+        self._wa_action.setDefaultWidget(self._lbl_action)
+        menu.addAction(self._wa_action)
 
     def bind(self, callback):
         self._on_action = callback
@@ -1913,57 +1914,46 @@ class _UpdateWidget(QWidget):
         if self._clickable and self._on_action:
             self._on_action()
 
-    # ── state setters ──
+    def _set_action(self, text: str, color: str, clickable: bool, tooltip: str = "",
+                    rich: bool = False):
+        if rich:
+            self._lbl_action.setTextFormat(Qt.TextFormat.RichText)
+        else:
+            self._lbl_action.setTextFormat(Qt.TextFormat.PlainText)
+        self._lbl_action.setText(text)
+        self._lbl_action.setStyleSheet(f"{self._CSS} color:{color};")
+        self._lbl_action.setCursor(
+            Qt.CursorShape.PointingHandCursor if clickable else Qt.CursorShape.ArrowCursor
+        )
+        self._lbl_action.setToolTip(tooltip)
+        self._clickable = clickable
 
     def set_idle(self):
         self._lbl_version.setText(f"v{self._local_version}")
-        self._lbl_action.setText("检查更新")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; {self._FONT}")
-        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._lbl_action.setToolTip("")
-        self._clickable = True
+        self._set_action("检查更新", self._CLR_ACCENT, True)
 
     def set_checking(self):
-        self._lbl_action.setText("正在检查…")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_DIMMED}; {self._FONT}")
-        self._lbl_action.setCursor(Qt.CursorShape.ArrowCursor)
-        self._clickable = False
+        self._set_action("正在检查…", self._CLR_DIMMED, False)
 
     def set_found(self, version: str):
         self._lbl_version.setText(f"v{self._local_version}")
-        self._lbl_action.setText(f"v{version} 可用 \U0001F534")
-        self._lbl_action.setToolTip("点击更新")
-        self._lbl_action.setStyleSheet(f"color:#fff; {self._FONT}")
-        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._clickable = True
+        dot = '<span style="color:#EF5350; font-size:8px;">●</span>'
+        self._set_action(
+            f'v{version} 可用 {dot}', "#fff", True, "点击更新", rich=True
+        )
 
     def set_downloading(self, percent: int):
-        self._lbl_action.setText(f"⬇ 正在下载… {percent}%")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; {self._FONT}")
-        self._lbl_action.setCursor(Qt.CursorShape.ArrowCursor)
-        self._lbl_action.setToolTip("")
-        self._clickable = False
+        self._set_action(f"⬇ 正在下载… {percent}%", self._CLR_ACCENT, False)
 
     def set_ready(self):
-        self._lbl_action.setText("✓ 安装并重启")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_GREEN}; {self._FONT}")
-        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._lbl_action.setToolTip("")
-        self._clickable = True
+        self._set_action("✓ 安装并重启", self._CLR_GREEN, True)
 
     def set_failed(self, is_download=False):
         text = "下载失败，点击重试" if is_download else "检查失败，点击重试"
-        self._lbl_action.setText(text)
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; {self._FONT}")
-        self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._lbl_action.setToolTip("")
-        self._clickable = True
+        self._set_action(text, self._CLR_ACCENT, True)
 
     def set_no_update(self):
-        self._lbl_action.setText("已是最新版本")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_DIMMED}; {self._FONT}")
-        self._lbl_action.setCursor(Qt.CursorShape.ArrowCursor)
-        self._clickable = False
+        self._set_action("已是最新版本", self._CLR_DIMMED, False)
 
 
 MENU_STYLE = """
@@ -2252,11 +2242,8 @@ class VoiceTray(QSystemTrayIcon):
 
         menu.addSeparator()
 
-        self._update_widget = _UpdateWidget()
+        self._update_widget = _UpdateMenuHelper(menu)
         self._update_widget.bind(self._on_update_click)
-        update_wa = QWidgetAction(menu)
-        update_wa.setDefaultWidget(self._update_widget)
-        menu.addAction(update_wa)
 
         act_quit = QAction("退出", menu)
         act_quit.triggered.connect(self._quit)
