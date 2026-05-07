@@ -1995,7 +1995,14 @@ class VoiceTray(QSystemTrayIcon):
         self._device_watcher.start()
 
         self._updater = UpdateChecker()
-        self._updater.start(self._on_update_available)
+        self._updater.start(
+            on_available=self._on_update_available,
+            on_no_update=self._on_no_update,
+            on_check_failed=self._on_check_failed,
+            on_progress=self._on_download_progress,
+            on_done=self._on_download_done,
+            on_dl_failed=self._on_download_failed,
+        )
 
         self.show()
 
@@ -2148,7 +2155,10 @@ class VoiceTray(QSystemTrayIcon):
         self._act_version = QAction(f"v{VERSION}", menu)
         self._act_version.setEnabled(False)
         menu.addAction(self._act_version)
-        self._refresh_version_action()
+
+        self._act_update = QAction("检查更新", menu)
+        self._act_update.triggered.connect(self._on_update_click)
+        menu.addAction(self._act_update)
 
         act_quit = QAction("退出", menu)
         act_quit.triggered.connect(self._quit)
@@ -2706,27 +2716,63 @@ class VoiceTray(QSystemTrayIcon):
 
     # ── update ──
 
-    def _on_update_available(self, info: UpdateInfo):
-        self._refresh_version_action()
-        self.showMessage(
-            "发现新版本",
-            f"VoiceInput v{info.version} 已发布，右键菜单可查看详情",
-            QSystemTrayIcon.MessageIcon.Information,
-            5000,
-        )
+    def _on_update_click(self):
+        """Dispatches based on current updater state."""
+        logger.debug(f"[DEBUG] _on_update_click | is_ready={self._updater.is_ready_to_install}, is_downloading={self._updater.is_downloading}, latest={self._updater.latest}")
+        if self._updater.is_ready_to_install:
+            logger.debug("[DEBUG] _on_update_click | → install()")
+            self._updater.install()
+            return
+        if self._updater.is_downloading:
+            logger.debug("[DEBUG] _on_update_click | → already downloading, ignored")
+            return
+        if self._updater.latest:
+            logger.debug("[DEBUG] _on_update_click | → download_and_install()")
+            self._act_update.setText("⬇ 正在下载…")
+            self._act_update.setEnabled(False)
+            self._updater.download_and_install()
+            return
+        logger.debug("[DEBUG] _on_update_click | → check_now()")
+        self._act_update.setText("正在检查…")
+        self._act_update.setEnabled(False)
+        self._updater.check_now()
 
-    def _refresh_version_action(self):
-        info = self._updater.latest
-        if info:
-            from _version import VERSION
-            self._act_version.setText(f"v{VERSION} → v{info.version} 🔴")
-            self._act_version.setEnabled(True)
-            try:
-                self._act_version.triggered.disconnect()
-            except TypeError:
-                pass
-            self._act_version.triggered.connect(
-                lambda: QDesktopServices.openUrl(QUrl(info.url)))
+    def _on_update_available(self, info: UpdateInfo):
+        from _version import VERSION
+        logger.debug(f"[DEBUG] _on_update_available | local={VERSION}, remote={info.version}")
+        self._act_version.setText(f"v{VERSION} → v{info.version} 可用")
+        self._act_update.setText("▸ 点击更新")
+        self._act_update.setEnabled(True)
+
+    def _on_no_update(self):
+        logger.debug("[DEBUG] _on_no_update | already latest")
+        self._act_update.setText("已是最新版本")
+        self._act_update.setEnabled(False)
+        QTimer.singleShot(3000, self._reset_update_action)
+
+    def _on_check_failed(self):
+        logger.debug("[DEBUG] _on_check_failed | check failed")
+        self._act_update.setText("检查失败，点击重试")
+        self._act_update.setEnabled(True)
+
+    def _on_download_progress(self, percent: int):
+        self._act_update.setText(f"⬇ 正在下载… {percent}%")
+
+    def _on_download_done(self):
+        logger.debug("[DEBUG] _on_download_done | download complete, ready to install")
+        self._act_update.setText("✓ 下载完成，点击安装")
+        self._act_update.setEnabled(True)
+
+    def _on_download_failed(self, msg: str):
+        logger.debug(f"[DEBUG] _on_download_failed | msg={msg}")
+        self._act_update.setText("下载失败，点击重试")
+        self._act_update.setEnabled(True)
+        logger.warning(f"[Updater] Download failed: {msg}")
+
+    def _reset_update_action(self):
+        logger.debug("[DEBUG] _reset_update_action | resetting to '检查更新'")
+        self._act_update.setText("检查更新")
+        self._act_update.setEnabled(True)
 
     def _on_hotkey(self):
         if self._engine.state == "processing":
