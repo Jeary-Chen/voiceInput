@@ -253,25 +253,24 @@ class UpdateChecker:
         QApplication.quit()
 
     def _install_zip(self, zip_path: str):
-        """Extract zip over current app directory via a helper batch script."""
+        """Extract zip over current app directory via a hidden PowerShell script."""
         if getattr(sys, "frozen", False):
             app_dir = Path(sys.executable).parent
         else:
             app_dir = Path(__file__).resolve().parent.parent.parent
-        script = Path(tempfile.gettempdir()) / "voiceinput_update.bat"
-        exe_name = "VoiceInput.exe"
+        script = Path(tempfile.gettempdir()) / "voiceinput_update.ps1"
+        exe_path = app_dir / "VoiceInput.exe"
         script.write_text(
-            f'@echo off\r\n'
-            f'timeout /t 2 /nobreak >nul\r\n'
-            f'powershell -Command "Expand-Archive -Path \\"{zip_path}\\" '
-            f'-DestinationPath \\"{app_dir}\\" -Force"\r\n'
-            f'start "" "{app_dir / exe_name}"\r\n'
-            f'del "%~f0"\r\n',
+            f'Start-Sleep -Seconds 2\n'
+            f'Expand-Archive -Path "{zip_path}" -DestinationPath "{app_dir}" -Force\n'
+            f'Start-Process "{exe_path}"\n'
+            f'Remove-Item $MyInvocation.MyCommand.Path -Force\n',
             encoding="utf-8",
         )
         subprocess.Popen(
-            ["cmd", "/c", str(script)],
-            creationflags=subprocess.DETACHED_PROCESS,
+            ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+             "-File", str(script)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
     def _on_check_result(self, result):

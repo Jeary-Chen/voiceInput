@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QTextEdit, QListWidget, QListWidgetItem,
     QStyledItemDelegate, QStyleOptionViewItem,
     QMessageBox, QSplitter, QWidget,
-    QWidgetAction, QProgressBar,
+    QWidgetAction,
 )
 
 from typing import Any, TypeVar
@@ -1867,12 +1867,20 @@ class _PolishPromptDialog(QDialog):
 
 
 class _UpdateWidget(QWidget):
-    """Custom widget embedded in tray menu via QWidgetAction."""
+    """Custom widget embedded in tray menu via QWidgetAction.
+
+    Layout (vertical, two rows):
+      Row 1:  v1.2.3                    ← version label (gray, disabled)
+      Row 2:  检查更新 / v1.3.0 可用 🔴  ← action label (clickable)
+              or ⬇ 正在下载… 47%         ← download progress text
+              or ✓ 安装并重启             ← ready to install
+    """
 
     _CLR_DIMMED = "#666"
     _CLR_ACCENT = "#4FC3F7"
     _CLR_GREEN = "#66BB6A"
     _CLR_BG = "#2a2a2a"
+    _FONT = "font-size:13px;"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1880,41 +1888,21 @@ class _UpdateWidget(QWidget):
 
         from _version import VERSION
         self._local_version = VERSION
-        self._on_action = None  # callback set by VoiceTray
+        self._on_action = None
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 8, 16, 8)
-        root.setSpacing(4)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 7, 28, 7)
+        layout.setSpacing(2)
 
-        row = QHBoxLayout()
-        row.setSpacing(0)
         self._lbl_version = QLabel(f"v{VERSION}")
-        self._lbl_version.setStyleSheet(f"color:{self._CLR_DIMMED}; font-size:13px;")
-        row.addWidget(self._lbl_version)
-        row.addStretch()
+        self._lbl_version.setStyleSheet(f"color:{self._CLR_DIMMED}; {self._FONT}")
+        layout.addWidget(self._lbl_version)
+
         self._lbl_action = QLabel("检查更新")
-        self._lbl_action.setStyleSheet(
-            f"color:{self._CLR_ACCENT}; font-size:13px;"
-        )
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; {self._FONT}")
         self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
         self._lbl_action.mousePressEvent = self._on_label_click
-        row.addWidget(self._lbl_action)
-        root.addLayout(row)
-
-        self._progress = QProgressBar()
-        self._progress.setFixedHeight(6)
-        self._progress.setTextVisible(False)
-        self._progress.setRange(0, 100)
-        self._progress.setStyleSheet(f"""
-            QProgressBar {{
-                background: #3a3a3a; border: none; border-radius: 3px;
-            }}
-            QProgressBar::chunk {{
-                background: {self._CLR_ACCENT}; border-radius: 3px;
-            }}
-        """)
-        self._progress.hide()
-        root.addWidget(self._progress)
+        layout.addWidget(self._lbl_action)
 
         self._clickable = True
 
@@ -1930,57 +1918,51 @@ class _UpdateWidget(QWidget):
     def set_idle(self):
         self._lbl_version.setText(f"v{self._local_version}")
         self._lbl_action.setText("检查更新")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; font-size:13px;")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; {self._FONT}")
         self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._lbl_action.show()
-        self._progress.hide()
+        self._lbl_action.setToolTip("")
         self._clickable = True
 
     def set_checking(self):
-        self._lbl_action.setText("检查中…")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_DIMMED}; font-size:13px;")
+        self._lbl_action.setText("正在检查…")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_DIMMED}; {self._FONT}")
         self._lbl_action.setCursor(Qt.CursorShape.ArrowCursor)
-        self._progress.hide()
         self._clickable = False
 
     def set_found(self, version: str):
         self._lbl_version.setText(f"v{self._local_version}")
         self._lbl_action.setText(f"v{version} 可用 \U0001F534")
         self._lbl_action.setToolTip("点击更新")
-        self._lbl_action.setStyleSheet(f"color:#fff; font-size:13px;")
+        self._lbl_action.setStyleSheet(f"color:#fff; {self._FONT}")
         self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._progress.hide()
         self._clickable = True
 
     def set_downloading(self, percent: int):
-        self._lbl_action.hide()
-        self._progress.show()
-        self._progress.setValue(percent)
+        self._lbl_action.setText(f"⬇ 正在下载… {percent}%")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; {self._FONT}")
+        self._lbl_action.setCursor(Qt.CursorShape.ArrowCursor)
+        self._lbl_action.setToolTip("")
         self._clickable = False
 
     def set_ready(self):
         self._lbl_action.setText("✓ 安装并重启")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_GREEN}; font-size:13px;")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_GREEN}; {self._FONT}")
         self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
         self._lbl_action.setToolTip("")
-        self._lbl_action.show()
-        self._progress.hide()
         self._clickable = True
 
     def set_failed(self, is_download=False):
         text = "下载失败，点击重试" if is_download else "检查失败，点击重试"
         self._lbl_action.setText(text)
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; font-size:13px;")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_ACCENT}; {self._FONT}")
         self._lbl_action.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._lbl_action.show()
-        self._progress.hide()
+        self._lbl_action.setToolTip("")
         self._clickable = True
 
     def set_no_update(self):
         self._lbl_action.setText("已是最新版本")
-        self._lbl_action.setStyleSheet(f"color:{self._CLR_DIMMED}; font-size:13px;")
+        self._lbl_action.setStyleSheet(f"color:{self._CLR_DIMMED}; {self._FONT}")
         self._lbl_action.setCursor(Qt.CursorShape.ArrowCursor)
-        self._progress.hide()
         self._clickable = False
 
 
