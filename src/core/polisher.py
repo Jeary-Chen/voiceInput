@@ -1,9 +1,11 @@
 """Text polisher — refines raw ASR output via OpenAI-compatible API."""
 import re
 
+import httpx
 from openai import OpenAI
 
 from core.log import logger
+from core.network import direct_business_network
 
 _TAG = "[Polisher]"
 
@@ -53,17 +55,32 @@ class TextPolisher:
         self.update_api_key(api_key)
         logger.info(f"{_TAG} Initialized (model={model}, url={self._base_url})")
 
-    def update_api_key(self, api_key: str):
-        api_key = (api_key or "").strip()
-        if not api_key:
-            self._client = None
-            logger.warning(f"{_TAG} API key not configured; client disabled")
+    def _close_client(self):
+        if self._client is None:
             return
         try:
-            self._client = OpenAI(api_key=api_key, base_url=self._base_url)
+            self._client.close()
+        except Exception as e:
+            logger.debug(f"{_TAG} Failed to close API client: {e}")
+        finally:
+            self._client = None
+
+    def update_api_key(self, api_key: str):
+        api_key = (api_key or "").strip()
+        self._close_client()
+        if not api_key:
+            logger.warning(f"{_TAG} API key not configured; client disabled")
+            return
+        http_client = httpx.Client(trust_env=False)
+        try:
+            self._client = OpenAI(
+                api_key=api_key,
+                base_url=self._base_url,
+                http_client=http_client,
+            )
             logger.info(f"{_TAG} API key updated")
         except Exception as e:
-            self._client = None
+            http_client.close()
             logger.error(f"{_TAG} API client init failed: {e}")
 
     def set_model(self, model: str):
@@ -81,15 +98,16 @@ class TextPolisher:
         try:
             system_content = _build_system_prompt(extra_instructions)
             user_content = f"```text\n{raw_text}\n```"
-            resp = self._client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": user_content},
-                ],
-                extra_body={"enable_thinking": False},
-                timeout=15,
-            )
+            with direct_business_network():
+                resp = self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_content},
+                    ],
+                    extra_body={"enable_thinking": False},
+                    timeout=15,
+                )
             content = resp.choices[0].message.content
             raw_result = content.strip() if isinstance(content, str) else str(content).strip()
             result = _extract_from_codeblock(raw_result)

@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 import urllib.request
 import urllib.error
-from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
@@ -15,68 +14,11 @@ from PyQt6.QtCore import QThread, pyqtSignal, QTimer
 
 from _version import VERSION
 from core.log import logger
+from core.network import open_update_url
 
 _REPO = "myuan19/voiceInput"
 _API_URL = f"https://api.github.com/repos/{_REPO}/releases?per_page=20"
 _CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000  # 4 hours
-_PROXY_SCHEMES = ("http", "https")
-
-
-def _filter_update_proxies(proxies: dict[str, str]) -> dict[str, str]:
-    return {
-        scheme: proxy
-        for scheme, proxy in (proxies or {}).items()
-        if scheme.lower() in _PROXY_SCHEMES and proxy
-    }
-
-
-def _windows_system_proxies() -> dict[str, str]:
-    if sys.platform != "win32":
-        return {}
-    getter = getattr(urllib.request, "getproxies_registry", None)
-    if getter is None:
-        return {}
-    try:
-        return _filter_update_proxies(getter())
-    except OSError as e:
-        logger.debug(f"[Updater] Failed to read Windows system proxy: {e}")
-        return {}
-
-
-@contextmanager
-def _without_no_proxy_env():
-    saved = {name: os.environ.pop(name, None) for name in ("NO_PROXY", "no_proxy")}
-    try:
-        yield
-    finally:
-        for name, value in saved.items():
-            if value is not None:
-                os.environ[name] = value
-
-
-def _environment_proxies_without_no_proxy() -> dict[str, str]:
-    with _without_no_proxy_env():
-        return _filter_update_proxies(urllib.request.getproxies())
-
-
-def _resolve_update_proxies() -> dict[str, str]:
-    """Resolve proxies for GitHub update traffic without changing app-wide env."""
-    proxies = _windows_system_proxies()
-    if proxies:
-        return proxies
-    return _environment_proxies_without_no_proxy()
-
-
-def _open_update_url(req: urllib.request.Request, *, timeout: int):
-    proxies = _resolve_update_proxies()
-    if not proxies:
-        logger.debug("[Updater] Opening update URL without proxy")
-        return urllib.request.urlopen(req, timeout=timeout)
-
-    logger.debug(f"[Updater] Opening update URL with proxy schemes: {sorted(proxies)}")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
-    with _without_no_proxy_env():
-        return opener.open(req, timeout=timeout)
 
 
 class UpdateInfo(NamedTuple):
@@ -182,7 +124,7 @@ class _CheckWorker(QThread):
                 "User-Agent": "VoiceInput-Updater",
             })
             logger.debug(f"[DEBUG] _CheckWorker.run | requesting {_API_URL}")
-            with _open_update_url(req, timeout=10) as resp:
+            with open_update_url(req, timeout=10) as resp:
                 raw = resp.read()
                 logger.debug(f"[DEBUG] _CheckWorker.run | response length={len(raw)}")
             data = json.loads(raw)
@@ -241,7 +183,7 @@ class _DownloadWorker(QThread):
             req = urllib.request.Request(self._url, headers={
                 "User-Agent": "VoiceInput-Updater",
             })
-            with _open_update_url(req, timeout=60) as resp:
+            with open_update_url(req, timeout=60) as resp:
                 total = int(resp.headers.get("Content-Length", 0))
                 logger.debug(f"[DEBUG] _DownloadWorker.run | Content-Length={total}")
                 downloaded = 0

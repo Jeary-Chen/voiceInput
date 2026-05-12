@@ -5,13 +5,13 @@ import ctypes
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from core.network import configure_direct_business_traffic
+
 # Ctrl+C 直接终止进程，不抛 KeyboardInterrupt 到随机线程
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-# VoiceInput 只访问 dashscope.aliyuncs.com (阿里云国内)，清除代理避免冲突
-for _pv in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-    os.environ.pop(_pv, None)
-os.environ["NO_PROXY"] = "*"
+# Business APIs use direct connections; GitHub update traffic opts into proxy separately.
+configure_direct_business_traffic()
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication

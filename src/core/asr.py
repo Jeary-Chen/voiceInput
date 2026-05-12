@@ -6,6 +6,7 @@ import wave
 import dashscope
 
 from core.log import logger
+from core.network import direct_business_network
 
 _TAG = "[ASR]"
 
@@ -37,16 +38,17 @@ class DashScopeASR:
                     f"→ base64 {len(b64)} B")
 
         try:
-            resp = dashscope.MultiModalConversation.call(
-                api_key=self.api_key,
-                model=self.model,
-                messages=[{
-                    "role": "user",
-                    "content": [{"audio": data_uri}],
-                }],
-                result_format="message",
-                asr_options={"enable_itn": False},
-            )
+            with direct_business_network():
+                resp = dashscope.MultiModalConversation.call(
+                    api_key=self.api_key,
+                    model=self.model,
+                    messages=[{
+                        "role": "user",
+                        "content": [{"audio": data_uri}],
+                    }],
+                    result_format="message",
+                    asr_options={"enable_itn": False},
+                )
         except Exception as e:
             logger.error(f"{_TAG} API call exception: {e}")
             raise
