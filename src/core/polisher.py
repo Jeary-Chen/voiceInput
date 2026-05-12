@@ -7,7 +7,7 @@ from core.log import logger
 
 _TAG = "[Polisher]"
 
-DEFAULT_INSTRUCTIONS = "去口语化，但不增删内容，保持原有的语句顺序。"
+DEFAULT_INSTRUCTIONS = "优化表达，不增删内容，保持原有的语句顺序。"
 
 _TASK_PREAMBLE="将给你的语音识别原始文本按照要求润色。"
 

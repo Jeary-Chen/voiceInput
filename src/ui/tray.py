@@ -15,7 +15,7 @@ from PyQt6.QtGui import QAction, QColor, QDesktopServices, QKeySequence
 from PyQt6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication,
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QTextEdit, QListWidget, QListWidgetItem,
+    QLineEdit, QTextBrowser, QTextEdit, QListWidget, QListWidgetItem,
     QStyledItemDelegate, QStyleOptionViewItem,
     QMessageBox, QSplitter, QWidget,
     QWidgetAction,
@@ -45,6 +45,8 @@ _MOD_KEYS = frozenset({
     "ctrl", "shift", "alt", "capslock",
     "lctrl", "rctrl", "lshift", "rshift", "lalt", "ralt",
 })
+
+_LOCK_STATE_KEYS = frozenset({"capslock", "numlock", "scrolllock"})
 
 _VK_TO_NAME: dict[int, str] = {}
 _NAME_TO_VK: dict[str, int] = {}
@@ -232,7 +234,8 @@ class ComboHotkeyThread(QThread):
                     self._active = True
                     self._active_time = time.monotonic()
                     self.triggered.emit()
-                if combo_key and self._combo_fully_pressed():
+                suppress_before_complete = combo_key and name in _LOCK_STATE_KEYS
+                if combo_key and (self._combo_fully_pressed() or suppress_before_complete):
                     if was_new:
                         self._hook_suppressed.add(name)
                     self._kb_listener.suppress_event()
@@ -882,7 +885,7 @@ _DIALOG_SUBTITLE_QSS = "font-size:14px; font-weight:600; color:#fff;"
 _DIALOG_META_QSS = f"color:{_DIALOG_MUTED}; font-size:13px; line-height:150%;"
 _DIALOG_HINT_QSS = f"color:{_DIALOG_MUTED}; font-size:12px;"
 _DIALOG_TEXTEDIT_QSS = f"""
-    QTextEdit {{
+    QTextEdit, QTextBrowser {{
         background: {_DIALOG_READONLY_BG};
         color: {_DIALOG_TEXT};
         border: 1px solid {_DIALOG_READONLY_BORDER};
@@ -891,7 +894,7 @@ _DIALOG_TEXTEDIT_QSS = f"""
         font-size: 13px;
         font-family: "Segoe UI", "Microsoft YaHei";
     }}
-""" + _dialog_qss_scrollbar("QTextEdit", _DIALOG_READONLY_BG)
+""" + _dialog_qss_scrollbar("QTextEdit", _DIALOG_READONLY_BG) + _dialog_qss_scrollbar("QTextBrowser", _DIALOG_READONLY_BG)
 _DIALOG_BTN_METRICS = "border-radius: 6px; padding: 4px 14px; font-size: 13px; min-height: 26px;"
 _DIALOG_BTN_SECONDARY = f"""
     QPushButton {{ background:#333; color:#fff; border:1px solid #555;
@@ -952,9 +955,10 @@ class _UpdateNotesDialog(QDialog):
 
         body = _strip_release_body_title(info.body, info.version) or "暂无更新日志。"
         if info.html_url:
-            body = f"{body}\n\nRelease 页面：{info.html_url}"
-        self._notes = QTextEdit()
+            body = f"{body}\n\nRelease 页面：[在浏览器中打开]({info.html_url})"
+        self._notes = QTextBrowser()
         self._notes.setReadOnly(True)
+        self._notes.setOpenExternalLinks(True)
         self._notes.setStyleSheet(_DIALOG_TEXTEDIT_QSS)
         self._notes.setMarkdown(body)
         root.addWidget(self._notes, 1)
