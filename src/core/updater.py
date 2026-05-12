@@ -17,7 +17,7 @@ from _version import VERSION
 from core.log import logger
 
 _REPO = "myuan19/voiceInput"
-_API_URL = f"https://api.github.com/repos/{_REPO}/releases/latest"
+_API_URL = f"https://api.github.com/repos/{_REPO}/releases?per_page=20"
 _CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000  # 4 hours
 _PROXY_SCHEMES = ("http", "https")
 
@@ -151,6 +151,22 @@ def _pick_asset(assets: list[dict], version: str) -> tuple[str, str, int] | None
     return None
 
 
+def _select_latest_release(releases: list[dict], local_version: str) -> dict | None:
+    candidates = []
+    for release in releases:
+        if release.get("draft") or release.get("prerelease"):
+            continue
+        tag = release.get("tag_name", "")
+        if not _is_newer(tag, local_version):
+            continue
+        version = tag.lstrip("vV")
+        if _pick_asset(release.get("assets", []), version):
+            candidates.append(release)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda release: _parse_version(release.get("tag_name", "")))
+
+
 _NO_UPDATE = "NO_UPDATE"
 _CHECK_ERROR = "CHECK_ERROR"
 
@@ -169,15 +185,17 @@ class _CheckWorker(QThread):
             with _open_update_url(req, timeout=10) as resp:
                 raw = resp.read()
                 logger.debug(f"[DEBUG] _CheckWorker.run | response length={len(raw)}")
-                data = json.loads(raw)
-            tag = data.get("tag_name", "")
-            logger.debug(f"[DEBUG] _CheckWorker.run | remote tag={tag!r}, local={VERSION!r}, is_newer={_is_newer(tag, VERSION)}")
-            if not _is_newer(tag, VERSION):
-                logger.debug("[DEBUG] _CheckWorker.run | no update needed, emitting _NO_UPDATE")
+            data = json.loads(raw)
+            releases = data if isinstance(data, list) else [data]
+            release = _select_latest_release(releases, VERSION)
+            if release is None:
+                logger.debug("[DEBUG] _CheckWorker.run | no newer release with matching asset")
                 self.result.emit(_NO_UPDATE)
                 return
+            tag = release.get("tag_name", "")
+            logger.debug(f"[DEBUG] _CheckWorker.run | remote tag={tag!r}, local={VERSION!r}, is_newer={_is_newer(tag, VERSION)}")
             version = tag.lstrip("vV")
-            assets = data.get("assets", [])
+            assets = release.get("assets", [])
             asset_names = [a.get("name") for a in assets]
             logger.debug(f"[DEBUG] _CheckWorker.run | version={version}, assets={asset_names}")
             picked = _pick_asset(assets, version)
@@ -192,10 +210,10 @@ class _CheckWorker(QThread):
                 download_url=url,
                 filename=filename,
                 size=size,
-                title=data.get("name", "") or f"VoiceInput v{version}",
-                body=data.get("body", "") or "",
-                html_url=data.get("html_url", "") or "",
-                published_at=data.get("published_at", "") or "",
+                title=release.get("name", "") or f"VoiceInput v{version}",
+                body=release.get("body", "") or "",
+                html_url=release.get("html_url", "") or "",
+                published_at=release.get("published_at", "") or "",
             )
             logger.info(f"[Updater] New version available: v{info.version} ({info.filename})")
             logger.debug(f"[DEBUG] _CheckWorker.run | emitting UpdateInfo: {info}")
