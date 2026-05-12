@@ -10,21 +10,23 @@ import ctypes
 import sys
 
 from PyQt6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, pyqtSignal,
+    Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF,
+    pyqtProperty, pyqtSignal,
 )
 from PyQt6.QtGui import QPainter, QColor, QPainterPath, QPen, QFont
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
-    QApplication,
+    QApplication, QFrame, QScrollArea,
 )
 
 from core.log import logger
 from ui.theme import Theme
+from ui.native_idle_pill import NativeIdlePillWindow
 from ui.waveform_widget import WaveformWidget
 
 IDLE_W, IDLE_H = 48, 8
 HOVER_W, HOVER_H = 120, 36       # 3 buttons
-REC_W, REC_H = 80, 38             # waveform only (with padding)
+REC_W, REC_H = 80, 36             # waveform only (with padding)
 REC_HOVER_W = 110                  # waveform + stop button on hover
 RESULT_W = 340                    # result popup width
 RADIUS = 19
@@ -169,6 +171,9 @@ class _RecStopButton(QWidget):
 
 class _ResultPopup(QWidget):
     """Floating text popup that shows below the mini window and auto-hides."""
+    TOP_MARGIN = 12
+    BOTTOM_MARGIN = 12
+    MIN_SCROLL_H = 96
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -181,6 +186,12 @@ class _ResultPopup(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setWidgetResizable(False)
+        self._scroll.setStyleSheet("background: transparent; border: none;")
 
         self._label = QLabel("")
         self._label.setFont(Theme.font(13))
@@ -198,7 +209,8 @@ class _ResultPopup(QWidget):
         self._label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        layout.addWidget(self._label)
+        self._scroll.setWidget(self._label)
+        layout.addWidget(self._scroll)
 
         self._auto_hide = QTimer(self)
         self._auto_hide.setSingleShot(True)
@@ -206,17 +218,31 @@ class _ResultPopup(QWidget):
 
     def show_text(self, text: str, anchor_widget: QWidget, duration_ms: int = 3500):
         self._label.setText(text)
-        self.setFixedWidth(RESULT_W)
-        self.adjustSize()
+        self._label.setFixedWidth(RESULT_W)
+        self._label.adjustSize()
 
         pos = anchor_widget.mapToGlobal(anchor_widget.rect().bottomLeft())
         screen = QApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
             x = geo.x() + (geo.width() - RESULT_W) // 2
+            top_limit = geo.y() + self.TOP_MARGIN
+            bottom_limit = geo.bottom() - self.BOTTOM_MARGIN
         else:
             x = pos.x()
-        self.move(x, pos.y() + 4)
+            top_limit = 0
+            bottom_limit = pos.y() + self._label.height()
+
+        desired_y = pos.y() + 4
+        natural_h = self._label.sizeHint().height()
+        max_h = max(self.MIN_SCROLL_H, bottom_limit - top_limit + 1)
+        popup_h = min(natural_h, max_h)
+        y = min(desired_y, bottom_limit - popup_h + 1)
+        y = max(top_limit, y)
+
+        self._scroll.setFixedSize(RESULT_W, popup_h)
+        self.setFixedSize(RESULT_W, popup_h)
+        self.move(x, y)
         self.show()
         self._auto_hide.start(duration_ms)
 
@@ -343,6 +369,7 @@ class MiniRecordingWindow(QWidget):
         self._hovered = False
         self._show_result = engine.config.show_result_text
         self._anchor_x: int | None = engine.config.mini_window_x
+        self._native_idle: NativeIdlePillWindow | None = None
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -353,6 +380,15 @@ class MiniRecordingWindow(QWidget):
 
         self._geom_anim = QPropertyAnimation(self, b"geometry")
         self._geom_anim.finished.connect(self._on_anim_finished)
+        self._opacity_anim = QPropertyAnimation(self, b"windowOpacity")
+        self._opacity_anim.finished.connect(self._on_opacity_anim_finished)
+        self._reveal_progress = 1.0
+        self._reveal_anim = QPropertyAnimation(self, b"revealProgress")
+        self._reveal_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._reveal_anim.finished.connect(self._on_reveal_anim_finished)
+        self._native_returning_to_idle = False
+        self._fade_target: str | None = None
+        self._shape_target: str | None = None
         self._target_size = (IDLE_W, IDLE_H)
         self._anim_interrupting = False
 
@@ -383,6 +419,9 @@ class MiniRecordingWindow(QWidget):
         self._winevent_hook = None
         self._winevent_cb_ref = None
         if sys.platform == "win32":
+            self._native_idle = NativeIdlePillWindow(
+                IDLE_W, IDLE_H, self._on_native_idle_enter,
+            )
             self._install_foreground_hook()
 
     # ── Win32 topmost enforcement ──
@@ -411,6 +450,9 @@ class MiniRecordingWindow(QWidget):
             )
 
     def closeEvent(self, event):
+        if self._native_idle:
+            self._native_idle.destroy()
+            self._native_idle = None
         if self._winevent_hook:
             ctypes.windll.user32.UnhookWinEvent(self._winevent_hook)
             self._winevent_hook = None
@@ -635,9 +677,13 @@ class MiniRecordingWindow(QWidget):
     def refresh_visibility(self):
         """Apply the current hide-when-idle preference to the minimal idle state."""
         if not self._engine.config.hide_mini_window_when_idle:
+            if self._mode == "idle" and self._engine.state == "ready":
+                self._show_idle_surface()
+                return
             self.show()
             return
         if self._mode == "idle" and self._engine.state == "ready":
+            self._hide_native_idle()
             self.hide()
 
     def _on_action_click(self):
@@ -659,6 +705,154 @@ class MiniRecordingWindow(QWidget):
 
     # ── animation helpers ──
 
+    def _log_anim(self, event: str, **extra):
+        g = self.geometry()
+        details = {
+            "mode": self._mode,
+            "engine": self._engine.state,
+            "hovered": self._hovered,
+            "visible": self.isVisible(),
+            "geom": (g.x(), g.y(), g.width(), g.height()),
+            "target": self._target_size,
+            "anchor_x": self._anchor_x,
+            "reveal": round(self._reveal_progress, 3),
+            "opacity": round(self.windowOpacity(), 3),
+            "shape_target": self._shape_target,
+            "fade_target": self._fade_target,
+            "returning": self._native_returning_to_idle,
+            "native": self._using_native_idle(),
+        }
+        details.update(extra)
+        logger.debug(f"[MiniWinAnim] {event} | {details}")
+
+    def _get_reveal_progress(self) -> float:
+        return self._reveal_progress
+
+    def _set_reveal_progress(self, value: float):
+        self._reveal_progress = max(0.0, min(float(value), 1.0))
+        self.update()
+
+    revealProgress = pyqtProperty(float, _get_reveal_progress, _set_reveal_progress)
+
+    def _using_native_idle(self) -> bool:
+        return bool(self._native_idle and self._native_idle.available)
+
+    def _idle_top_left(self) -> tuple[int, int] | None:
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return None
+        geo = screen.availableGeometry()
+        return self._get_x_for_width(IDLE_W), geo.y() + 4
+
+    def _native_idle_scale(self) -> float:
+        screen = QApplication.screenAt(self.pos()) or QApplication.primaryScreen()
+        if not screen:
+            return 1.0
+        return float(screen.devicePixelRatio())
+
+    def _show_idle_surface(self):
+        if self._using_native_idle():
+            pos = self._idle_top_left()
+            if pos is None:
+                return
+            self._log_anim("show_native_idle", pos=pos, scale=self._native_idle_scale())
+            self._anim_interrupting = True
+            self._geom_anim.stop()
+            self._anim_interrupting = False
+            self._native_returning_to_idle = False
+            self.hide()
+            self._position_at(IDLE_W, IDLE_H)
+            self._native_idle.show_at(*pos, scale=self._native_idle_scale())
+            return
+        self._log_anim("show_qt_idle_fallback")
+        self.show()
+
+    def _hide_native_idle(self):
+        if self._native_idle:
+            self._log_anim("hide_native_idle")
+            self._native_idle.hide()
+
+    def _fade_to(self, opacity: float, duration: int, target: str | None = None):
+        self._fade_target = target
+        self._opacity_anim.stop()
+        self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._opacity_anim.setDuration(duration)
+        self._opacity_anim.setStartValue(self.windowOpacity())
+        self._opacity_anim.setEndValue(opacity)
+        self._opacity_anim.start()
+
+    def _reveal_to(self, value: float, duration: int, target: str | None = None):
+        self._shape_target = target
+        self._log_anim("reveal_start", end=value, duration=duration, target=target)
+        self._reveal_anim.stop()
+        self._reveal_anim.setDuration(duration)
+        self._reveal_anim.setStartValue(self._reveal_progress)
+        self._reveal_anim.setEndValue(value)
+        self._reveal_anim.start()
+
+    def _animate_hover_to_top(self, duration: int = 220):
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        start = self.geometry()
+        target_w = max(IDLE_W, start.width())
+        target_h = max(IDLE_H, start.height())
+        target_x = self._get_x_for_width(IDLE_W) - (target_w - IDLE_W) // 2
+        target = QRect(
+            target_x,
+            screen.availableGeometry().y() + 4,
+            target_w,
+            target_h,
+        )
+        self._native_returning_to_idle = True
+        self._anim_interrupting = True
+        self._geom_anim.stop()
+        self._anim_interrupting = False
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        self.setGeometry(start)
+        self._geom_anim.setEasingCurve(QEasingCurve.Type.InOutQuart)
+        self._geom_anim.setDuration(duration)
+        self._geom_anim.setStartValue(start)
+        self._geom_anim.setEndValue(target)
+        self._geom_anim.start()
+        self._log_anim("return_to_top_start", target_geom=(
+            target.x(), target.y(), target.width(), target.height(),
+        ), duration=duration)
+
+    def _on_opacity_anim_finished(self):
+        if self._fade_target != "idle":
+            self._fade_target = None
+            return
+        self._fade_target = None
+        if self._mode == "idle" and self._engine.state == "ready":
+            self._set_widgets_for_mode("idle")
+            self._reveal_progress = 1.0
+            self.setWindowOpacity(1.0)
+            self._show_idle_surface()
+
+    def _on_reveal_anim_finished(self):
+        target = self._shape_target
+        self._log_anim("reveal_finished", target=target)
+        self._shape_target = None
+        if target == "idle" and self._mode == "shrinking":
+            self._mode = "idle"
+            self._native_returning_to_idle = False
+            self._set_widgets_for_mode("idle")
+            self._reveal_progress = 1.0
+            self.setWindowOpacity(1.0)
+            self._show_idle_surface()
+        elif target == "hover" and self._mode == "hover":
+            self._reveal_progress = 1.0
+            self._top_bar.setVisible(True)
+            self.setWindowOpacity(1.0)
+
+    def _on_native_idle_enter(self):
+        if self._mode in ("idle", "shrinking") and self._engine.state == "ready":
+            self._log_anim("native_idle_enter")
+            self._hide_native_idle()
+            self._apply_hover()
+
     def _get_x_for_width(self, w: int) -> int:
         screen = QApplication.primaryScreen()
         if not screen:
@@ -677,6 +871,10 @@ class MiniRecordingWindow(QWidget):
         if not screen:
             return
         if not self.isVisible():
+            if self._using_native_idle() and self._mode == "hover":
+                self._position_at(w, h)
+                self.show()
+                return
             self.show()
             if self.width() < 2 or self.height() < 2:
                 self._position_at(IDLE_W, IDLE_H)
@@ -708,6 +906,9 @@ class MiniRecordingWindow(QWidget):
     def _on_anim_finished(self):
         if self._anim_interrupting:
             return
+        if self._native_returning_to_idle:
+            self._log_anim("return_to_top_finished")
+            return
         w, h = self._target_size
         self.setFixedSize(w, h)
         if self._mode == "shrinking":
@@ -715,7 +916,10 @@ class MiniRecordingWindow(QWidget):
             self.update()
             if (self._engine.config.hide_mini_window_when_idle
                     and self._engine.state == "ready"):
+                self._hide_native_idle()
                 self.hide()
+            elif self._using_native_idle():
+                self._show_idle_surface()
             else:
                 self.show()
 
@@ -732,16 +936,56 @@ class MiniRecordingWindow(QWidget):
     # ── state transitions ──
 
     def _apply_hover(self):
+        was_returning = self._native_returning_to_idle or self._shape_target == "idle"
+        self._log_anim("hover_start", was_returning=was_returning)
         self._mode = "hover"
+        self._fade_target = None
+        self._shape_target = None
+        self._native_returning_to_idle = False
+        self._opacity_anim.stop()
+        self._reveal_anim.stop()
+        self._hide_native_idle()
         self._style_action_record()
         self._update_polish_style()
         self._update_show_result_style()
         self._set_widgets_for_mode("hover")
-        self._animate_to(HOVER_W, HOVER_H, 220,
-                         QEasingCurve.Type.InOutQuart)
+        if self._using_native_idle() and not self.isVisible():
+            self._target_size = (HOVER_W, HOVER_H)
+            self._position_at(HOVER_W, HOVER_H)
+            self._reveal_progress = 0.0
+            self.setWindowOpacity(1.0)
+            self._top_bar.setVisible(False)
+            self.show()
+            self._reveal_to(1.0, 160, "hover")
+        else:
+            if was_returning and self._geom_anim.state() == QPropertyAnimation.State.Running:
+                current = self._geom_anim.currentValue()
+                if current is not None:
+                    self._geom_anim.stop()
+                    self.setGeometry(current)
+            if self.windowOpacity() < 1.0:
+                self._fade_to(1.0, 90)
+            else:
+                self.setWindowOpacity(1.0)
+            if was_returning:
+                self._top_bar.setVisible(False)
+                self._reveal_to(1.0, 120, "hover")
+            else:
+                self._reveal_progress = 1.0
+                self._animate_to(HOVER_W, HOVER_H, 220,
+                                 QEasingCurve.Type.InOutQuart)
 
     def _apply_recording(self):
+        self._log_anim("recording_start")
         self._cancel_deferred_shrink()
+        self._fade_target = None
+        self._shape_target = None
+        self._native_returning_to_idle = False
+        self._opacity_anim.stop()
+        self._reveal_anim.stop()
+        self._hide_native_idle()
+        self._reveal_progress = 1.0
+        self.setWindowOpacity(1.0)
         self._mode = "recording"
         self._waveform.reset()
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_RECORDING.name()};")
@@ -776,6 +1020,23 @@ class MiniRecordingWindow(QWidget):
         if self._engine.state != "ready":
             return
         if self._mode in ("idle", "shrinking"):
+            return
+        if self._using_native_idle():
+            self._log_anim("shrink_start")
+            self._mode = "shrinking"
+            self._hide_recording_status()
+            self._target_size = (IDLE_W, IDLE_H)
+            if self.isVisible():
+                self._reveal_progress = 1.0
+                self.setWindowOpacity(1.0)
+                self._set_widgets_for_mode("idle")
+                self._animate_hover_to_top(160)
+                self._reveal_to(0.0, 180, "idle")
+            else:
+                self._set_widgets_for_mode("idle")
+                self._reveal_progress = 1.0
+                self.setWindowOpacity(1.0)
+                self._show_idle_surface()
             return
         self._mode = "shrinking"
         self._hide_recording_status()
@@ -832,8 +1093,12 @@ class MiniRecordingWindow(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
         w, h = float(self.width()), float(self.height())
-        r = min(RADIUS, h / 2)
-        path.addRoundedRect(0, 0, w, h, r, r)
+        progress = self._reveal_progress if self._mode in ("hover", "shrinking") else 1.0
+        draw_w = IDLE_W + (w - IDLE_W) * progress
+        draw_h = IDLE_H + (h - IDLE_H) * progress
+        x = (w - draw_w) / 2
+        r = min(RADIUS, draw_h / 2)
+        path.addRoundedRect(QRectF(x, 0, draw_w, draw_h), r, r)
         bg = QColor(Theme.BG_PRIMARY)
         bg.setAlpha(245)
         p.fillPath(path, bg)

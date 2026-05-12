@@ -233,7 +233,16 @@ class ComboHotkeyThread(QThread):
                 if was_new and self._combo_fully_pressed() and not self._active:
                     self._active = True
                     self._active_time = time.monotonic()
+                    logger.debug(
+                        f"[Hotkey] Triggered combo={sorted(self._combo)} "
+                        f"pressed={sorted(self._pressed)} key={name}"
+                    )
                     self.triggered.emit()
+                elif combo_key and self._combo_fully_pressed() and self._active:
+                    logger.debug(
+                        f"[Hotkey] Ignored repeat while active "
+                        f"pressed={sorted(self._pressed)} key={name} was_new={was_new}"
+                    )
                 suppress_before_complete = combo_key and name in _LOCK_STATE_KEYS
                 if combo_key and (self._combo_fully_pressed() or suppress_before_complete):
                     if was_new:
@@ -243,6 +252,10 @@ class ComboHotkeyThread(QThread):
                 if self._active and combo_key:
                     hold_ms = int((time.monotonic() - self._active_time) * 1000)
                     self._active = False
+                    logger.debug(
+                        f"[Hotkey] Released combo key={name} hold_ms={hold_ms} "
+                        f"pressed_before={sorted(self._pressed)}"
+                    )
                     self.released.emit(hold_ms)
                 self._pressed.discard(name)
                 # 只抑制「曾被抑制过 KEYDOWN」的键的 KEYUP；否则系统仍认为 Shift/Ctrl 未弹起（粘键），
@@ -3055,6 +3068,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_tray_click(self):
         """Tray icon click: simple toggle, no hold-to-cancel."""
+        logger.debug(f"[Tray] Toggle requested via tray/mini (state={self._engine.state})")
         if self._engine.state == "processing":
             return
         if self._engine.state == "ready":
@@ -3064,7 +3078,7 @@ class VoiceTray(QSystemTrayIcon):
             if self._key_warning:
                 self.show_api_key_invalid_notice()
                 return
-            self._audio.play_start()
+            self._audio.play_start(source="tray_or_mini")
         elif self._engine.state == "recording":
             self._audio.play_stop()
         self._engine.toggle_record()
@@ -3200,6 +3214,7 @@ class VoiceTray(QSystemTrayIcon):
         logger.warning(f"[Updater] Download failed: {msg}")
 
     def _on_hotkey(self):
+        logger.debug(f"[Tray] Toggle requested via hotkey down (state={self._engine.state})")
         if self._engine.state == "processing":
             return
         if self._engine.state == "ready":
@@ -3209,7 +3224,7 @@ class VoiceTray(QSystemTrayIcon):
             if self._key_warning:
                 self.show_api_key_invalid_notice()
                 return
-            self._audio.play_start()
+            self._audio.play_start(source="hotkey")
             self._engine.toggle_record()
         elif self._engine.state == "recording":
             self._hotkey_hold_active = True

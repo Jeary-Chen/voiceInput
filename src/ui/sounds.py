@@ -27,6 +27,7 @@ _SAMPLE_RATE = 22050
 _TAG = "[Sound]"
 
 _FRAMES_PER_BUFFER = 1024
+_START_DEBOUNCE_SEC = 0.25
 
 
 def _make_wav(pcm: bytes) -> bytes:
@@ -112,6 +113,7 @@ class AudioCues:
         self._lock = threading.Lock()
         self._buf: collections.deque[bytes] = collections.deque()
         self._stream_ready = False
+        self._last_start_monotonic = 0.0
         self._init_stream()
 
     def _init_stream(self):
@@ -183,8 +185,12 @@ class AudioCues:
         wav = _make_wav(pcm)
         winsound.PlaySound(wav, winsound.SND_MEMORY)
 
-    def _play(self, name: str, pcm: bytes):
-        logger.info(f"{_TAG} Playing '{name}' ({len(pcm)} B)")
+    def _play(self, name: str, pcm: bytes, *, source: str = "unknown"):
+        queue_chunks = len(self._buf)
+        logger.info(
+            f"{_TAG} Playing '{name}' ({len(pcm)} B, source={source}, "
+            f"queue_chunks={queue_chunks})"
+        )
         try:
             self._enqueue(name, pcm)
         except Exception as e:
@@ -196,9 +202,18 @@ class AudioCues:
             except Exception as e2:
                 logger.warning(f"{_TAG} '{name}' winsound also failed: {e2}")
 
-    def play_start(self):
+    def play_start(self, *, source: str = "unknown"):
         if self._enabled:
-            self._play("start", self._sounds["start"])
+            now = time.monotonic()
+            elapsed = now - self._last_start_monotonic
+            if elapsed < _START_DEBOUNCE_SEC:
+                logger.warning(
+                    f"{_TAG} Suppressed duplicate 'start' "
+                    f"(source={source}, elapsed_ms={elapsed * 1000:.0f})"
+                )
+                return
+            self._last_start_monotonic = now
+            self._play("start", self._sounds["start"], source=source)
 
     def play_stop(self):
         if self._enabled:

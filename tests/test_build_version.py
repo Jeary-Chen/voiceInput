@@ -11,7 +11,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 
-from build import _normalize_tag_version, _resolve_app_version
+from build import _normalize_tag_version, _resolve_app_version, build_installer
 
 
 class BuildVersionTests(unittest.TestCase):
@@ -27,6 +27,20 @@ class BuildVersionTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with patch("build._git_latest_tag", return_value="v1.2.4"):
                 self.assertEqual(_resolve_app_version(), "1.2.4")
+
+    def test_installer_build_refreshes_portable_by_default(self):
+        with patch("build.build_portable") as build_portable:
+            with patch("build._find_iscc", return_value=None):
+                build_installer()
+
+        build_portable.assert_called_once_with()
+
+    def test_installer_build_can_reuse_existing_portable(self):
+        with patch("build.build_portable") as build_portable:
+            with patch("build._find_iscc", return_value=None):
+                build_installer(refresh_portable=False)
+
+        build_portable.assert_not_called()
 
 
 if __name__ == "__main__":

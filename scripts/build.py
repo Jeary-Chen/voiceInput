@@ -374,10 +374,10 @@ def _zip_dir(src_dir: Path, zip_path: Path):
     print(f"[OK] {zip_path} ({size_mb:.1f} MB)")
 
 
-def build_installer():
+def build_installer(*, refresh_portable: bool = True):
     """基于 portable 构建生成 Inno Setup 安装包。"""
-    if not DIST_APP.exists():
-        print("[INFO] Portable build not found, building first...")
+    if refresh_portable or not DIST_APP.exists():
+        print("[INFO] Refreshing portable build for installer...")
         build_portable()
 
     iss_path = BUILD / "installer.iss"
@@ -544,7 +544,7 @@ def build_all():
     _zip_dir(DIST_APP, DIST / f"VoiceInput-{APP_VERSION}-portable.zip")
 
     print("\n--- [3/3] Installer ---")
-    build_installer()
+    build_installer(refresh_portable=False)
 
     print("\n" + "=" * 60)
     print(" Build artifacts in dist/:")

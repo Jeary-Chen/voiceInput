@@ -1,6 +1,3 @@
-"""Build-time application version.
+"""Build-time application version."""
 
-The release build rewrites this file from the current git tag.
-"""
-
-VERSION = "0.0.0-dev"
+VERSION = "1.2.4"

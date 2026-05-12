@@ -2,6 +2,7 @@ import sys
 import os
 import signal
 import ctypes
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -31,6 +32,15 @@ _SHUTDOWN_EVENT_NAME = "VoiceInput_Shutdown_Event"
 _app_mutex_handle = None
 _shutdown_event_handle = None
 _shutdown_bridge = None
+
+
+def _runtime_summary() -> str:
+    from _version import VERSION
+
+    return (
+        f"version={VERSION}, main={Path(__file__).resolve()}, "
+        f"exe={Path(sys.executable).resolve()}, cwd={Path.cwd()}"
+    )
 
 
 def _is_already_running() -> bool:
@@ -118,6 +128,7 @@ def main():
     app.setApplicationName("VoiceInput")
     app.setWindowIcon(icons.app_icon())
     install_qt_handler()
+    logger.info(f"[Runtime] {_runtime_summary()}")
 
     if _is_already_running():
         logger.warning("VoiceInput is already running, exiting.")

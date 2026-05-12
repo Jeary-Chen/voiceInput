@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 dist/
 build/
+VoiceInput/
 # PyInstaller 每次打包在 CWD 生成，勿提交（含绝对路径）
 VoiceInput.spec
 *.wav
