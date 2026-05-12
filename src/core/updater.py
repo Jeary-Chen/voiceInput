@@ -25,6 +25,10 @@ class UpdateInfo(NamedTuple):
     download_url: str
     filename: str
     size: int
+    title: str
+    body: str
+    html_url: str
+    published_at: str
 
 
 def _parse_version(tag: str) -> tuple[int, ...]:
@@ -124,7 +128,16 @@ class _CheckWorker(QThread):
                 self.result.emit(_NO_UPDATE)
                 return
             url, filename, size = picked
-            info = UpdateInfo(version=version, download_url=url, filename=filename, size=size)
+            info = UpdateInfo(
+                version=version,
+                download_url=url,
+                filename=filename,
+                size=size,
+                title=data.get("name", "") or f"VoiceInput v{version}",
+                body=data.get("body", "") or "",
+                html_url=data.get("html_url", "") or "",
+                published_at=data.get("published_at", "") or "",
+            )
             logger.info(f"[Updater] New version available: v{info.version} ({info.filename})")
             logger.debug(f"[DEBUG] _CheckWorker.run | emitting UpdateInfo: {info}")
             self.result.emit(info)

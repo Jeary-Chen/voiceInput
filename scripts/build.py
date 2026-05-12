@@ -29,6 +29,7 @@ DIST_APP = DIST / "VoiceInput"
 PYTHON_VERSION = "3.12.10"
 PYTHON_EMBED_URL = f"https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_VERSION}-embed-amd64.zip"
 GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
+DEFAULT_DEV_VERSION = "0.0.0-dev"
 
 LAUNCHER_CS = r"""
 using System;
@@ -89,7 +90,42 @@ def copy_src(dest: Path):
     print(f"[COPY] src/ -> {src_dest}")
 
 
-APP_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+def _normalize_tag_version(tag: str) -> str:
+    tag = (tag or "").strip()
+    if tag.lower().startswith("refs/tags/"):
+        tag = tag.rsplit("/", 1)[-1]
+    return tag.lstrip("vV") or DEFAULT_DEV_VERSION
+
+
+def _git_latest_tag() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "describe", "--tags", "--abbrev=0"],
+            cwd=ROOT,
+            text=True,
+            encoding="utf-8",
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def _resolve_app_version() -> str:
+    ref_name = os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF", "")
+    if ref_name:
+        return _normalize_tag_version(ref_name)
+    return _normalize_tag_version(_git_latest_tag())
+
+
+APP_VERSION = _resolve_app_version()
+
+
+def _write_embedded_version(version: str = APP_VERSION):
+    version_py = SRC / "_version.py"
+    version_py.write_text(
+        f'"""Build-time application version."""\n\nVERSION = "{version}"\n',
+        encoding="utf-8",
+    )
+    print(f"[WRITE] {version_py} ({version})")
 
 
 def _pip_install(*packages: str):
@@ -130,7 +166,6 @@ def _pyinstaller_cmd(onefile: bool = False) -> list[str]:
         "--add-data", f"{SRC / 'ui'};ui",
         "--add-data", f"{SRC / 'config.py'};.",
         "--add-data", f"{SRC / '_version.py'};.",
-        "--add-data", f"{ROOT / 'VERSION'};.",
         "--hidden-import", "pyaudio",
         "--hidden-import", "dashscope",
         "--hidden-import", "pynput",
@@ -155,6 +190,7 @@ def build_onefile():
     """PyInstaller --onefile: 单文件便携 exe。"""
     print("[BUILD] PyInstaller onefile mode")
     _ensure_pyinstaller()
+    _write_embedded_version()
 
     cmd = _pyinstaller_cmd(onefile=True)
     print(f"[CMD] {' '.join(cmd)}")
@@ -182,11 +218,8 @@ def build_portable():
     _install_deps(python_dir)
     _prune_runtime_only_python(python_dir)
 
+    _write_embedded_version()
     copy_src(DIST_APP)
-
-    ver_dest = DIST_APP / "VERSION"
-    shutil.copy2(ROOT / "VERSION", ver_dest)
-    print(f"[COPY] VERSION -> {ver_dest}")
 
     _build_launcher(DIST_APP)
 

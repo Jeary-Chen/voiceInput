@@ -49,12 +49,22 @@ class TextPolisher:
                  base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"):
         self._model = model
         self._base_url = _to_compatible_url(base_url)
-        self._client = OpenAI(api_key=api_key, base_url=self._base_url)
+        self._client: OpenAI | None = None
+        self.update_api_key(api_key)
         logger.info(f"{_TAG} Initialized (model={model}, url={self._base_url})")
 
     def update_api_key(self, api_key: str):
-        self._client = OpenAI(api_key=api_key, base_url=self._base_url)
-        logger.info(f"{_TAG} API key updated")
+        api_key = (api_key or "").strip()
+        if not api_key:
+            self._client = None
+            logger.warning(f"{_TAG} API key not configured; client disabled")
+            return
+        try:
+            self._client = OpenAI(api_key=api_key, base_url=self._base_url)
+            logger.info(f"{_TAG} API key updated")
+        except Exception as e:
+            self._client = None
+            logger.error(f"{_TAG} API client init failed: {e}")
 
     def set_model(self, model: str):
         old = self._model
@@ -65,6 +75,9 @@ class TextPolisher:
         """Returns (api_ok, text). api_ok is False only when the request raised."""
         if not raw_text.strip():
             return True, raw_text
+        if self._client is None:
+            logger.warning(f"{_TAG} Skipped: API key not configured")
+            return False, raw_text
         try:
             system_content = _build_system_prompt(extra_instructions)
             user_content = f"```text\n{raw_text}\n```"

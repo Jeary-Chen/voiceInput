@@ -34,7 +34,13 @@ def classify_user_error(message: str) -> UserErrorContext:
     if not m:
         return UserErrorContext(UserErrorDomain.GENERAL, m)
 
-    if "API 401:" in m or "API 403:" in m:
+    if (
+        "API 401:" in m
+        or "API 403:" in m
+        or "Missing credentials" in m
+        or "OPENAI_API_KEY" in m
+        or "OPENAI_ADMIN_KEY" in m
+    ):
         return UserErrorContext(UserErrorDomain.API_CREDENTIALS, m)
 
     if m.startswith("未录到音频"):

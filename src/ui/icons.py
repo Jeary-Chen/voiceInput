@@ -102,3 +102,7 @@ def icon_done() -> QIcon:
 
 def icon_key_invalid() -> QIcon:
     return _make_icon(QColor(140, 140, 140), Theme.COLOR_WARNING)
+
+
+def icon_updating() -> QIcon:
+    return _make_icon(QColor(80, 80, 80), QColor(175, 82, 222))

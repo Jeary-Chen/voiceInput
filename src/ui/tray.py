@@ -823,6 +823,154 @@ class _ApiKeyDialog(QDialog):
         return self._result
 
 
+def _format_update_size(size: int) -> str:
+    if size <= 0:
+        return "未知大小"
+    mb = size / (1024 * 1024)
+    if mb >= 1:
+        return f"{mb:.1f} MB"
+    return f"{size / 1024:.1f} KB"
+
+
+class _UpdateNotesDialog(QDialog):
+    """Shows release notes before starting the silent update download."""
+
+    def __init__(self, info: UpdateInfo, current_version: str, parent=None):
+        super().__init__(parent)
+        self._info = info
+        self._start_update = False
+        self.setWindowTitle(f"发现新版本 v{info.version}")
+        self.setWindowIcon(icons.app_icon())
+        self.setFixedSize(560, 520)
+        self.setStyleSheet("""
+            QDialog { background:#1e1e1e; color:#fff; }
+            QLabel { color:#fff; font-size:13px; }
+            QTextEdit {
+                background:#252525; color:#e8e8e8; border:1px solid #444;
+                border-radius:8px; padding:10px; font-size:13px;
+                font-family: "Segoe UI", "Microsoft YaHei";
+            }
+            QPushButton {
+                border-radius:6px; padding:7px 16px; font-size:13px;
+            }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setSpacing(12)
+
+        title = QLabel(f"VoiceInput v{info.version} 可用")
+        title.setStyleSheet("font-size:18px; font-weight:600;")
+        root.addWidget(title)
+
+        meta = QLabel(
+            f"当前版本：v{current_version}\n"
+            f"更新文件：{info.filename}（{_format_update_size(info.size)}）"
+        )
+        meta.setStyleSheet("color:#aaa; line-height:150%;")
+        root.addWidget(meta)
+
+        note = QLabel("更新日志")
+        note.setStyleSheet("font-size:14px; font-weight:600;")
+        root.addWidget(note)
+
+        body = (info.body or "").strip() or "暂无更新日志。"
+        if info.html_url:
+            body = f"{body}\n\nRelease 页面：{info.html_url}"
+        self._notes = QTextEdit()
+        self._notes.setReadOnly(True)
+        self._notes.setPlainText(body)
+        root.addWidget(self._notes, 1)
+
+        hint = QLabel("点击“开始更新”后，本窗口会关闭，程序将切换至右下角托盘图标进行静默更新；可在托盘菜单中查看下载进度。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#aaa; font-size:12px;")
+        root.addWidget(hint)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        btn_later = QPushButton("稍后")
+        btn_later.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_later.setStyleSheet("""
+            QPushButton { background:transparent; color:#aaa; border:1px solid #444; }
+            QPushButton:hover { background:#2a2a2a; color:#fff; }
+        """)
+        btn_later.clicked.connect(self.reject)
+        row.addWidget(btn_later)
+
+        btn_start = QPushButton("开始更新")
+        btn_start.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_start.setStyleSheet("""
+            QPushButton { background:#007aff; color:#fff; border:1px solid #007aff; }
+            QPushButton:hover { background:#0066dd; border-color:#0066dd; }
+        """)
+        btn_start.clicked.connect(self._accept_start)
+        row.addWidget(btn_start)
+        root.addLayout(row)
+
+    @property
+    def start_update(self) -> bool:
+        return self._start_update
+
+    def _accept_start(self):
+        self._start_update = True
+        self.accept()
+
+
+class _UpdateReadyDialog(QDialog):
+    """Prompts the user to restart after the update payload is downloaded."""
+
+    def __init__(self, version: str, parent=None):
+        super().__init__(parent)
+        self._restart_now = False
+        self.setWindowTitle("更新已准备好")
+        self.setWindowIcon(icons.app_icon())
+        self.setFixedSize(420, 180)
+        self.setStyleSheet("background:#1e1e1e; color:#fff;")
+
+        root = QVBoxLayout(self)
+        root.setSpacing(12)
+
+        title = QLabel(f"v{version} 已下载完成")
+        title.setStyleSheet("font-size:17px; font-weight:600;")
+        root.addWidget(title)
+
+        body = QLabel("点击“重启更新”后，VoiceInput 将退出并启动安装/覆盖更新。")
+        body.setWordWrap(True)
+        body.setStyleSheet("color:#aaa; font-size:13px;")
+        root.addWidget(body)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        btn_later = QPushButton("稍后")
+        btn_later.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_later.setStyleSheet("""
+            QPushButton { background:transparent; color:#aaa; border:1px solid #444;
+                          border-radius:6px; padding:7px 16px; font-size:13px; }
+            QPushButton:hover { background:#2a2a2a; color:#fff; }
+        """)
+        btn_later.clicked.connect(self.reject)
+        row.addWidget(btn_later)
+
+        btn_restart = QPushButton("重启更新")
+        btn_restart.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_restart.setStyleSheet("""
+            QPushButton { background:#34c759; color:#fff; border:1px solid #34c759;
+                          border-radius:6px; padding:7px 16px; font-size:13px; }
+            QPushButton:hover { background:#28a745; border-color:#28a745; }
+        """)
+        btn_restart.clicked.connect(self._accept_restart)
+        row.addWidget(btn_restart)
+        root.addLayout(row)
+
+    @property
+    def restart_now(self) -> bool:
+        return self._restart_now
+
+    def _accept_restart(self):
+        self._restart_now = True
+        self.accept()
+
+
 class _KeepWhiteTextDelegate(QStyledItemDelegate):
     """Force white text in all states so selection/hover never flips to black."""
 
@@ -2003,7 +2151,7 @@ class _UpdateMenuHelper:
 
     def set_ready(self):
         self._set_action(
-            f'<span style="color:{self._CLR_GREEN};">\u2713</span> 安装并重启',
+            f'<span style="color:{self._CLR_GREEN};">\u2713</span> 重启更新',
             self._CLR_GREEN,
         )
 
@@ -2096,6 +2244,9 @@ class VoiceTray(QSystemTrayIcon):
         self._config = config
         self._prompt_dlg: _PolishPromptDialog | None = None
         self._apikey_dlg: _ApiKeyDialog | None = None
+        self._update_notes_dlg: _UpdateNotesDialog | None = None
+        self._update_ready_dlg: _UpdateReadyDialog | None = None
+        self._update_status = "idle"  # idle | downloading | ready
         self._hotkey_pause_depth = 0
 
         self._audio = AudioCues()
@@ -2661,8 +2812,7 @@ class VoiceTray(QSystemTrayIcon):
         self._engine.asr.api_key = dlg.api_key
         self._engine.polisher.update_api_key(dlg.api_key)
         logger.info("[Tray] API Key updated")
-        if dlg.api_key:
-            self.set_key_warning(False)
+        self.set_key_warning(not bool(dlg.api_key))
 
     def _toggle_save_audio(self, checked: bool):
         self._config.save_audio = checked
@@ -2841,11 +2991,11 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "processing":
             return
         if self._engine.state == "ready":
-            if self._key_warning:
-                self.show_api_key_invalid_notice()
-                return
             if not self._config.api_key:
                 self._configure_apikey()
+                return
+            if self._key_warning:
+                self.show_api_key_invalid_notice()
                 return
             self._audio.play_start()
         elif self._engine.state == "recording":
@@ -2871,13 +3021,85 @@ class VoiceTray(QSystemTrayIcon):
             logger.debug("[DEBUG] _on_update_click | → already downloading, ignored")
             return
         if self._updater.latest:
-            logger.debug("[DEBUG] _on_update_click | → download_and_install()")
-            self._update_widget.set_downloading(0)
-            self._updater.download_and_install()
+            logger.debug("[DEBUG] _on_update_click | → show release notes")
+            self._show_update_notes(self._updater.latest)
             return
         logger.debug("[DEBUG] _on_update_click | → check_now()")
         self._update_widget.set_checking()
         self._updater.check_now()
+
+    def _show_update_notes(self, info: UpdateInfo):
+        if self._update_notes_dlg is not None:
+            self._update_notes_dlg.raise_()
+            self._update_notes_dlg.activateWindow()
+            return
+        from _version import VERSION
+        dlg = _UpdateNotesDialog(info, VERSION)
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.finished.connect(self._on_update_notes_finished)
+        self._update_notes_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_update_notes_finished(self, result: int):
+        dlg = self._update_notes_dlg
+        self._update_notes_dlg = None
+        if (dlg is None
+                or result != QDialog.DialogCode.Accepted
+                or not dlg.start_update):
+            return
+        self._begin_update_download()
+
+    def _begin_update_download(self):
+        if self._updater.is_downloading:
+            return
+        if self._updater.is_ready_to_install:
+            self._set_update_status("ready")
+            self._show_update_ready_dialog()
+            return
+        if not self._updater.latest:
+            return
+        logger.info("[Updater] User accepted release notes; starting silent download")
+        self._update_widget.set_downloading(0)
+        self._set_update_status("downloading")
+        self._updater.download_and_install()
+
+    def _set_update_status(self, status: str):
+        self._update_status = status
+        if status == "downloading":
+            self.setIcon(icons.icon_updating())
+            self.setToolTip("Voice Input 正在更新")
+        elif status == "ready":
+            self.setIcon(icons.icon_updating())
+            self.setToolTip("Voice Input 重启更新")
+        else:
+            self._restore_idle_icon()
+
+    def _show_update_ready_dialog(self):
+        if not self._updater.latest:
+            return
+        if self._update_ready_dlg is not None:
+            self._update_ready_dlg.raise_()
+            self._update_ready_dlg.activateWindow()
+            return
+        dlg = _UpdateReadyDialog(self._updater.latest.version)
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.finished.connect(self._on_update_ready_finished)
+        self._update_ready_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_update_ready_finished(self, result: int):
+        dlg = self._update_ready_dlg
+        self._update_ready_dlg = None
+        if (dlg is not None
+                and result == QDialog.DialogCode.Accepted
+                and dlg.restart_now):
+            self._updater.install()
 
     def _on_update_available(self, info: UpdateInfo):
         logger.debug(f"[DEBUG] _on_update_available | remote={info.version}")
@@ -2885,22 +3107,28 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_no_update(self):
         logger.debug("[DEBUG] _on_no_update | already latest")
+        self._set_update_status("idle")
         self._update_widget.set_no_update()
         QTimer.singleShot(3000, self._update_widget.set_idle)
 
     def _on_check_failed(self):
         logger.debug("[DEBUG] _on_check_failed | check failed")
+        self._set_update_status("idle")
         self._update_widget.set_failed(is_download=False)
 
     def _on_download_progress(self, percent: int):
         self._update_widget.set_downloading(percent)
+        self._set_update_status("downloading")
 
     def _on_download_done(self):
         logger.debug("[DEBUG] _on_download_done | download complete, ready to install")
         self._update_widget.set_ready()
+        self._set_update_status("ready")
+        self._show_update_ready_dialog()
 
     def _on_download_failed(self, msg: str):
         logger.debug(f"[DEBUG] _on_download_failed | msg={msg}")
+        self._set_update_status("idle")
         self._update_widget.set_failed(is_download=True)
         logger.warning(f"[Updater] Download failed: {msg}")
 
@@ -2908,11 +3136,11 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "processing":
             return
         if self._engine.state == "ready":
-            if self._key_warning:
-                self.show_api_key_invalid_notice()
-                return
             if not self._config.api_key:
                 self._configure_apikey()
+                return
+            if self._key_warning:
+                self.show_api_key_invalid_notice()
                 return
             self._audio.play_start()
             self._engine.toggle_record()
@@ -2939,6 +3167,9 @@ class VoiceTray(QSystemTrayIcon):
 
     def _sync_tray_icon_with_engine(self):
         """Align icon and primary tooltip with engine state (e.g. after menu device refresh)."""
+        if self._update_status in ("downloading", "ready"):
+            self._set_update_status(self._update_status)
+            return
         st = self._engine.state
         if st == "recording":
             self.setIcon(icons.icon_recording())
@@ -2993,6 +3224,9 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_done(self, text: str):
         self._audio.play_done()
+        if self._update_status in ("downloading", "ready"):
+            self._set_update_status(self._update_status)
+            return
         self.setIcon(icons.icon_done())
         self._update_tooltip("就绪")
         QTimer.singleShot(2000, self._restore_idle_icon)
@@ -3037,6 +3271,9 @@ class VoiceTray(QSystemTrayIcon):
     def _restore_idle_icon(self):
         if self._engine.state in ("recording", "processing"):
             self._sync_tray_icon_with_engine()
+            return
+        if self._update_status in ("downloading", "ready"):
+            self._set_update_status(self._update_status)
             return
         if self._key_warning:
             self.setIcon(icons.icon_key_invalid())
