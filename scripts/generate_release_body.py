@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 DEFAULT_REPO_URL = "https://github.com/myuan19/voiceInput"
+MANUAL_NOTES_DIR = Path(".github") / "release-notes"
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,16 @@ def _previous_tag(current_tag: str) -> str:
         return _run_git(["describe", "--tags", "--abbrev=0", rev])
     except subprocess.CalledProcessError:
         return ""
+
+
+def load_manual_release_body(current_tag: str, *, root: Path = Path(".")) -> str | None:
+    tag = (current_tag or "").strip().rsplit("/", 1)[-1]
+    if not tag:
+        return None
+    path = root / MANUAL_NOTES_DIR / f"{tag}.md"
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
 
 
 def _collect_commits(previous_tag: str, current_tag: str) -> list[Commit]:
@@ -146,7 +157,7 @@ def render_release_body(
             seen_authors.add(author)
             authors.append(author)
 
-    lines = [f"## VoiceInput v{version}", ""]
+    lines: list[str] = []
 
     if previous_tag:
         lines.extend([
@@ -194,15 +205,20 @@ def main() -> None:
     args = parser.parse_args()
 
     repo_url = args.repo_url or _detect_repo_url()
-    previous_tag = _previous_tag(args.current_tag)
-    commits = _collect_commits(previous_tag, args.current_tag)
-    body = render_release_body(
-        version=args.version,
-        previous_tag=previous_tag,
-        current_tag=args.current_tag,
-        commits=commits,
-        repo_url=repo_url,
-    )
+    manual_body = load_manual_release_body(args.current_tag)
+    if manual_body is not None:
+        body = manual_body
+        print(f"Using manual release notes for {args.current_tag}")
+    else:
+        previous_tag = _previous_tag(args.current_tag)
+        commits = _collect_commits(previous_tag, args.current_tag)
+        body = render_release_body(
+            version=args.version,
+            previous_tag=previous_tag,
+            current_tag=args.current_tag,
+            commits=commits,
+            repo_url=repo_url,
+        )
     Path(args.output).write_text(body, encoding="utf-8")
     print(f"Wrote {args.output}")
 

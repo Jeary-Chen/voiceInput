@@ -832,6 +832,93 @@ def _format_update_size(size: int) -> str:
     return f"{size / 1024:.1f} KB"
 
 
+_DIALOG_PANEL_BG = "#2a2a2a"
+_DIALOG_PANEL_BORDER = "#555"
+_DIALOG_READONLY_BG = "#252525"
+_DIALOG_READONLY_BORDER = "#444"
+_DIALOG_BG = "#1e1e1e"
+_DIALOG_FOCUS = "#007aff"
+_DIALOG_MUTED = "#aaa"
+_DIALOG_TEXT = "#ececec"
+_DIALOG_TOOLTIP_BG = "#2d2d2d"
+_DIALOG_SB_HANDLE = "#555"
+_DIALOG_SB_HANDLE_HOVER = "#666"
+
+
+def _dialog_qss_scrollbar(widget_prefix: str, track_bg: str) -> str:
+    return f"""
+    {widget_prefix} QScrollBar:vertical {{ background: {track_bg}; }}
+    {widget_prefix} QScrollBar::handle:vertical {{ background: {_DIALOG_SB_HANDLE}; }}
+    {widget_prefix} QScrollBar::handle:vertical:hover {{ background: {_DIALOG_SB_HANDLE_HOVER}; }}
+    {widget_prefix} QScrollBar:horizontal {{ background: {track_bg}; }}
+    {widget_prefix} QScrollBar::handle:horizontal {{ background: {_DIALOG_SB_HANDLE}; }}
+    {widget_prefix} QScrollBar::handle:horizontal:hover {{ background: {_DIALOG_SB_HANDLE_HOVER}; }}
+    """
+
+
+_DIALOG_CHROME_QSS = f"""
+    QDialog {{
+        background: {_DIALOG_BG};
+        color: #fff;
+        border: none;
+        border-radius: 0px;
+    }}
+    QLabel {{
+        color: #fff;
+        font-size: 13px;
+    }}
+    QToolTip {{
+        background-color: {_DIALOG_TOOLTIP_BG};
+        color: {_DIALOG_TEXT};
+        border: 1px solid {_DIALOG_PANEL_BORDER};
+        padding: 6px 9px;
+        border-radius: 4px;
+        font-size: 12px;
+        max-width: 420px;
+    }}
+"""
+_DIALOG_TITLE_QSS = "font-size:18px; font-weight:600; color:#fff;"
+_DIALOG_SUBTITLE_QSS = "font-size:14px; font-weight:600; color:#fff;"
+_DIALOG_META_QSS = f"color:{_DIALOG_MUTED}; font-size:13px; line-height:150%;"
+_DIALOG_HINT_QSS = f"color:{_DIALOG_MUTED}; font-size:12px;"
+_DIALOG_TEXTEDIT_QSS = f"""
+    QTextEdit {{
+        background: {_DIALOG_READONLY_BG};
+        color: {_DIALOG_TEXT};
+        border: 1px solid {_DIALOG_READONLY_BORDER};
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 13px;
+        font-family: "Segoe UI", "Microsoft YaHei";
+    }}
+""" + _dialog_qss_scrollbar("QTextEdit", _DIALOG_READONLY_BG)
+_DIALOG_BTN_METRICS = "border-radius: 6px; padding: 4px 14px; font-size: 13px; min-height: 26px;"
+_DIALOG_BTN_SECONDARY = f"""
+    QPushButton {{ background:#333; color:#fff; border:1px solid #555;
+                  {_DIALOG_BTN_METRICS} }}
+    QPushButton:hover {{ background:#444; border-color:#666; }}
+    QPushButton:disabled {{ color:#555; border-color:#444; }}
+"""
+_DIALOG_BTN_PRIMARY = f"""
+    QPushButton {{ background:{_DIALOG_FOCUS}; color:#fff; border:1px solid {_DIALOG_FOCUS};
+                  {_DIALOG_BTN_METRICS} }}
+    QPushButton:hover {{ background:#0066dd; border-color:#0066dd; }}
+"""
+
+
+def _strip_release_body_title(body: str, version: str) -> str:
+    lines = (body or "").strip().splitlines()
+    if not lines:
+        return ""
+    first = lines[0].strip().lstrip("#").strip().lower()
+    titles = {f"voiceinput v{version}".lower(), f"voice input v{version}".lower()}
+    if first in titles:
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
 class _UpdateNotesDialog(QDialog):
     """Shows release notes before starting the silent update download."""
 
@@ -842,67 +929,52 @@ class _UpdateNotesDialog(QDialog):
         self.setWindowTitle(f"发现新版本 v{info.version}")
         self.setWindowIcon(icons.app_icon())
         self.setFixedSize(560, 520)
-        self.setStyleSheet("""
-            QDialog { background:#1e1e1e; color:#fff; }
-            QLabel { color:#fff; font-size:13px; }
-            QTextEdit {
-                background:#252525; color:#e8e8e8; border:1px solid #444;
-                border-radius:8px; padding:10px; font-size:13px;
-                font-family: "Segoe UI", "Microsoft YaHei";
-            }
-            QPushButton {
-                border-radius:6px; padding:7px 16px; font-size:13px;
-            }
-        """)
+        self.setStyleSheet(_DIALOG_CHROME_QSS)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
         title = QLabel(f"VoiceInput v{info.version} 可用")
-        title.setStyleSheet("font-size:18px; font-weight:600;")
+        title.setStyleSheet(_DIALOG_TITLE_QSS)
         root.addWidget(title)
 
         meta = QLabel(
             f"当前版本：v{current_version}\n"
             f"更新文件：{info.filename}（{_format_update_size(info.size)}）"
         )
-        meta.setStyleSheet("color:#aaa; line-height:150%;")
+        meta.setStyleSheet(_DIALOG_META_QSS)
         root.addWidget(meta)
 
         note = QLabel("更新日志")
-        note.setStyleSheet("font-size:14px; font-weight:600;")
+        note.setStyleSheet(_DIALOG_SUBTITLE_QSS)
         root.addWidget(note)
 
-        body = (info.body or "").strip() or "暂无更新日志。"
+        body = _strip_release_body_title(info.body, info.version) or "暂无更新日志。"
         if info.html_url:
             body = f"{body}\n\nRelease 页面：{info.html_url}"
         self._notes = QTextEdit()
         self._notes.setReadOnly(True)
-        self._notes.setPlainText(body)
+        self._notes.setStyleSheet(_DIALOG_TEXTEDIT_QSS)
+        self._notes.setMarkdown(body)
         root.addWidget(self._notes, 1)
 
         hint = QLabel("点击“开始更新”后，本窗口会关闭，程序将切换至右下角托盘图标进行静默更新；可在托盘菜单中查看下载进度。")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color:#aaa; font-size:12px;")
+        hint.setStyleSheet(_DIALOG_HINT_QSS)
         root.addWidget(hint)
 
         row = QHBoxLayout()
         row.addStretch()
         btn_later = QPushButton("稍后")
         btn_later.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_later.setStyleSheet("""
-            QPushButton { background:transparent; color:#aaa; border:1px solid #444; }
-            QPushButton:hover { background:#2a2a2a; color:#fff; }
-        """)
+        btn_later.setStyleSheet(_DIALOG_BTN_SECONDARY)
         btn_later.clicked.connect(self.reject)
         row.addWidget(btn_later)
 
         btn_start = QPushButton("开始更新")
         btn_start.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_start.setStyleSheet("""
-            QPushButton { background:#007aff; color:#fff; border:1px solid #007aff; }
-            QPushButton:hover { background:#0066dd; border-color:#0066dd; }
-        """)
+        btn_start.setStyleSheet(_DIALOG_BTN_PRIMARY)
         btn_start.clicked.connect(self._accept_start)
         row.addWidget(btn_start)
         root.addLayout(row)
@@ -925,39 +997,32 @@ class _UpdateReadyDialog(QDialog):
         self.setWindowTitle("更新已准备好")
         self.setWindowIcon(icons.app_icon())
         self.setFixedSize(420, 180)
-        self.setStyleSheet("background:#1e1e1e; color:#fff;")
+        self.setStyleSheet(_DIALOG_CHROME_QSS)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
         title = QLabel(f"v{version} 已下载完成")
-        title.setStyleSheet("font-size:17px; font-weight:600;")
+        title.setStyleSheet(_DIALOG_TITLE_QSS)
         root.addWidget(title)
 
         body = QLabel("点击“重启更新”后，VoiceInput 将退出并启动安装/覆盖更新。")
         body.setWordWrap(True)
-        body.setStyleSheet("color:#aaa; font-size:13px;")
+        body.setStyleSheet(_DIALOG_META_QSS)
         root.addWidget(body)
 
         row = QHBoxLayout()
         row.addStretch()
         btn_later = QPushButton("稍后")
         btn_later.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_later.setStyleSheet("""
-            QPushButton { background:transparent; color:#aaa; border:1px solid #444;
-                          border-radius:6px; padding:7px 16px; font-size:13px; }
-            QPushButton:hover { background:#2a2a2a; color:#fff; }
-        """)
+        btn_later.setStyleSheet(_DIALOG_BTN_SECONDARY)
         btn_later.clicked.connect(self.reject)
         row.addWidget(btn_later)
 
         btn_restart = QPushButton("重启更新")
         btn_restart.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_restart.setStyleSheet("""
-            QPushButton { background:#34c759; color:#fff; border:1px solid #34c759;
-                          border-radius:6px; padding:7px 16px; font-size:13px; }
-            QPushButton:hover { background:#28a745; border-color:#28a745; }
-        """)
+        btn_restart.setStyleSheet(_DIALOG_BTN_PRIMARY)
         btn_restart.clicked.connect(self._accept_restart)
         row.addWidget(btn_restart)
         root.addLayout(row)
@@ -1038,17 +1103,17 @@ _DEFAULT_PROMPT_ID = "__default__"
 _TRAY_MENU_DEFAULT_PROMPT = "__tray_default_prompt__"
 
 # ── 管理提示词：QSS 调色板与组合样式（颜色单源；滚动条仅一处实现） ──
-_PROMPT_QSS_PANEL_BG = "#2a2a2a"
-_PROMPT_QSS_PANEL_BORDER = "#555"
-_PROMPT_QSS_READONLY_BG = "#252525"
-_PROMPT_QSS_READONLY_BORDER = "#444"
-_PROMPT_QSS_DIALOG_BG = "#1e1e1e"
+_PROMPT_QSS_PANEL_BG = _DIALOG_PANEL_BG
+_PROMPT_QSS_PANEL_BORDER = _DIALOG_PANEL_BORDER
+_PROMPT_QSS_READONLY_BG = _DIALOG_READONLY_BG
+_PROMPT_QSS_READONLY_BORDER = _DIALOG_READONLY_BORDER
+_PROMPT_QSS_DIALOG_BG = _DIALOG_BG
 _PROMPT_QSS_SPLITTER_HANDLE = "#444"
-_PROMPT_QSS_SB_HANDLE = "#555"
-_PROMPT_QSS_SB_HANDLE_HOVER = "#666"
-_PROMPT_QSS_FOCUS = "#007aff"
-_PROMPT_QSS_MSGBOX_FG = "#ececec"
-_PROMPT_QSS_TOOLTIP_BG = "#2d2d2d"
+_PROMPT_QSS_SB_HANDLE = _DIALOG_SB_HANDLE
+_PROMPT_QSS_SB_HANDLE_HOVER = _DIALOG_SB_HANDLE_HOVER
+_PROMPT_QSS_FOCUS = _DIALOG_FOCUS
+_PROMPT_QSS_MSGBOX_FG = _DIALOG_TEXT
+_PROMPT_QSS_TOOLTIP_BG = _DIALOG_TOOLTIP_BG
 
 
 def _prompt_qss_scrollbar(widget_prefix: str, track_bg: str) -> str:
@@ -1154,9 +1219,7 @@ _LIST_STYLE = f"""
 """ + _prompt_qss_scrollbar("QListWidget", _PROMPT_QSS_PANEL_BG)
 
 # 管理提示词按钮：统一尺寸；主色按钮用与底色同色的 1px 边框（勿用 border:none），否则比灰底按钮少 2px 高
-_PROMPT_QSS_BTN_METRICS = (
-    "border-radius: 6px; padding: 4px 14px; font-size: 13px; min-height: 26px;"
-)
+_PROMPT_QSS_BTN_METRICS = _DIALOG_BTN_METRICS
 
 _BTN = f"""
     QPushButton {{ background:#333; color:#fff; border:1px solid #555;

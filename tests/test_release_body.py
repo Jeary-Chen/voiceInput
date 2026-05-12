@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,7 +10,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 
-from generate_release_body import Commit, render_release_body
+from generate_release_body import Commit, load_manual_release_body, render_release_body
 
 
 class ReleaseBodyTests(unittest.TestCase):
@@ -29,7 +30,7 @@ class ReleaseBodyTests(unittest.TestCase):
             repo_url="https://github.com/myuan19/voiceInput",
         )
 
-        self.assertIn("## VoiceInput v1.2.4", body)
+        self.assertFalse(body.startswith("## VoiceInput v1.2.4"))
         self.assertIn("### 新增", body)
         self.assertIn("show release notes before updating", body)
         self.assertIn("### 修复", body)
@@ -59,6 +60,19 @@ class ReleaseBodyTests(unittest.TestCase):
         self.assertNotIn("### 其他变更", body)
         self.assertNotIn("improve tray update copy", body)
         self.assertNotIn("/compare/", body)
+
+    def test_load_manual_release_body_uses_tag_specific_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manual_dir = root / ".github" / "release-notes"
+            manual_dir.mkdir(parents=True)
+            manual = manual_dir / "v1.2.4.md"
+            manual.write_text("## 手动更新说明\n\n- 修复启动问题\n", encoding="utf-8")
+
+            self.assertEqual(
+                load_manual_release_body("v1.2.4", root=root),
+                "## 手动更新说明\n\n- 修复启动问题\n",
+            )
 
 
 if __name__ == "__main__":

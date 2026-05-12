@@ -38,7 +38,23 @@ scripts\run.bat --start       # 通过 bat 包装调用 run.ps1
 | `run.bat` | cmd.exe 薄包装，透传参数给 `run.ps1` |
 | `run.sh` | Bash 脚本，功能与 `run.ps1` 对等 |
 | `build.py` | 构建脚本（PyInstaller / 嵌入式 Python / Inno Setup） |
+| `prepare_release_notes.py` | 发布前生成 `.github/release-notes/<tag>.md`，确认后再打 tag |
+| `generate_release_body.py` | Release workflow 使用；优先读取手写 release notes，缺省时按 commit 自动生成 |
 | `clean_build.py` | 构建产物清理 |
+
+## 发布顺序
+
+发布前先生成并确认 release 信息，再推送 tag 触发 GitHub Release：
+
+```powershell
+uv run python scripts/prepare_release_notes.py v1.2.6
+# 编辑并确认 .github/release-notes/v1.2.6.md
+git add .github/release-notes/v1.2.6.md
+git commit -m "docs(release): add notes for v1.2.6"
+git push origin main
+git tag v1.2.6
+git push origin v1.2.6
+```
 
 ## 注意事项
 
