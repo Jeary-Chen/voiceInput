@@ -167,7 +167,7 @@ class _CheckWorker(QThread):
 
 class _DownloadWorker(QThread):
     progress = pyqtSignal(int)  # percent 0-100
-    finished_ok = pyqtSignal(str)  # local file path
+    finished_ok = pyqtSignal(str, int)  # (local file path, expected size)
     failed = pyqtSignal(str)  # error message
 
     def __init__(self, url: str, filename: str):
@@ -196,9 +196,17 @@ class _DownloadWorker(QThread):
                         downloaded += len(chunk)
                         if total > 0:
                             self.progress.emit(int(downloaded * 100 / total))
-            logger.info(f"[Updater] Downloaded: {dest}")
+            if total > 0 and downloaded != total:
+                logger.error(f"[Updater] Incomplete download: {downloaded}/{total} bytes ({downloaded*100//total}%)")
+                try:
+                    dest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self.failed.emit(f"下载不完整 ({downloaded}/{total} 字节)")
+                return
+            logger.info(f"[Updater] Downloaded: {dest} ({downloaded} bytes)")
             logger.debug(f"[DEBUG] _DownloadWorker.run | download complete, size={downloaded}, emitting finished_ok")
-            self.finished_ok.emit(str(dest))
+            self.finished_ok.emit(str(dest), total)
         except Exception as e:
             logger.error(f"[Updater] Download failed: {e}")
             logger.debug(f"[DEBUG] _DownloadWorker.run | exception: {type(e).__name__}: {e}")
@@ -216,6 +224,7 @@ class UpdateChecker:
         self._dl_worker: _DownloadWorker | None = None
         self._latest: UpdateInfo | None = None
         self._downloaded_path: str | None = None
+        self._downloaded_expected_size: int = 0
         self._cb_available = None
         self._cb_no_update = None
         self._cb_check_failed = None
@@ -272,7 +281,7 @@ class UpdateChecker:
         logger.debug(f"[DEBUG] UpdateChecker.download_and_install | starting download: {self._latest.download_url}")
         self._dl_worker = _DownloadWorker(self._latest.download_url, self._latest.filename)
         self._dl_worker.progress.connect(self._on_dl_progress)
-        self._dl_worker.finished_ok.connect(self._on_dl_done)
+        self._dl_worker.finished_ok.connect(self._on_dl_done)  # (path, expected_size)
         self._dl_worker.failed.connect(self._on_dl_failed)
         self._dl_worker.start()
 
@@ -285,7 +294,19 @@ class UpdateChecker:
         file_exists = Path(path).exists()
         file_size = Path(path).stat().st_size if file_exists else 0
         logger.info(f"[Updater] Installing: {path}")
-        logger.debug(f"[DEBUG] UpdateChecker.install | file_exists={file_exists}, file_size={file_size}")
+        logger.debug(f"[DEBUG] UpdateChecker.install | file_exists={file_exists}, file_size={file_size}, expected={self._downloaded_expected_size}")
+        if not file_exists or file_size == 0:
+            logger.error("[Updater] Install aborted: file missing or empty")
+            self._downloaded_path = None
+            return
+        if self._downloaded_expected_size > 0 and file_size != self._downloaded_expected_size:
+            logger.error(f"[Updater] Install aborted: file size mismatch (on_disk={file_size}, expected={self._downloaded_expected_size})")
+            self._downloaded_path = None
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
         if path.endswith("-setup.exe"):
             cmd = [path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
             logger.debug(f"[DEBUG] UpdateChecker.install | launching setup cmd={cmd}")
@@ -353,9 +374,10 @@ class UpdateChecker:
         if self._cb_progress:
             self._cb_progress(percent)
 
-    def _on_dl_done(self, path: str):
-        logger.debug(f"[DEBUG] UpdateChecker._on_dl_done | path={path}")
+    def _on_dl_done(self, path: str, expected_size: int):
+        logger.debug(f"[DEBUG] UpdateChecker._on_dl_done | path={path}, expected_size={expected_size}")
         self._downloaded_path = path
+        self._downloaded_expected_size = expected_size
         if self._cb_done:
             logger.debug("[DEBUG] UpdateChecker._on_dl_done | calling cb_done")
             self._cb_done()
