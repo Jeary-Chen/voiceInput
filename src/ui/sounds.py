@@ -8,8 +8,10 @@ Generates short beep/chirp sounds for audio feedback:
 Uses a pyaudio callback-mode output stream opened once at init and
 kept alive for the app lifetime.  Sound data is queued into a buffer
 and consumed by the audio callback without blocking the caller.
-A silence prefix is prepended on first play to wake the Bluetooth HFP
-channel.  Falls back to winsound if pyaudio output fails.
+When the audio path has been idle long enough for the DAC / amplifier
+to enter low-power standby, a short silence prefix is injected before
+the actual sound to let the hardware wake up first.
+Falls back to winsound if pyaudio output fails.
 """
 import math
 import struct
@@ -28,6 +30,8 @@ _TAG = "[Sound]"
 
 _FRAMES_PER_BUFFER = 1024
 _START_DEBOUNCE_SEC = 0.25
+_COLD_THRESHOLD_SEC = 2.0
+_WARMUP_SILENCE_SEC = 0.1
 
 
 def _make_wav(pcm: bytes) -> bytes:
@@ -114,6 +118,8 @@ class AudioCues:
         self._buf: collections.deque[bytes] = collections.deque()
         self._stream_ready = False
         self._last_start_monotonic = 0.0
+        self._last_enqueue_monotonic = 0.0
+        self._warmup_silence = b"\x00" * int(_SAMPLE_RATE * _WARMUP_SILENCE_SEC) * 2
         self._init_stream()
 
     def _init_stream(self):
@@ -174,12 +180,20 @@ class AudioCues:
 
     def _enqueue(self, name: str, pcm: bytes):
         t0 = time.perf_counter()
+        now = time.monotonic()
+        cold = (now - self._last_enqueue_monotonic) > _COLD_THRESHOLD_SEC
         with self._lock:
             if not self._stream_ready:
                 raise RuntimeError("PyAudio stream not available")
+            if cold:
+                self._buf.append(self._warmup_silence)
             self._buf.append(pcm)
+        self._last_enqueue_monotonic = now
         ms = (time.perf_counter() - t0) * 1000
-        logger.info(f"{_TAG} '{name}' enqueued ({ms:.0f}ms)")
+        if cold:
+            logger.info(f"{_TAG} '{name}' enqueued with warmup prefix ({ms:.0f}ms)")
+        else:
+            logger.info(f"{_TAG} '{name}' enqueued ({ms:.0f}ms)")
 
     def _play_via_winsound(self, name: str, pcm: bytes):
         wav = _make_wav(pcm)
