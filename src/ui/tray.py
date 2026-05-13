@@ -2229,6 +2229,11 @@ class _UpdateMenuHelper:
             f'正在下载… {percent}%', self._CLR_BLUE, clickable=False
         )
 
+    def set_extracting(self, percent: int):
+        self._set_action(
+            f'正在解压… {percent}%', self._CLR_BLUE, clickable=False
+        )
+
     def set_ready(self):
         self._set_action(
             f'<span style="color:{self._CLR_GREEN};">\u2713</span> 重启更新',
@@ -2380,9 +2385,12 @@ class VoiceTray(QSystemTrayIcon):
             on_available=self._on_update_available,
             on_no_update=self._on_no_update,
             on_check_failed=self._on_check_failed,
-            on_progress=self._on_download_progress,
-            on_done=self._on_download_done,
+            on_dl_progress=self._on_download_progress,
+            on_dl_done=self._on_download_done,
             on_dl_failed=self._on_download_failed,
+            on_stage_progress=self._on_stage_progress,
+            on_stage_done=self._on_stage_done,
+            on_stage_failed=self._on_stage_failed,
         )
 
         self.show()
@@ -3093,13 +3101,15 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_update_click(self):
         """Dispatches based on current updater state."""
-        logger.debug(f"[DEBUG] _on_update_click | is_ready={self._updater.is_ready_to_install}, is_downloading={self._updater.is_downloading}, latest={self._updater.latest}")
+        logger.debug(f"[DEBUG] _on_update_click | is_ready={self._updater.is_ready_to_install}, "
+                     f"is_downloading={self._updater.is_downloading}, is_staging={self._updater.is_staging}, "
+                     f"latest={self._updater.latest}")
         if self._updater.is_ready_to_install:
-            logger.debug("[DEBUG] _on_update_click | → install()")
-            self._updater.install()
+            logger.debug("[DEBUG] _on_update_click | → show ready dialog")
+            self._show_update_ready_dialog()
             return
-        if self._updater.is_downloading:
-            logger.debug("[DEBUG] _on_update_click | → already downloading, ignored")
+        if self._updater.is_downloading or self._updater.is_staging:
+            logger.debug("[DEBUG] _on_update_click | → busy, ignored")
             return
         if self._updater.latest:
             logger.debug("[DEBUG] _on_update_click | → show release notes")
@@ -3134,7 +3144,7 @@ class VoiceTray(QSystemTrayIcon):
         self._begin_update_download()
 
     def _begin_update_download(self):
-        if self._updater.is_downloading:
+        if self._updater.is_downloading or self._updater.is_staging:
             return
         if self._updater.is_ready_to_install:
             self._set_update_status("ready")
@@ -3142,14 +3152,14 @@ class VoiceTray(QSystemTrayIcon):
             return
         if not self._updater.latest:
             return
-        logger.info("[Updater] User accepted release notes; starting silent download")
+        logger.info("[Updater] User accepted release notes; starting download")
         self._update_widget.set_downloading(0)
         self._set_update_status("downloading")
-        self._updater.download_and_install()
+        self._updater.download_update()
 
     def _set_update_status(self, status: str):
         self._update_status = status
-        if status == "downloading":
+        if status in ("downloading", "staging"):
             self.setIcon(icons.icon_updating())
             self.setToolTip("Voice Input 正在更新")
         elif status == "ready":
@@ -3202,16 +3212,30 @@ class VoiceTray(QSystemTrayIcon):
         self._set_update_status("downloading")
 
     def _on_download_done(self):
-        logger.debug("[DEBUG] _on_download_done | download complete, ready to install")
-        self._update_widget.set_ready()
-        self._set_update_status("ready")
-        self._show_update_ready_dialog()
+        logger.debug("[DEBUG] _on_download_done | download complete, starting extraction")
+        self._update_widget.set_extracting(0)
+        self._set_update_status("staging")
 
     def _on_download_failed(self, msg: str):
         logger.debug(f"[DEBUG] _on_download_failed | msg={msg}")
         self._set_update_status("idle")
         self._update_widget.set_failed(is_download=True)
         logger.warning(f"[Updater] Download failed: {msg}")
+
+    def _on_stage_progress(self, percent: int):
+        self._update_widget.set_extracting(percent)
+
+    def _on_stage_done(self):
+        logger.debug("[DEBUG] _on_stage_done | staging complete, ready to install")
+        self._update_widget.set_ready()
+        self._set_update_status("ready")
+        self._show_update_ready_dialog()
+
+    def _on_stage_failed(self, msg: str):
+        logger.debug(f"[DEBUG] _on_stage_failed | msg={msg}")
+        self._set_update_status("idle")
+        self._update_widget.set_failed(is_download=True)
+        logger.warning(f"[Updater] Staging failed: {msg}")
 
     def _on_hotkey(self):
         logger.debug(f"[Tray] Toggle requested via hotkey down (state={self._engine.state})")
@@ -3249,7 +3273,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _sync_tray_icon_with_engine(self):
         """Align icon and primary tooltip with engine state (e.g. after menu device refresh)."""
-        if self._update_status in ("downloading", "ready"):
+        if self._update_status in ("downloading", "staging", "ready"):
             self._set_update_status(self._update_status)
             return
         st = self._engine.state
@@ -3306,7 +3330,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_done(self, text: str):
         self._audio.play_done()
-        if self._update_status in ("downloading", "ready"):
+        if self._update_status in ("downloading", "staging", "ready"):
             self._set_update_status(self._update_status)
             return
         self.setIcon(icons.icon_done())
@@ -3354,7 +3378,7 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state in ("recording", "processing"):
             self._sync_tray_icon_with_engine()
             return
-        if self._update_status in ("downloading", "ready"):
+        if self._update_status in ("downloading", "staging", "ready"):
             self._set_update_status(self._update_status)
             return
         if self._key_warning:

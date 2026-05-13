@@ -2,11 +2,13 @@
 
 import json
 import os
+import shutil
 import sys
 import subprocess
 import tempfile
 import urllib.request
 import urllib.error
+import zipfile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -79,13 +81,8 @@ def _is_installed_version() -> bool:
 
 
 def _pick_asset(assets: list[dict], version: str) -> tuple[str, str, int] | None:
-    """Pick the matching asset based on install type."""
-    installed = _is_installed_version()
-    logger.debug(f"[DEBUG] _pick_asset | is_installed={installed}")
-    if installed:
-        preferred = [f"VoiceInput-{version}-setup.exe", f"VoiceInput-{version}-portable.zip"]
-    else:
-        preferred = [f"VoiceInput-{version}-portable.zip", f"VoiceInput-{version}-setup.exe"]
+    """Always prefer the portable zip for faster pre-extract updates."""
+    preferred = [f"VoiceInput-{version}-portable.zip"]
     for name in preferred:
         for a in assets:
             if a.get("name") == name:
@@ -213,8 +210,46 @@ class _DownloadWorker(QThread):
             self.failed.emit(str(e))
 
 
+_STAGING_DIR_NAME = "VoiceInput_update_staging"
+
+
+_STAGE_VERSION_FILE = ".update_version"
+
+
+class _StageWorker(QThread):
+    """Extract a downloaded zip to a staging directory."""
+    progress = pyqtSignal(int)   # percent 0-100
+    finished_ok = pyqtSignal(str)  # staging directory path
+    failed = pyqtSignal(str)
+
+    def __init__(self, zip_path: str, version: str):
+        super().__init__()
+        self._zip_path = zip_path
+        self._version = version
+
+    def run(self):
+        staging_dir = Path(tempfile.gettempdir()) / _STAGING_DIR_NAME
+        logger.debug(f"[DEBUG] _StageWorker.run | zip={self._zip_path}, staging={staging_dir}")
+        try:
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(self._zip_path, "r") as zf:
+                members = zf.namelist()
+                total = len(members)
+                for i, member in enumerate(members, 1):
+                    zf.extract(member, staging_dir)
+                    self.progress.emit(int(i * 100 / total))
+            (staging_dir / _STAGE_VERSION_FILE).write_text(self._version, encoding="utf-8")
+            logger.info(f"[Updater] Staged {total} files to {staging_dir} (v{self._version})")
+            self.finished_ok.emit(str(staging_dir))
+        except Exception as e:
+            logger.error(f"[Updater] Staging failed: {e}")
+            self.failed.emit(str(e))
+
+
 class UpdateChecker:
-    """Checks for updates, downloads, and installs silently."""
+    """Checks for updates, downloads, stages, and installs."""
 
     def __init__(self):
         self._timer = QTimer()
@@ -222,15 +257,21 @@ class UpdateChecker:
         self._timer.timeout.connect(self.check_now)
         self._check_worker: _CheckWorker | None = None
         self._dl_worker: _DownloadWorker | None = None
+        self._stage_worker: _StageWorker | None = None
         self._latest: UpdateInfo | None = None
         self._downloaded_path: str | None = None
         self._downloaded_expected_size: int = 0
+        self._staged_dir: str | None = None
+        # callbacks
         self._cb_available = None
         self._cb_no_update = None
         self._cb_check_failed = None
-        self._cb_progress = None
-        self._cb_done = None
+        self._cb_dl_progress = None
+        self._cb_dl_done = None
         self._cb_dl_failed = None
+        self._cb_stage_progress = None
+        self._cb_stage_done = None
+        self._cb_stage_failed = None
 
     @property
     def latest(self) -> UpdateInfo | None:
@@ -241,17 +282,25 @@ class UpdateChecker:
         return self._dl_worker is not None and self._dl_worker.isRunning()
 
     @property
+    def is_staging(self) -> bool:
+        return self._stage_worker is not None and self._stage_worker.isRunning()
+
+    @property
     def is_ready_to_install(self) -> bool:
-        return self._downloaded_path is not None and Path(self._downloaded_path).exists()
+        return self._staged_dir is not None and Path(self._staged_dir).exists()
 
     def start(self, *, on_available=None, on_no_update=None, on_check_failed=None,
-              on_progress=None, on_done=None, on_dl_failed=None):
+              on_dl_progress=None, on_dl_done=None, on_dl_failed=None,
+              on_stage_progress=None, on_stage_done=None, on_stage_failed=None):
         self._cb_available = on_available
         self._cb_no_update = on_no_update
         self._cb_check_failed = on_check_failed
-        self._cb_progress = on_progress
-        self._cb_done = on_done
+        self._cb_dl_progress = on_dl_progress
+        self._cb_dl_done = on_dl_done
         self._cb_dl_failed = on_dl_failed
+        self._cb_stage_progress = on_stage_progress
+        self._cb_stage_done = on_stage_done
+        self._cb_stage_failed = on_stage_failed
         self._timer.start()
         self.check_now()
 
@@ -265,127 +314,146 @@ class UpdateChecker:
         self._check_worker.finished.connect(self._cleanup_check)
         self._check_worker.start()
 
-    def download_and_install(self):
-        """Start downloading the update. After download, call install()."""
-        logger.debug(f"[DEBUG] UpdateChecker.download_and_install | latest={self._latest}, is_downloading={self.is_downloading}, is_ready={self.is_ready_to_install}")
+    def download_update(self):
+        """Start downloading the update zip."""
+        logger.debug(f"[DEBUG] UpdateChecker.download_update | latest={self._latest}, "
+                     f"downloading={self.is_downloading}, staging={self.is_staging}, ready={self.is_ready_to_install}")
         if not self._latest:
-            logger.debug("[DEBUG] UpdateChecker.download_and_install | no latest, returning")
             return
-        if self.is_downloading:
-            logger.debug("[DEBUG] UpdateChecker.download_and_install | already downloading, returning")
+        if self.is_downloading or self.is_staging:
             return
         if self.is_ready_to_install:
-            logger.debug("[DEBUG] UpdateChecker.download_and_install | already downloaded, calling install()")
-            self.install()
             return
-        logger.debug(f"[DEBUG] UpdateChecker.download_and_install | starting download: {self._latest.download_url}")
+        logger.debug(f"[DEBUG] UpdateChecker.download_update | starting download: {self._latest.download_url}")
         self._dl_worker = _DownloadWorker(self._latest.download_url, self._latest.filename)
         self._dl_worker.progress.connect(self._on_dl_progress)
-        self._dl_worker.finished_ok.connect(self._on_dl_done)  # (path, expected_size)
+        self._dl_worker.finished_ok.connect(self._on_dl_done)
         self._dl_worker.failed.connect(self._on_dl_failed)
         self._dl_worker.start()
 
     def install(self):
-        """Launch the installer/updater and quit the app."""
-        if not self._downloaded_path:
-            logger.debug("[DEBUG] UpdateChecker.install | no downloaded_path, returning")
+        """Copy staged files over the app directory and restart."""
+        if not self._staged_dir:
+            logger.debug("[DEBUG] UpdateChecker.install | no staged_dir, returning")
             return
-        path = self._downloaded_path
-        file_exists = Path(path).exists()
-        file_size = Path(path).stat().st_size if file_exists else 0
-        logger.info(f"[Updater] Installing: {path}")
-        logger.debug(f"[DEBUG] UpdateChecker.install | file_exists={file_exists}, file_size={file_size}, expected={self._downloaded_expected_size}")
-        if not file_exists or file_size == 0:
-            logger.error("[Updater] Install aborted: file missing or empty")
-            self._downloaded_path = None
+        staged = Path(self._staged_dir)
+        if not staged.exists():
+            logger.error("[Updater] Install aborted: staging directory missing")
+            self._staged_dir = None
             return
-        if self._downloaded_expected_size > 0 and file_size != self._downloaded_expected_size:
-            logger.error(f"[Updater] Install aborted: file size mismatch (on_disk={file_size}, expected={self._downloaded_expected_size})")
-            self._downloaded_path = None
-            try:
-                Path(path).unlink(missing_ok=True)
-            except OSError:
-                pass
-            return
-        if path.endswith("-setup.exe"):
-            cmd = [path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
-            logger.debug(f"[DEBUG] UpdateChecker.install | launching setup cmd={cmd}")
-            try:
-                proc = subprocess.Popen(cmd, creationflags=subprocess.DETACHED_PROCESS)
-                logger.debug(f"[DEBUG] UpdateChecker.install | setup Popen ok, pid={proc.pid}")
-            except Exception as e:
-                logger.error(f"[DEBUG] UpdateChecker.install | setup Popen FAILED: {type(e).__name__}: {e}")
-                return
-        elif path.endswith(".zip"):
-            logger.debug(f"[DEBUG] UpdateChecker.install | launching zip install: {path}")
-            try:
-                self._install_zip(path)
-            except Exception as e:
-                logger.error(f"[DEBUG] UpdateChecker.install | zip install FAILED: {type(e).__name__}: {e}")
-                return
-        else:
-            logger.debug(f"[DEBUG] UpdateChecker.install | unknown file type: {path}")
+        app_dir = Path(__file__).resolve().parent.parent.parent
+        exe_path = app_dir / "VoiceInput.exe"
+        # The zip contains a top-level "VoiceInput/" directory
+        inner = staged / "VoiceInput"
+        source = inner if inner.is_dir() else staged
+        logger.info(f"[Updater] Installing from staged: {source} → {app_dir}")
+        script = Path(tempfile.gettempdir()) / "voiceinput_update.ps1"
+        ps_content = (
+            f'Start-Sleep -Seconds 1\n'
+            f'robocopy "{source}" "{app_dir}" /E /IS /IT /NFL /NDL /NJH /NJS /R:3 /W:1\n'
+            f'Start-Process "{exe_path}"\n'
+            f'Remove-Item "{staged}" -Recurse -Force -ErrorAction SilentlyContinue\n'
+            f'Remove-Item $MyInvocation.MyCommand.Path -Force\n'
+        )
+        script.write_text(ps_content, encoding="utf-8")
+        logger.debug(f"[DEBUG] UpdateChecker.install | ps_content:\n{ps_content}")
+        cmd = ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+               "-File", str(script)]
+        try:
+            proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+            logger.debug(f"[DEBUG] UpdateChecker.install | swap script pid={proc.pid}")
+        except Exception as e:
+            logger.error(f"[Updater] Install script launch failed: {e}")
             return
         logger.debug("[DEBUG] UpdateChecker.install | calling QApplication.quit()")
         from PyQt6.QtWidgets import QApplication
         QApplication.quit()
 
-    def _install_zip(self, zip_path: str):
-        """Extract zip over current app directory via a hidden PowerShell script."""
-        app_dir = Path(__file__).resolve().parent.parent.parent
-        script = Path(tempfile.gettempdir()) / "voiceinput_update.ps1"
-        exe_path = app_dir / "VoiceInput.exe"
-        logger.debug(f"[DEBUG] _install_zip | app_dir={app_dir}, exe_path={exe_path}, exe_exists={exe_path.exists()}")
-        ps_content = (
-            f'Start-Sleep -Seconds 2\n'
-            f'Expand-Archive -Path "{zip_path}" -DestinationPath "{app_dir}" -Force\n'
-            f'Start-Process "{exe_path}"\n'
-            f'Remove-Item $MyInvocation.MyCommand.Path -Force\n'
-        )
-        script.write_text(ps_content, encoding="utf-8")
-        logger.debug(f"[DEBUG] _install_zip | script={script}, script_exists={script.exists()}")
-        logger.debug(f"[DEBUG] _install_zip | ps_content:\n{ps_content}")
-        cmd = ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
-               "-File", str(script)]
-        logger.debug(f"[DEBUG] _install_zip | launching cmd={cmd}")
-        proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
-        logger.debug(f"[DEBUG] _install_zip | Popen ok, pid={proc.pid}")
+    # ── internal callbacks ──
 
     def _on_check_result(self, result):
         logger.debug(f"[DEBUG] UpdateChecker._on_check_result | result type={type(result).__name__}, value={result!r}")
         if isinstance(result, UpdateInfo):
             self._latest = result
             self._downloaded_path = None
+            self._staged_dir = None
+            if self._try_reuse_staging(result.version):
+                return
             if self._cb_available:
-                logger.debug("[DEBUG] UpdateChecker._on_check_result | calling cb_available")
                 self._cb_available(result)
-            else:
-                logger.debug("[DEBUG] UpdateChecker._on_check_result | cb_available is None")
         elif result == _NO_UPDATE:
             if self._cb_no_update:
-                logger.debug("[DEBUG] UpdateChecker._on_check_result | calling cb_no_update")
                 self._cb_no_update()
         elif result == _CHECK_ERROR:
             if self._cb_check_failed:
-                logger.debug("[DEBUG] UpdateChecker._on_check_result | calling cb_check_failed")
                 self._cb_check_failed()
 
     def _on_dl_progress(self, percent: int):
-        if self._cb_progress:
-            self._cb_progress(percent)
+        if self._cb_dl_progress:
+            self._cb_dl_progress(percent)
 
     def _on_dl_done(self, path: str, expected_size: int):
         logger.debug(f"[DEBUG] UpdateChecker._on_dl_done | path={path}, expected_size={expected_size}")
         self._downloaded_path = path
         self._downloaded_expected_size = expected_size
-        if self._cb_done:
-            logger.debug("[DEBUG] UpdateChecker._on_dl_done | calling cb_done")
-            self._cb_done()
+        if self._cb_dl_done:
+            self._cb_dl_done()
+        self._start_staging(path)
 
     def _on_dl_failed(self, msg: str):
         logger.debug(f"[DEBUG] UpdateChecker._on_dl_failed | msg={msg}")
         if self._cb_dl_failed:
             self._cb_dl_failed(msg)
+
+    # ── staging ──
+
+    def _try_reuse_staging(self, version: str) -> bool:
+        """Return True if a previously staged directory for *version* exists."""
+        staging_dir = Path(tempfile.gettempdir()) / _STAGING_DIR_NAME
+        ver_file = staging_dir / _STAGE_VERSION_FILE
+        if not ver_file.is_file():
+            return False
+        try:
+            staged_ver = ver_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        if staged_ver != version:
+            logger.debug(f"[DEBUG] _try_reuse_staging | version mismatch: staged={staged_ver}, wanted={version}")
+            return False
+        logger.info(f"[Updater] Reusing existing staging directory for v{version}")
+        self._staged_dir = str(staging_dir)
+        if self._cb_stage_done:
+            self._cb_stage_done()
+        return True
+
+    def _start_staging(self, zip_path: str):
+        logger.debug(f"[DEBUG] UpdateChecker._start_staging | zip_path={zip_path}")
+        self._stage_worker = _StageWorker(zip_path, self._latest.version if self._latest else "")
+        self._stage_worker.progress.connect(self._on_stage_progress)
+        self._stage_worker.finished_ok.connect(self._on_stage_done)
+        self._stage_worker.failed.connect(self._on_stage_failed)
+        self._stage_worker.start()
+
+    def _on_stage_progress(self, percent: int):
+        if self._cb_stage_progress:
+            self._cb_stage_progress(percent)
+
+    def _on_stage_done(self, staged_dir: str):
+        logger.info(f"[Updater] Staging complete: {staged_dir}")
+        self._staged_dir = staged_dir
+        # Clean up the downloaded zip
+        if self._downloaded_path:
+            try:
+                Path(self._downloaded_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        if self._cb_stage_done:
+            self._cb_stage_done()
+
+    def _on_stage_failed(self, msg: str):
+        logger.error(f"[Updater] Staging failed: {msg}")
+        if self._cb_stage_failed:
+            self._cb_stage_failed(msg)
 
     def _cleanup_check(self):
         if self._check_worker:
