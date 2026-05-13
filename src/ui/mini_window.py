@@ -13,7 +13,7 @@ from PyQt6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF,
     pyqtProperty, pyqtSignal,
 )
-from PyQt6.QtGui import QPainter, QColor, QPainterPath, QPen, QFont
+from PyQt6.QtGui import QCursor, QPainter, QColor, QPainterPath, QPen, QFont
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QApplication, QFrame, QScrollArea,
@@ -849,6 +849,15 @@ class MiniRecordingWindow(QWidget):
 
     def _on_native_idle_enter(self):
         if self._mode in ("idle", "shrinking") and self._engine.state == "ready":
+            screen = QApplication.primaryScreen()
+            if not screen:
+                return
+            geo = screen.availableGeometry()
+            target = QRect(
+                self._get_x_for_width(HOVER_W), geo.y() + 4, HOVER_W, HOVER_H,
+            )
+            if not target.contains(QCursor.pos()):
+                return
             self._log_anim("native_idle_enter")
             self._hide_native_idle()
             self._apply_hover()
