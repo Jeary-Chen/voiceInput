@@ -30,6 +30,7 @@ REC_W, REC_H = 80, 36             # waveform only (with padding)
 REC_HOVER_W = 110                  # waveform + stop button on hover
 RESULT_W = 340                    # result popup width
 RADIUS = 19
+HOVER_COLLAPSE_DELAY_MS = 300
 
 _BTN_STYLE = """
     QPushButton {{
@@ -750,6 +751,24 @@ class MiniRecordingWindow(QWidget):
             return 1.0
         return float(screen.devicePixelRatio())
 
+    def _hover_region(self) -> QRect:
+        screen = QApplication.primaryScreen()
+        y = screen.availableGeometry().y() + 4 if screen else self.y()
+        return QRect(self._get_x_for_width(HOVER_W), y, HOVER_W, HOVER_H)
+
+    def _cursor_in_hover_region(self) -> bool:
+        return self._hover_region().contains(QCursor.pos())
+
+    def _sync_hover_tracking(self, source: str):
+        if self._mode != "hover":
+            return
+        self._hovered = self._cursor_in_hover_region()
+        self._log_anim("hover_track", source=source, in_region=self._hovered)
+        if self._hovered:
+            self._hover_timer.stop()
+        elif not self._hover_timer.isActive():
+            self._hover_timer.start(HOVER_COLLAPSE_DELAY_MS)
+
     def _show_idle_surface(self):
         if self._using_native_idle():
             pos = self._idle_top_left()
@@ -846,21 +865,16 @@ class MiniRecordingWindow(QWidget):
             self._reveal_progress = 1.0
             self._top_bar.setVisible(True)
             self.setWindowOpacity(1.0)
+            self._sync_hover_tracking("reveal_finished")
 
     def _on_native_idle_enter(self):
         if self._mode in ("idle", "shrinking") and self._engine.state == "ready":
-            screen = QApplication.primaryScreen()
-            if not screen:
-                return
-            geo = screen.availableGeometry()
-            target = QRect(
-                self._get_x_for_width(HOVER_W), geo.y() + 4, HOVER_W, HOVER_H,
-            )
-            if not target.contains(QCursor.pos()):
+            if not self._cursor_in_hover_region():
                 return
             self._log_anim("native_idle_enter")
             self._hide_native_idle()
             self._apply_hover()
+            self._sync_hover_tracking("native_idle_enter")
 
     def _get_x_for_width(self, w: int) -> int:
         screen = QApplication.primaryScreen()
@@ -966,6 +980,7 @@ class MiniRecordingWindow(QWidget):
             self._top_bar.setVisible(False)
             self.show()
             self._reveal_to(1.0, 160, "hover")
+            QTimer.singleShot(0, lambda: self._sync_hover_tracking("hover_show"))
         else:
             if was_returning and self._geom_anim.state() == QPropertyAnimation.State.Running:
                 current = self._geom_anim.currentValue()
@@ -983,6 +998,7 @@ class MiniRecordingWindow(QWidget):
                 self._reveal_progress = 1.0
                 self._animate_to(HOVER_W, HOVER_H, 220,
                                  QEasingCurve.Type.InOutQuart)
+            QTimer.singleShot(0, lambda: self._sync_hover_tracking("hover_apply"))
 
     def _apply_recording(self):
         self._log_anim("recording_start")
@@ -1118,22 +1134,24 @@ class MiniRecordingWindow(QWidget):
     # ── hover / drag ──
 
     def enterEvent(self, event):
-        self._hovered = True
-        self._hover_timer.stop()
         if self._mode in ("idle", "shrinking"):
             self._apply_hover()
         elif self._mode == "recording":
+            self._hovered = True
+            self._hover_timer.stop()
             self._btn_rec_stop.setVisible(True)
             self._animate_to(REC_HOVER_W, REC_H, 150)
             self._show_recording_status()
+        else:
+            self._sync_hover_tracking("enter")
         self.update()
 
     def leaveEvent(self, event):
-        self._hovered = False
         self._hide_recording_status()
         if self._mode == "hover":
-            self._hover_timer.start(300)
+            self._sync_hover_tracking("leave")
         elif self._mode == "recording":
+            self._hovered = False
             self._btn_rec_stop.setVisible(False)
             self._animate_to(REC_W, REC_H, 150)
             if self._engine._countdown_active \

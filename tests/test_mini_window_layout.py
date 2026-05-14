@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, pyqtSignal
 from PyQt6.QtCore import QRect
 from PyQt6.QtWidgets import QApplication
 
@@ -139,6 +139,51 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertEqual(window._target_size, (HOVER_W, HOVER_H))
         self.assertEqual(window.windowOpacity(), 1.0)
         self.assertEqual(window._reveal_anim.endValue(), 1.0)
+
+    def test_windows_native_idle_hover_schedules_collapse_if_cursor_left(self):
+        screen = _Screen(QRect(0, 0, 1200, 900))
+        inside_hover = QPoint(600, 10)
+        outside_hover = QPoint(20, 10)
+
+        with patch("ui.mini_window.sys.platform", "win32"):
+            with patch("ui.mini_window.QApplication.primaryScreen", return_value=screen):
+                with patch("ui.mini_window.QCursor.pos",
+                           side_effect=[inside_hover, outside_hover]):
+                    with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
+                        with patch("ui.mini_window.NativeIdlePillWindow") as native_cls:
+                            native = native_cls.return_value
+                            native.available = True
+
+                            window = MiniRecordingWindow(_Engine())
+                            self.addCleanup(window.close)
+                            window._on_native_idle_enter()
+
+        self.assertEqual(window._mode, "hover")
+        self.assertFalse(window._hovered)
+        self.assertTrue(window._hover_timer.isActive())
+        native.hide.assert_called()
+
+    def test_windows_native_idle_hover_tracks_cursor_inside_panel(self):
+        screen = _Screen(QRect(0, 0, 1200, 900))
+        inside_hover = QPoint(600, 10)
+
+        with patch("ui.mini_window.sys.platform", "win32"):
+            with patch("ui.mini_window.QApplication.primaryScreen", return_value=screen):
+                with patch("ui.mini_window.QCursor.pos",
+                           side_effect=[inside_hover, inside_hover]):
+                    with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
+                        with patch("ui.mini_window.NativeIdlePillWindow") as native_cls:
+                            native = native_cls.return_value
+                            native.available = True
+
+                            window = MiniRecordingWindow(_Engine())
+                            self.addCleanup(window.close)
+                            window._on_native_idle_enter()
+
+        self.assertEqual(window._mode, "hover")
+        self.assertTrue(window._hovered)
+        self.assertFalse(window._hover_timer.isActive())
+        native.hide.assert_called()
 
     def test_windows_native_idle_shrink_shapes_down_before_showing_idle_pill(self):
         with patch("ui.mini_window.sys.platform", "win32"):
