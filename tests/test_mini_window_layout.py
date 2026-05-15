@@ -346,6 +346,31 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertEqual((target.width(), target.height()), (REC_W, REC_H))
         native.hide.assert_called()
 
+    def test_windows_native_hover_primes_reveal_before_positioning(self):
+        with patch("ui.mini_window.sys.platform", "win32"):
+            with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
+                with patch("ui.mini_window.NativeIdlePillWindow") as native_cls:
+                    native = native_cls.return_value
+                    native.available = True
+                    window = MiniRecordingWindow(_Engine())
+                    self.addCleanup(window.close)
+
+        calls = []
+        original = window._apply_capsule_mask
+
+        def record_mask(source):
+            calls.append((source, window._reveal_progress))
+            original(source)
+
+        with patch.object(window, "_apply_capsule_mask", side_effect=record_mask):
+            window._apply_hover()
+
+        position_calls = [
+            progress for source, progress in calls
+            if source == f"position_at:{HOVER_W}x{HOVER_H}"
+        ]
+        self.assertEqual(position_calls, [0.0])
+
     def test_windows_qt_surface_disables_system_shadow(self):
         with patch("ui.mini_window.sys.platform", "win32"):
             with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
@@ -478,6 +503,18 @@ class MiniWindowLayoutTests(unittest.TestCase):
         mask_rect = window.mask().boundingRect()
         self.assertEqual(mask_rect, QRect(expected_x, 0, IDLE_W, IDLE_H))
         self.assertFalse(window.mask().contains(QPoint(0, HOVER_H - 1)))
+
+    def test_hover_geometry_animation_refreshes_capsule_mask_each_frame(self):
+        window = MiniRecordingWindow(_Engine())
+        self.addCleanup(window.close)
+        window._mode = "hover"
+        window.setFixedSize(IDLE_W, IDLE_H)
+        window._reveal_progress = 1.0
+
+        with patch.object(window, "_apply_capsule_mask") as apply_mask:
+            window._on_geometry_anim_value_changed(QRect(540, 4, HOVER_W, HOVER_H))
+
+        apply_mask.assert_called_once_with("geometry_anim")
 
     def test_idle_hover_drag_can_move_down_but_release_animates_to_top(self):
         screen = _Screen(QRect(0, 0, 1200, 900))

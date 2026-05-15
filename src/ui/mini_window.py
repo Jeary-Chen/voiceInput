@@ -1213,7 +1213,10 @@ class MiniRecordingWindow(QWidget):
                 self.show()
 
     def _on_geometry_anim_value_changed(self, value):
-        if self._mode != "hover" or not isinstance(value, QRect):
+        if not isinstance(value, QRect):
+            return
+        self._apply_capsule_mask("geometry_anim")
+        if self._mode != "hover":
             return
         cursor = QCursor.pos()
         self._hovered = value.contains(cursor)
@@ -1263,8 +1266,9 @@ class MiniRecordingWindow(QWidget):
         self._set_widgets_for_mode("hover")
         if self._using_native_idle() and not self.isVisible():
             self._target_size = (HOVER_W, HOVER_H)
+            self._reveal_progress = 0.0
             self._position_at(HOVER_W, HOVER_H)
-            self._reset_reveal_progress(0.0, "hover_native_start")
+            self._apply_capsule_mask("hover_native_start")
             self.setWindowOpacity(1.0)
             self._top_bar.setVisible(False)
             self.show()
