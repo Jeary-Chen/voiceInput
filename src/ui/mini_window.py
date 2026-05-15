@@ -518,25 +518,34 @@ class MiniRecordingWindow(QWidget):
     def _apply_capsule_mask(self, source: str):
         if self.width() <= 0 or self.height() <= 0:
             return
-        radius = min(RADIUS, self.height() // 2)
-        region = QRegion(0, 0, self.width(), self.height(),
+        progress = (
+            self._reveal_progress
+            if self._mode in ("hover", "shrinking")
+            else 1.0
+        )
+        mask_w = round(IDLE_W + (self.width() - IDLE_W) * progress)
+        mask_h = round(IDLE_H + (self.height() - IDLE_H) * progress)
+        mask_x = round((self.width() - mask_w) / 2)
+        radius = min(RADIUS, mask_h // 2)
+        region = QRegion(mask_x, 0, mask_w, mask_h,
                          QRegion.RegionType.Rectangle)
-        mask = QRegion(0, 0, self.width(), self.height(),
+        mask = QRegion(mask_x, 0, mask_w, mask_h,
                        QRegion.RegionType.Ellipse)
-        if self.height() < self.width():
-            center_w = max(0, self.width() - self.height())
-            region = QRegion(radius, 0, center_w, self.height(),
+        if mask_h < mask_w:
+            center_w = max(0, mask_w - mask_h)
+            region = QRegion(mask_x + radius, 0, center_w, mask_h,
                              QRegion.RegionType.Rectangle)
-            left = QRegion(0, 0, self.height(), self.height(),
+            left = QRegion(mask_x, 0, mask_h, mask_h,
                            QRegion.RegionType.Ellipse)
-            right = QRegion(self.width() - self.height(), 0,
-                            self.height(), self.height(),
+            right = QRegion(mask_x + mask_w - mask_h, 0,
+                            mask_h, mask_h,
                             QRegion.RegionType.Ellipse)
             mask = region.united(left).united(right)
         self.setMask(mask)
         logger.debug(
             f"[DEBUG] _apply_capsule_mask | source={source}, "
-            f"size=({self.width()}, {self.height()}), radius={radius}"
+            f"size=({self.width()}, {self.height()}), "
+            f"mask=({mask_x}, 0, {mask_w}, {mask_h}), radius={radius}"
         )
 
     def _install_screen_watchers(self):
@@ -890,6 +899,12 @@ class MiniRecordingWindow(QWidget):
 
     def _set_reveal_progress(self, value: float):
         self._reveal_progress = max(0.0, min(float(value), 1.0))
+        self._apply_capsule_mask("reveal")
+        self.update()
+
+    def _reset_reveal_progress(self, value: float, source: str):
+        self._reveal_progress = max(0.0, min(float(value), 1.0))
+        self._apply_capsule_mask(source)
         self.update()
 
     revealProgress = pyqtProperty(float, _get_reveal_progress, _set_reveal_progress)
@@ -1089,7 +1104,7 @@ class MiniRecordingWindow(QWidget):
         self._fade_target = None
         if self._mode == "idle" and self._engine.state == "ready":
             self._set_widgets_for_mode("idle")
-            self._reveal_progress = 1.0
+            self._reset_reveal_progress(1.0, "opacity_finished")
             self.setWindowOpacity(1.0)
             self._show_idle_surface()
 
@@ -1101,11 +1116,11 @@ class MiniRecordingWindow(QWidget):
             self._mode = "idle"
             self._native_returning_to_idle = False
             self._set_widgets_for_mode("idle")
-            self._reveal_progress = 1.0
+            self._reset_reveal_progress(1.0, "reveal_finished_idle")
             self.setWindowOpacity(1.0)
             self._show_idle_surface()
         elif target == "hover" and self._mode == "hover":
-            self._reveal_progress = 1.0
+            self._reset_reveal_progress(1.0, "reveal_finished_hover")
             self._top_bar.setVisible(True)
             self.setWindowOpacity(1.0)
             self._sync_hover_tracking("reveal_finished")
@@ -1249,7 +1264,7 @@ class MiniRecordingWindow(QWidget):
         if self._using_native_idle() and not self.isVisible():
             self._target_size = (HOVER_W, HOVER_H)
             self._position_at(HOVER_W, HOVER_H)
-            self._reveal_progress = 0.0
+            self._reset_reveal_progress(0.0, "hover_native_start")
             self.setWindowOpacity(1.0)
             self._top_bar.setVisible(False)
             self.show()
@@ -1269,7 +1284,7 @@ class MiniRecordingWindow(QWidget):
                 self._top_bar.setVisible(False)
                 self._reveal_to(1.0, 120, "hover")
             else:
-                self._reveal_progress = 1.0
+                self._reset_reveal_progress(1.0, "hover_full")
                 self._animate_to(HOVER_W, HOVER_H, 220,
                                  QEasingCurve.Type.InOutQuart)
             QTimer.singleShot(0, lambda: self._sync_hover_tracking("hover_apply"))
@@ -1284,7 +1299,7 @@ class MiniRecordingWindow(QWidget):
         self._opacity_anim.stop()
         self._reveal_anim.stop()
         self._hide_native_idle()
-        self._reveal_progress = 1.0
+        self._reset_reveal_progress(1.0, "recording_start")
         self.setWindowOpacity(1.0)
         self._mode = "recording"
         self._waveform.reset()
@@ -1308,10 +1323,12 @@ class MiniRecordingWindow(QWidget):
         self._cancel_deferred_shrink()
         self._stop_hover_polling("processing")
         self._mode = "processing"
+        self._hovered = False
+        self._hide_recording_status()
         self._waveform.freeze()
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_PROCESSING.name()};")
-        self._btn_action.setVisible(False)
-        self._dot_status.setVisible(True)
+        self._set_widgets_for_mode("processing")
+        self._animate_to(REC_W, REC_H, 150)
 
     def _apply_done(self):
         self._mode = "done"
@@ -1329,14 +1346,14 @@ class MiniRecordingWindow(QWidget):
             self._hide_recording_status()
             self._target_size = (IDLE_W, IDLE_H)
             if self.isVisible():
-                self._reveal_progress = 1.0
+                self._reset_reveal_progress(1.0, "shrink_start")
                 self.setWindowOpacity(1.0)
                 self._set_widgets_for_mode("idle")
                 self._animate_hover_to_top(160)
                 self._reveal_to(0.0, 180, "idle")
             else:
                 self._set_widgets_for_mode("idle")
-                self._reveal_progress = 1.0
+                self._reset_reveal_progress(1.0, "shrink_hidden")
                 self.setWindowOpacity(1.0)
                 self._show_idle_surface()
             return

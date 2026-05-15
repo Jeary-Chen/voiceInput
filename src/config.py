@@ -20,7 +20,7 @@ LATEST_ASR_MODEL = "qwen3-asr-flash-2026-02-10"
 class Config:
     hotkey: str = "lctrl+lshift+r"
     trigger_mode: str = "toggle"
-    mode: str = "transcribe"
+    mode: str = "polish"
     custom_prompts: list = field(default_factory=list)
     active_prompt_id: str = ""
     prompts_initialized: bool = False

@@ -420,6 +420,65 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertFalse(window._btn_rec_stop.isVisible())
         self.assertEqual(window._target_size, (REC_W, REC_H))
 
+    def test_processing_hides_recording_stop_button_after_hovered_stop(self):
+        screen = _Screen(QRect(0, 0, 1200, 900))
+        engine = _Engine()
+        engine.state = "recording"
+
+        with patch("ui.mini_window.QApplication.primaryScreen",
+                   return_value=screen):
+            window = MiniRecordingWindow(engine)
+        self.addCleanup(window.close)
+        window._mode = "recording"
+        window._hovered = True
+        window._btn_rec_stop.setVisible(True)
+        window.setFixedSize(REC_HOVER_W, REC_H)
+        window.move(545, 4)
+        window.show()
+
+        window._apply_processing()
+
+        target = window._geom_anim.endValue()
+        self.assertFalse(window._hovered)
+        self.assertFalse(window._btn_rec_stop.isVisible())
+        self.assertEqual((target.width(), target.height()), (REC_W, REC_H))
+        self.assertTrue(window._waveform.isVisible())
+        self.assertTrue(window._dot_status.isVisible())
+
+    def test_next_recording_after_hovered_stop_starts_collapsed(self):
+        engine = _Engine()
+        window = MiniRecordingWindow(engine)
+        self.addCleanup(window.close)
+        window._mode = "recording"
+        window._hovered = True
+        window._btn_rec_stop.setVisible(True)
+
+        window._apply_processing()
+        engine.state = "ready"
+        window._shrink_to_idle()
+        engine.state = "recording"
+
+        window._apply_recording()
+
+        self.assertFalse(window._hovered)
+        self.assertFalse(window._btn_rec_stop.isVisible())
+        self.assertFalse(window._status_popup.isVisible())
+        self.assertEqual(window._target_size, (REC_W, REC_H))
+
+    def test_revealing_hover_mask_matches_visible_capsule_width(self):
+        window = MiniRecordingWindow(_Engine())
+        self.addCleanup(window.close)
+        window._mode = "hover"
+        window.setFixedSize(HOVER_W, HOVER_H)
+        window._reveal_progress = 0.0
+
+        window._apply_capsule_mask("unit-test")
+
+        expected_x = (HOVER_W - IDLE_W) // 2
+        mask_rect = window.mask().boundingRect()
+        self.assertEqual(mask_rect, QRect(expected_x, 0, IDLE_W, IDLE_H))
+        self.assertFalse(window.mask().contains(QPoint(0, HOVER_H - 1)))
+
     def test_idle_hover_drag_can_move_down_but_release_animates_to_top(self):
         screen = _Screen(QRect(0, 0, 1200, 900))
 

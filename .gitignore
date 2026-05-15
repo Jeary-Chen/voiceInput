@@ -15,6 +15,7 @@ launcher.log
 *.key
 *.pem
 *.secret
+.cursor/
 
 # 内部文档、实验、参考代码
 _docs/
