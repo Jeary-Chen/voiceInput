@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+import ui.native_idle_pill as native_idle_pill  # noqa: E402
 from ui.native_idle_pill import NativeIdlePillWindow  # noqa: E402
 
 
@@ -25,6 +26,22 @@ class _Bits:
 
 
 class NativeIdlePillTests(unittest.TestCase):
+    def test_wnd_proc_forces_arrow_cursor_on_native_pill(self):
+        with patch("ui.native_idle_pill.sys.platform", "linux"):
+            pill = NativeIdlePillWindow(48, 8, lambda: None)
+        pill._hwnd = 100
+        native_idle_pill._WINDOWS[pill._hwnd] = pill
+        self.addCleanup(lambda: native_idle_pill._WINDOWS.pop(pill._hwnd, None))
+
+        with patch("ui.native_idle_pill._ARROW_CURSOR", 200):
+            with patch("ui.native_idle_pill._user32") as user32:
+                result = native_idle_pill._wnd_proc(
+                    pill._hwnd, native_idle_pill.WM_SETCURSOR, 0, 0,
+                )
+
+        self.assertEqual(result, 1)
+        user32.SetCursor.assert_called_once_with(200)
+
     def test_show_at_uses_scaled_size_and_position_for_win32_pixels(self):
         with patch("ui.native_idle_pill.sys.platform", "linux"):
             pill = NativeIdlePillWindow(48, 8, lambda: None)

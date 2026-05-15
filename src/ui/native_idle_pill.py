@@ -27,6 +27,9 @@ if sys.platform == "win32":
         wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
     ]
     _user32.DefWindowProcW.restype = wintypes.LPARAM
+    _user32.LoadCursorW.restype = _HCURSOR
+    _user32.SetCursor.argtypes = [_HCURSOR]
+    _user32.SetCursor.restype = _HCURSOR
 else:  # pragma: no cover - module is a no-op outside Windows.
     _user32 = None
     _gdi32 = None
@@ -50,6 +53,8 @@ AC_SRC_ALPHA = 1
 DIB_RGB_COLORS = 0
 BI_RGB = 0
 WM_MOUSEMOVE = 0x0200
+WM_SETCURSOR = 0x0020
+IDC_ARROW = 32512
 
 
 class _POINT(ctypes.Structure):
@@ -126,10 +131,14 @@ _WINDOWS: dict[int, "NativeIdlePillWindow"] = {}
 _CLASS_NAME = "VoiceInputNativeIdlePill"
 _WNDPROC_REF = None
 _CLASS_REGISTERED = False
+_ARROW_CURSOR = None
 
 
 def _wnd_proc(hwnd, msg, wparam, lparam):
     window = _WINDOWS.get(int(hwnd))
+    if window is not None and msg == WM_SETCURSOR:
+        window._apply_arrow_cursor()
+        return 1
     if window is not None and msg == WM_MOUSEMOVE:
         window._queue_enter()
         return 0
@@ -137,14 +146,16 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
 
 
 def _register_class() -> None:
-    global _WNDPROC_REF, _CLASS_REGISTERED
+    global _WNDPROC_REF, _CLASS_REGISTERED, _ARROW_CURSOR
     if _CLASS_REGISTERED:
         return
     _WNDPROC_REF = _WNDPROC(_wnd_proc)
     hinstance = _kernel32.GetModuleHandleW(None)
+    _ARROW_CURSOR = _user32.LoadCursorW(None, IDC_ARROW)
     wndclass = _WNDCLASS()
     wndclass.lpfnWndProc = _WNDPROC_REF
     wndclass.hInstance = hinstance
+    wndclass.hCursor = _ARROW_CURSOR
     wndclass.lpszClassName = _CLASS_NAME
     atom = _user32.RegisterClassW(ctypes.byref(wndclass))
     if not atom:
@@ -200,6 +211,10 @@ class NativeIdlePillWindow:
             self._hwnd = 0
 
     def _queue_enter(self) -> None:
+        logger.debug(
+            f"[DEBUG] NativeIdlePillWindow._queue_enter | "
+            f"visible={self._visible}, enter_queued={self._enter_queued}, hwnd={self._hwnd}"
+        )
         if self._enter_queued:
             return
         self._enter_queued = True
@@ -207,8 +222,16 @@ class NativeIdlePillWindow:
 
     def _emit_enter(self) -> None:
         self._enter_queued = False
+        logger.debug(
+            f"[DEBUG] NativeIdlePillWindow._emit_enter | "
+            f"visible={self._visible}, hwnd={self._hwnd}"
+        )
         if self._visible:
             self._on_enter()
+
+    def _apply_arrow_cursor(self) -> None:
+        if _ARROW_CURSOR:
+            _user32.SetCursor(_ARROW_CURSOR)
 
     def _render_image(self, width: int | None = None, height: int | None = None) -> QImage:
         width = self.width if width is None else width
@@ -228,12 +251,21 @@ class NativeIdlePillWindow:
 
     def show_at(self, x: int, y: int, *, scale: float = 1.0) -> None:
         if not self._hwnd:
+            logger.debug(
+                "[DEBUG] NativeIdlePillWindow.show_at | skipped: hwnd unavailable"
+            )
             return
         scale = max(float(scale), 1.0)
         pixel_x = round(x * scale)
         pixel_y = round(y * scale)
         pixel_width = round(self.width * scale)
         pixel_height = round(self.height * scale)
+        logger.debug(
+            f"[DEBUG] NativeIdlePillWindow.show_at | before | "
+            f"visible={self._visible}, hwnd={self._hwnd}, logical=({x}, {y}, "
+            f"{self.width}, {self.height}), scale={scale}, pixels=({pixel_x}, "
+            f"{pixel_y}, {pixel_width}, {pixel_height})"
+        )
         image = self._render_image(pixel_width, pixel_height)
         bits = image.bits()
         bits.setsize(image.sizeInBytes())
@@ -282,6 +314,11 @@ class NativeIdlePillWindow:
             )
             if not ok:
                 raise ctypes.WinError(ctypes.get_last_error())
+            logger.debug(
+                f"[DEBUG] NativeIdlePillWindow.show_at | UpdateLayeredWindow ok | "
+                f"hwnd={self._hwnd}, pixels=({pixel_x}, {pixel_y}, "
+                f"{pixel_width}, {pixel_height})"
+            )
             _user32.SetWindowPos(
                 self._hwnd,
                 HWND_TOPMOST,
@@ -293,6 +330,10 @@ class NativeIdlePillWindow:
             )
             _user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
             self._visible = True
+            logger.debug(
+                f"[DEBUG] NativeIdlePillWindow.show_at | after | "
+                f"visible={self._visible}, hwnd={self._hwnd}"
+            )
         except Exception as e:
             logger.debug(f"[NativeIdlePill] Failed to show native idle pill: {e}")
         finally:
@@ -306,9 +347,17 @@ class NativeIdlePillWindow:
                 _user32.ReleaseDC(None, screen_dc)
 
     def hide(self) -> None:
+        logger.debug(
+            f"[DEBUG] NativeIdlePillWindow.hide | before | "
+            f"visible={self._visible}, hwnd={self._hwnd}"
+        )
         if self._hwnd:
             _user32.ShowWindow(self._hwnd, SW_HIDE)
         self._visible = False
+        logger.debug(
+            f"[DEBUG] NativeIdlePillWindow.hide | after | "
+            f"visible={self._visible}, hwnd={self._hwnd}"
+        )
 
     def destroy(self) -> None:
         self.hide()

@@ -442,6 +442,7 @@ class MiniRecordingWindow(QWidget):
             )
             self._install_foreground_hook()
         QTimer.singleShot(0, lambda: self._apply_windows_surface_tweaks("init"))
+        QTimer.singleShot(450, self._prewarm_hover_surface)
 
     # ── Win32 topmost enforcement ──
 
@@ -990,23 +991,114 @@ class MiniRecordingWindow(QWidget):
         if self._using_native_idle():
             pos = self._idle_top_left()
             if pos is None:
+                logger.debug(
+                    "[DEBUG] _show_idle_surface | native branch skipped: no idle position"
+                )
                 return
-            self._log_anim("show_native_idle", pos=pos, scale=self._native_idle_scale())
+            scale = self._native_idle_scale()
+            native_visible_before = getattr(self._native_idle, "_visible", None)
+            self._log_anim(
+                "show_native_idle",
+                pos=pos,
+                scale=scale,
+                native_visible_before=native_visible_before,
+                qt_visible_before=self.isVisible(),
+            )
             self._anim_interrupting = True
             self._geom_anim.stop()
             self._anim_interrupting = False
             self._native_returning_to_idle = False
-            self.hide()
+            logger.debug(
+                f"[DEBUG] _show_idle_surface | before position_at | "
+                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
+                f"mask={self.mask().boundingRect().getRect()}"
+            )
             self._position_at(IDLE_W, IDLE_H)
-            self._native_idle.show_at(*pos, scale=self._native_idle_scale())
+            logger.debug(
+                f"[DEBUG] _show_idle_surface | before native show_at | "
+                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
+                f"mask={self.mask().boundingRect().getRect()}, pos={pos}, scale={scale}"
+            )
+            # Show native idle before hiding Qt so the handoff has no blank frame.
+            self._native_idle.show_at(*pos, scale=scale)
+            logger.debug(
+                f"[DEBUG] _show_idle_surface | after native show_at | "
+                f"qt_visible={self.isVisible()}, native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}"
+            )
+            self.hide()
+            logger.debug(
+                f"[DEBUG] _show_idle_surface | after qt hide | "
+                f"qt_visible={self.isVisible()}, native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}"
+            )
             return
         self._log_anim("show_qt_idle_fallback")
         self.show()
 
     def _hide_native_idle(self):
         if self._native_idle:
-            self._log_anim("hide_native_idle")
+            self._log_anim(
+                "hide_native_idle",
+                native_visible_before=getattr(self._native_idle, "_visible", None),
+            )
             self._native_idle.hide()
+            logger.debug(
+                f"[DEBUG] _hide_native_idle | after hide | native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}, "
+                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}"
+            )
+
+    def _prewarm_hover_surface(self):
+        if not self._using_native_idle():
+            return
+        if self._mode != "idle" or self._engine.state != "ready":
+            return
+        if self.isVisible():
+            return
+        pos = self._idle_top_left()
+        if pos is None:
+            return
+        scale = self._native_idle_scale()
+        logger.debug(
+            f"[DEBUG] _prewarm_hover_surface | start | native_visible="
+            f"{getattr(self._native_idle, '_visible', None)}, "
+            f"geom={self.geometry().getRect()}"
+        )
+        self._anim_interrupting = True
+        self._geom_anim.stop()
+        self._reveal_anim.stop()
+        self._opacity_anim.stop()
+        self._anim_interrupting = False
+
+        self._mode = "hover"
+        self._target_size = (HOVER_W, HOVER_H)
+        self._fade_target = None
+        self._shape_target = None
+        self._native_returning_to_idle = False
+        self._hovered = False
+        self._style_action_record()
+        self._update_polish_style()
+        self._update_show_result_style()
+        self._set_widgets_for_mode("hover")
+        self._reset_reveal_progress(0.0, "prewarm_hover")
+        self._position_at(HOVER_W, HOVER_H)
+        self.setWindowOpacity(0.0)
+        self.show()
+        self.hide()
+
+        self._mode = "idle"
+        self._target_size = (IDLE_W, IDLE_H)
+        self._set_widgets_for_mode("idle")
+        self._reset_reveal_progress(1.0, "prewarm_idle_restore")
+        self.setWindowOpacity(1.0)
+        self._position_at(IDLE_W, IDLE_H)
+        self._native_idle.show_at(*pos, scale=scale)
+        logger.debug(
+            f"[DEBUG] _prewarm_hover_surface | done | qt_visible={self.isVisible()}, "
+            f"native_visible={getattr(self._native_idle, '_visible', None)}, "
+            f"geom={self.geometry().getRect()}"
+        )
 
     def _apply_screen_relayout(self, source: str):
         logger.debug(
@@ -1113,25 +1205,84 @@ class MiniRecordingWindow(QWidget):
         self._log_anim("reveal_finished", target=target)
         self._shape_target = None
         if target == "idle" and self._mode == "shrinking":
+            logger.debug(
+                f"[DEBUG] _on_reveal_anim_finished | idle handoff start | "
+                f"mode={self._mode}, reveal={self._reveal_progress}, "
+                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
+                f"mask={self.mask().boundingRect().getRect()}, "
+                f"native_visible={getattr(self._native_idle, '_visible', None)}"
+            )
+            self._set_widgets_for_mode("idle")
+            self.setWindowOpacity(1.0)
+            # Keep the visible Qt surface clipped to the tiny pill until native takes over.
+            self._reset_reveal_progress(0.0, "reveal_finished_idle")
+            logger.debug(
+                f"[DEBUG] _on_reveal_anim_finished | idle handoff before surface | "
+                f"mode={self._mode}, reveal={self._reveal_progress}, "
+                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
+                f"mask={self.mask().boundingRect().getRect()}"
+            )
+            self._show_idle_surface()
             self._mode = "idle"
             self._native_returning_to_idle = False
-            self._set_widgets_for_mode("idle")
-            self._reset_reveal_progress(1.0, "reveal_finished_idle")
-            self.setWindowOpacity(1.0)
-            self._show_idle_surface()
+            self._reveal_progress = 1.0
+            logger.debug(
+                f"[DEBUG] _on_reveal_anim_finished | idle handoff done | "
+                f"mode={self._mode}, reveal={self._reveal_progress}, "
+                f"qt_visible={self.isVisible()}, native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}"
+            )
         elif target == "hover" and self._mode == "hover":
+            logger.debug(
+                f"[DEBUG] _on_reveal_anim_finished | hover handoff start | "
+                f"mode={self._mode}, reveal={self._reveal_progress}, "
+                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
+                f"mask={self.mask().boundingRect().getRect()}, "
+                f"native_visible={getattr(self._native_idle, '_visible', None)}"
+            )
             self._reset_reveal_progress(1.0, "reveal_finished_hover")
             self._top_bar.setVisible(True)
             self.setWindowOpacity(1.0)
             self._sync_hover_tracking("reveal_finished")
+            logger.debug(
+                f"[DEBUG] _on_reveal_anim_finished | hover handoff done | "
+                f"mode={self._mode}, reveal={self._reveal_progress}, "
+                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
+                f"mask={self.mask().boundingRect().getRect()}"
+            )
 
     def _on_native_idle_enter(self):
         if self._mode in ("idle", "shrinking") and self._engine.state == "ready":
-            if not self._cursor_in_hover_region():
+            cursor = QCursor.pos()
+            hover_region = self._hover_region()
+            logger.debug(
+                f"[DEBUG] _on_native_idle_enter | enter | mode={self._mode}, "
+                f"state={self._engine.state}, cursor=({cursor.x()}, {cursor.y()}), "
+                f"hover_region={hover_region.getRect()}, "
+                f"qt_visible={self.isVisible()}, native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}, "
+                f"shape_target={self._shape_target}, returning={self._native_returning_to_idle}"
+            )
+            if not hover_region.contains(cursor):
+                logger.debug(
+                    "[DEBUG] _on_native_idle_enter | ignored: cursor outside hover region"
+                )
                 return
             self._log_anim("native_idle_enter")
-            self._hide_native_idle()
+            logger.debug(
+                f"[DEBUG] _on_native_idle_enter | before apply_hover | "
+                f"qt_visible={self.isVisible()}, native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}, "
+                f"geom={self.geometry().getRect()}, mask={self.mask().boundingRect().getRect()}"
+            )
             self._apply_hover()
+            logger.debug(
+                f"[DEBUG] _on_native_idle_enter | after apply_hover | "
+                f"qt_visible={self.isVisible()}, native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}, "
+                f"geom={self.geometry().getRect()}, mask={self.mask().boundingRect().getRect()}, "
+                f"reveal={self._reveal_progress}, shape_target={self._shape_target}"
+            )
             self._sync_hover_tracking("native_idle_enter")
 
     def _get_x_for_width(self, w: int) -> int:
@@ -1251,7 +1402,16 @@ class MiniRecordingWindow(QWidget):
 
     def _apply_hover(self):
         was_returning = self._native_returning_to_idle or self._shape_target == "idle"
+        defer_native_hide = self._using_native_idle() and not self.isVisible()
         self._log_anim("hover_start", was_returning=was_returning)
+        logger.debug(
+            f"[DEBUG] _apply_hover | enter | was_returning={was_returning}, "
+            f"defer_native_hide={defer_native_hide}, "
+            f"qt_visible={self.isVisible()}, native_visible="
+            f"{getattr(self._native_idle, '_visible', None)}, "
+            f"geom={self.geometry().getRect()}, reveal={self._reveal_progress}, "
+            f"shape_target={self._shape_target}, returning={self._native_returning_to_idle}"
+        )
         self._start_hover_polling("apply_hover")
         self._mode = "hover"
         self._fade_target = None
@@ -1259,19 +1419,45 @@ class MiniRecordingWindow(QWidget):
         self._native_returning_to_idle = False
         self._opacity_anim.stop()
         self._reveal_anim.stop()
-        self._hide_native_idle()
+        if not defer_native_hide:
+            self._hide_native_idle()
         self._style_action_record()
         self._update_polish_style()
         self._update_show_result_style()
         self._set_widgets_for_mode("hover")
-        if self._using_native_idle() and not self.isVisible():
+        if defer_native_hide:
+            logger.debug(
+                f"[DEBUG] _apply_hover | native hidden-qt branch before position | "
+                f"native_visible={getattr(self._native_idle, '_visible', None)}, "
+                f"geom={self.geometry().getRect()}, reveal={self._reveal_progress}"
+            )
             self._target_size = (HOVER_W, HOVER_H)
             self._reveal_progress = 0.0
             self._position_at(HOVER_W, HOVER_H)
             self._apply_capsule_mask("hover_native_start")
             self.setWindowOpacity(1.0)
             self._top_bar.setVisible(False)
+            logger.debug(
+                f"[DEBUG] _apply_hover | native hidden-qt branch before qt show | "
+                f"qt_visible={self.isVisible()}, native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}, "
+                f"geom={self.geometry().getRect()}, mask={self.mask().boundingRect().getRect()}, "
+                f"reveal={self._reveal_progress}"
+            )
             self.show()
+            logger.debug(
+                f"[DEBUG] _apply_hover | native hidden-qt branch after qt show | "
+                f"qt_visible={self.isVisible()}, native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}, "
+                f"geom={self.geometry().getRect()}, mask={self.mask().boundingRect().getRect()}"
+            )
+            self._hide_native_idle()
+            logger.debug(
+                f"[DEBUG] _apply_hover | native hidden-qt branch after native hide | "
+                f"qt_visible={self.isVisible()}, native_visible="
+                f"{getattr(self._native_idle, '_visible', None)}, "
+                f"geom={self.geometry().getRect()}, mask={self.mask().boundingRect().getRect()}"
+            )
             self._reveal_to(1.0, 160, "hover")
             QTimer.singleShot(0, lambda: self._sync_hover_tracking("hover_show"))
         else:

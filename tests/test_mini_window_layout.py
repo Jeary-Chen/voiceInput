@@ -170,6 +170,68 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertEqual(window.windowOpacity(), 1.0)
         self.assertEqual(window._reveal_anim.endValue(), 1.0)
 
+    def test_windows_native_idle_hover_shows_qt_before_hiding_native(self):
+        screen = _Screen(QRect(0, 0, 1200, 900))
+        inside_hover = QPoint(600, 10)
+
+        with patch("ui.mini_window.sys.platform", "win32"):
+            with patch("ui.mini_window.QApplication.primaryScreen",
+                       return_value=screen):
+                with patch("ui.mini_window.QCursor.pos",
+                           return_value=inside_hover):
+                    with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
+                        with patch("ui.mini_window.NativeIdlePillWindow") as native_cls:
+                            native = native_cls.return_value
+                            native.available = True
+                            native._visible = True
+
+                            window = MiniRecordingWindow(_Engine())
+                            self.addCleanup(window.close)
+                            window.refresh_visibility()
+
+                            visible_during_native_hide = []
+                            native.hide.side_effect = (
+                                lambda: visible_during_native_hide.append(window.isVisible())
+                            )
+
+                            window._on_native_idle_enter()
+
+        self.assertEqual(visible_during_native_hide, [True])
+        self.assertTrue(window.isVisible())
+
+    def test_windows_native_idle_prewarms_hover_surface_then_restores_idle(self):
+        with patch("ui.mini_window.sys.platform", "win32"):
+            with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
+                with patch("ui.mini_window.NativeIdlePillWindow") as native_cls:
+                    native = native_cls.return_value
+                    native.available = True
+                    native._visible = True
+
+                    window = MiniRecordingWindow(_Engine())
+                    self.addCleanup(window.close)
+                    window.refresh_visibility()
+                    native.show_at.reset_mock()
+                    native.hide.reset_mock()
+
+                    shown_opacities = []
+                    original_show = window.show
+
+                    def record_show():
+                        shown_opacities.append(window.windowOpacity())
+                        original_show()
+
+                    with patch.object(window, "show", side_effect=record_show):
+                        window._prewarm_hover_surface()
+
+        self.assertEqual(shown_opacities, [0.0])
+        self.assertEqual(window._mode, "idle")
+        self.assertEqual(window._target_size, (IDLE_W, IDLE_H))
+        self.assertEqual(window.windowOpacity(), 1.0)
+        self.assertFalse(window.isVisible())
+        self.assertTrue(native._visible)
+        native.hide.assert_not_called()
+        native.show_at.assert_called_once()
+
     def test_windows_native_idle_hover_schedules_collapse_if_cursor_left(self):
         screen = _Screen(QRect(0, 0, 1200, 900))
         inside_hover = QPoint(600, 10)
@@ -301,6 +363,58 @@ class MiniWindowLayoutTests(unittest.TestCase):
 
         self.assertFalse(window._top_bar.isVisible())
         native.show_at.assert_called()
+
+    def test_windows_native_idle_surface_shows_native_before_hiding_qt(self):
+        with patch("ui.mini_window.sys.platform", "win32"):
+            with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
+                with patch("ui.mini_window.NativeIdlePillWindow") as native_cls:
+                    native = native_cls.return_value
+                    native.available = True
+
+                    window = MiniRecordingWindow(_Engine())
+                    self.addCleanup(window.close)
+                    window._mode = "shrinking"
+                    window.setFixedSize(HOVER_W, HOVER_H)
+                    window.show()
+
+                    visible_during_native_show = []
+                    native.show_at.side_effect = (
+                        lambda *_, **__: visible_during_native_show.append(window.isVisible())
+                    )
+
+                    window._show_idle_surface()
+
+        self.assertEqual(visible_during_native_show, [True])
+        self.assertFalse(window.isVisible())
+
+    def test_windows_native_idle_reveal_finish_keeps_idle_mask_before_handoff(self):
+        with patch("ui.mini_window.sys.platform", "win32"):
+            with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
+                with patch("ui.mini_window.NativeIdlePillWindow") as native_cls:
+                    native = native_cls.return_value
+                    native.available = True
+
+                    window = MiniRecordingWindow(_Engine())
+                    self.addCleanup(window.close)
+                    window._mode = "shrinking"
+                    window._shape_target = "idle"
+                    window._reveal_progress = 0.0
+                    window.setFixedSize(HOVER_W, HOVER_H)
+                    window.show()
+
+                    masks = []
+                    original = window._apply_capsule_mask
+
+                    def record_mask(source):
+                        original(source)
+                        if source == "reveal_finished_idle":
+                            masks.append(window.mask().boundingRect())
+
+                    with patch.object(window, "_apply_capsule_mask", side_effect=record_mask):
+                        window._on_reveal_anim_finished()
+
+        expected_x = (HOVER_W - IDLE_W) // 2
+        self.assertEqual(masks, [QRect(expected_x, 0, IDLE_W, IDLE_H)])
 
     def test_windows_native_idle_hover_interrupts_shrink_animation(self):
         with patch("ui.mini_window.sys.platform", "win32"):

@@ -58,6 +58,10 @@ class UpdateMetadataTests(unittest.TestCase):
 
         self.assertIn("[DEBUG] update_install.ps1", script)
         self.assertIn("sleep_before_copy elapsed_ms=", script)
+        self.assertIn("C:\\Program Files\\VoiceInput\\python", script)
+        self.assertIn("C:\\Program Files\\VoiceInput\\src", script)
+        self.assertIn("Remove-Item $ManagedPath", script)
+        self.assertIn("cleanup_managed_paths elapsed_ms=", script)
         self.assertIn("robocopy_copy exit_code=", script)
         self.assertIn("start_process elapsed_ms=", script)
         self.assertIn("cleanup_staging elapsed_ms=", script)
