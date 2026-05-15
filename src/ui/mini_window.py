@@ -527,19 +527,25 @@ class MiniRecordingWindow(QWidget):
         mask_w = round(IDLE_W + (self.width() - IDLE_W) * progress)
         mask_h = round(IDLE_H + (self.height() - IDLE_H) * progress)
         mask_x = round((self.width() - mask_w) / 2)
+        mask_y = 0
+        mask_pad = 1
+        region_x = mask_x - mask_pad
+        region_y = mask_y - mask_pad
+        region_w = mask_w + mask_pad * 2
+        region_h = mask_h + mask_pad * 2
         radius = min(RADIUS, mask_h // 2)
-        region = QRegion(mask_x, 0, mask_w, mask_h,
+        region = QRegion(region_x, region_y, region_w, region_h,
                          QRegion.RegionType.Rectangle)
-        mask = QRegion(mask_x, 0, mask_w, mask_h,
+        mask = QRegion(region_x, region_y, region_w, region_h,
                        QRegion.RegionType.Ellipse)
         if mask_h < mask_w:
-            center_w = max(0, mask_w - mask_h)
-            region = QRegion(mask_x + radius, 0, center_w, mask_h,
+            center_w = max(0, region_w - region_h)
+            region = QRegion(region_x + radius, region_y, center_w, region_h,
                              QRegion.RegionType.Rectangle)
-            left = QRegion(mask_x, 0, mask_h, mask_h,
+            left = QRegion(region_x, region_y, region_h, region_h,
                            QRegion.RegionType.Ellipse)
-            right = QRegion(mask_x + mask_w - mask_h, 0,
-                            mask_h, mask_h,
+            right = QRegion(region_x + region_w - region_h, region_y,
+                            region_h, region_h,
                             QRegion.RegionType.Ellipse)
             mask = region.united(left).united(right)
         self.setMask(mask)

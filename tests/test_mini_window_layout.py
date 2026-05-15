@@ -414,7 +414,7 @@ class MiniWindowLayoutTests(unittest.TestCase):
                         window._on_reveal_anim_finished()
 
         expected_x = (HOVER_W - IDLE_W) // 2
-        self.assertEqual(masks, [QRect(expected_x, 0, IDLE_W, IDLE_H)])
+        self.assertEqual(masks, [QRect(expected_x - 1, -1, IDLE_W + 2, IDLE_H + 2)])
 
     def test_windows_native_idle_hover_interrupts_shrink_animation(self):
         with patch("ui.mini_window.sys.platform", "win32"):
@@ -511,6 +511,18 @@ class MiniWindowLayoutTests(unittest.TestCase):
 
         center = QColor(image.pixelColor(HOVER_W // 2, HOVER_H // 2))
         self.assertEqual(center.alpha(), 255)
+
+    def test_capsule_mask_leaves_room_for_antialiasing_edge(self):
+        window = MiniRecordingWindow(_Engine())
+        self.addCleanup(window.close)
+        window._mode = "hover"
+        window._reveal_progress = 1.0
+        window.setFixedSize(HOVER_W, HOVER_H)
+
+        window._apply_capsule_mask("unit-test")
+
+        mask_bounds = window.mask().boundingRect()
+        self.assertEqual(mask_bounds, QRect(-1, -1, HOVER_W + 2, HOVER_H + 2))
 
     def test_native_idle_pill_paints_opaque_center(self):
         pill = NativeIdlePillWindow(IDLE_W, IDLE_H, lambda: None)
@@ -615,7 +627,7 @@ class MiniWindowLayoutTests(unittest.TestCase):
 
         expected_x = (HOVER_W - IDLE_W) // 2
         mask_rect = window.mask().boundingRect()
-        self.assertEqual(mask_rect, QRect(expected_x, 0, IDLE_W, IDLE_H))
+        self.assertEqual(mask_rect, QRect(expected_x - 1, -1, IDLE_W + 2, IDLE_H + 2))
         self.assertFalse(window.mask().contains(QPoint(0, HOVER_H - 1)))
 
     def test_hover_geometry_animation_refreshes_capsule_mask_each_frame(self):
