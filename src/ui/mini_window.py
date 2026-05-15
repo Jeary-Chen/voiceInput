@@ -1485,7 +1485,7 @@ class MiniRecordingWindow(QWidget):
             logger.debug(
                 f"[DEBUG] mouseReleaseEvent | saved anchor_x={self._anchor_x}"
             )
-            if self._engine.state == "ready":
+            if self._engine.state != "recording":
                 self._animate_to(
                     self.width(), self.height(), 160,
                     QEasingCurve.Type.InOutQuart,

@@ -468,6 +468,31 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertFalse(window._hovered)
         self.assertTrue(window._hover_timer.isActive())
 
+    def test_processing_drag_release_animates_to_top_before_ready(self):
+        screen = _Screen(QRect(0, 0, 1200, 900))
+        engine = _Engine()
+        engine.state = "processing"
+
+        with patch("ui.mini_window.QApplication.primaryScreen",
+                   return_value=screen):
+            window = MiniRecordingWindow(engine)
+        self.addCleanup(window.close)
+        window._mode = "processing"
+        window._target_size = (REC_W, REC_H)
+        window.setFixedSize(REC_W, REC_H)
+        window.move(560, 4)
+        window.show()
+
+        window.mousePressEvent(_MouseEvent(QPoint(600, 14)))
+        window.mouseMoveEvent(_MouseEvent(QPoint(640, 120)))
+        window.mouseReleaseEvent(_MouseEvent(QPoint(640, 120)))
+
+        target = window._geom_anim.endValue()
+        self.assertEqual(window.y(), 110)
+        self.assertEqual(target.y(), screen.availableGeometry().y() + 4)
+        self.assertEqual((target.width(), target.height()), (REC_W, REC_H))
+        self.assertEqual(window._anchor_x, 640)
+
 
 if __name__ == "__main__":
     unittest.main()
