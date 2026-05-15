@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from PyQt6.QtCore import QObject, QPoint, QPointF, pyqtSignal, Qt
 from PyQt6.QtCore import QRect
+from PyQt6.QtGui import QColor, QImage, QPainter
 from PyQt6.QtWidgets import QApplication
 
 
@@ -25,6 +26,7 @@ from ui.mini_window import (  # noqa: E402
     REC_W,
     _ResultPopup,
 )
+from ui.native_idle_pill import NativeIdlePillWindow  # noqa: E402
 
 
 class _Config:
@@ -355,6 +357,30 @@ class MiniWindowLayoutTests(unittest.TestCase):
             window.windowFlags() & Qt.WindowType.NoDropShadowWindowHint
         )
 
+    def test_capsule_paints_opaque_center(self):
+        window = MiniRecordingWindow(_Engine())
+        self.addCleanup(window.close)
+        window._mode = "hover"
+        window.setFixedSize(HOVER_W, HOVER_H)
+        window.show()
+
+        image = QImage(HOVER_W, HOVER_H, QImage.Format.Format_ARGB32)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        window.render(painter)
+        painter.end()
+
+        center = QColor(image.pixelColor(HOVER_W // 2, HOVER_H // 2))
+        self.assertEqual(center.alpha(), 255)
+
+    def test_native_idle_pill_paints_opaque_center(self):
+        pill = NativeIdlePillWindow(IDLE_W, IDLE_H, lambda: None)
+
+        image = pill._render_image(IDLE_W, IDLE_H)
+        center = QColor(image.pixelColor(IDLE_W // 2, IDLE_H // 2))
+
+        self.assertEqual(center.alpha(), 255)
+
     def test_screen_metrics_change_repositions_recording_capsule(self):
         first_screen = _Screen(QRect(0, 0, 1200, 900))
         second_screen = _Screen(QRect(0, 0, 800, 600))
@@ -394,7 +420,7 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertFalse(window._btn_rec_stop.isVisible())
         self.assertEqual(window._target_size, (REC_W, REC_H))
 
-    def test_idle_hover_drag_updates_anchor_without_moving_off_top(self):
+    def test_idle_hover_drag_can_move_down_but_release_animates_to_top(self):
         screen = _Screen(QRect(0, 0, 1200, 900))
 
         with patch("ui.mini_window.QApplication.primaryScreen",
@@ -409,10 +435,38 @@ class MiniWindowLayoutTests(unittest.TestCase):
 
         window.mousePressEvent(_MouseEvent(QPoint(600, 14)))
         window.mouseMoveEvent(_MouseEvent(QPoint(640, 120)))
+
+        self.assertEqual(window.y(), 110)
+
         window.mouseReleaseEvent(_MouseEvent(QPoint(640, 120)))
 
-        self.assertEqual(window.y(), screen.availableGeometry().y() + 4)
+        target = window._geom_anim.endValue()
+        self.assertEqual(window.y(), 110)
+        self.assertEqual(target.y(), screen.availableGeometry().y() + 4)
+        self.assertEqual((target.width(), target.height()), (HOVER_W, HOVER_H))
         self.assertEqual(window._anchor_x, 640)
+
+    def test_idle_hover_return_animation_starts_collapse_when_cursor_left(self):
+        screen = _Screen(QRect(0, 0, 1200, 900))
+
+        with patch("ui.mini_window.QApplication.primaryScreen",
+                   return_value=screen):
+            window = MiniRecordingWindow(_Engine())
+        self.addCleanup(window.close)
+        window._mode = "hover"
+        window._hovered = True
+        window._target_size = (HOVER_W, HOVER_H)
+        window.setFixedSize(HOVER_W, HOVER_H)
+        window.move(540, 110)
+        window.show()
+
+        with patch("ui.mini_window.QCursor.pos", return_value=QPoint(640, 120)):
+            window.mousePressEvent(_MouseEvent(QPoint(600, 120)))
+            window.mouseReleaseEvent(_MouseEvent(QPoint(600, 120)))
+            window._geom_anim.valueChanged.emit(QRect(580, 70, HOVER_W, HOVER_H))
+
+        self.assertFalse(window._hovered)
+        self.assertTrue(window._hover_timer.isActive())
 
 
 if __name__ == "__main__":

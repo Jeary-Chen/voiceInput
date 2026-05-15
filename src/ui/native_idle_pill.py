@@ -8,7 +8,7 @@ from ctypes import wintypes
 from typing import Callable
 
 from PyQt6.QtCore import QRectF, Qt, QTimer
-from PyQt6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import QColor, QImage, QPainter, QPainterPath
 
 from core.log import logger
 from ui.theme import Theme
@@ -221,10 +221,8 @@ class NativeIdlePillWindow:
         radius = height / 2
         path.addRoundedRect(QRectF(0, 0, width, height), radius, radius)
         bg = QColor(Theme.BG_PRIMARY)
-        bg.setAlpha(245)
+        bg.setAlpha(255)
         painter.fillPath(path, bg)
-        painter.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
-        painter.drawPath(path)
         painter.end()
         return image
 

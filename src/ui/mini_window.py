@@ -387,6 +387,7 @@ class MiniRecordingWindow(QWidget):
 
         self._geom_anim = QPropertyAnimation(self, b"geometry")
         self._geom_anim.finished.connect(self._on_anim_finished)
+        self._geom_anim.valueChanged.connect(self._on_geometry_anim_value_changed)
         self._opacity_anim = QPropertyAnimation(self, b"windowOpacity")
         self._opacity_anim.finished.connect(self._on_opacity_anim_finished)
         self._reveal_progress = 1.0
@@ -1196,6 +1197,22 @@ class MiniRecordingWindow(QWidget):
             else:
                 self.show()
 
+    def _on_geometry_anim_value_changed(self, value):
+        if self._mode != "hover" or not isinstance(value, QRect):
+            return
+        cursor = QCursor.pos()
+        self._hovered = value.contains(cursor)
+        if self._hovered:
+            self._hover_timer.stop()
+        elif not self._hover_timer.isActive():
+            self._hover_timer.start(HOVER_COLLAPSE_DELAY_MS)
+        self._log_anim(
+            "geometry_hover_track",
+            cursor=(cursor.x(), cursor.y()),
+            anim_geom=value.getRect(),
+            in_region=self._hovered,
+        )
+
     def _position_at(self, w, h):
         screen = QApplication.primaryScreen()
         if not screen:
@@ -1403,10 +1420,8 @@ class MiniRecordingWindow(QWidget):
         r = min(RADIUS, draw_h / 2)
         path.addRoundedRect(QRectF(x, 0, draw_w, draw_h), r, r)
         bg = QColor(Theme.BG_PRIMARY)
-        bg.setAlpha(245)
+        bg.setAlpha(255)
         p.fillPath(path, bg)
-        p.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
-        p.drawPath(path)
         p.end()
 
     # ── hover / drag ──
@@ -1454,15 +1469,6 @@ class MiniRecordingWindow(QWidget):
     def mouseMoveEvent(self, event):
         if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
             new_pos = event.globalPosition().toPoint() - self._drag_pos
-            if self._engine.state == "ready":
-                screen = QApplication.primaryScreen()
-                top_y = screen.availableGeometry().y() + 4 if screen else self.y()
-                if new_pos.y() != top_y:
-                    logger.debug(
-                        f"[DEBUG] mouseMoveEvent | clamp idle hover y "
-                        f"from {new_pos.y()} to {top_y}"
-                    )
-                new_pos.setY(top_y)
             self.move(new_pos)
             self._anchor_x = new_pos.x() + self.width() // 2
             self._reposition_popups()
@@ -1479,6 +1485,11 @@ class MiniRecordingWindow(QWidget):
             logger.debug(
                 f"[DEBUG] mouseReleaseEvent | saved anchor_x={self._anchor_x}"
             )
+            if self._engine.state == "ready":
+                self._animate_to(
+                    self.width(), self.height(), 160,
+                    QEasingCurve.Type.InOutQuart,
+                )
         self._drag_pos = None
 
     def reset_position(self):
