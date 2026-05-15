@@ -13,7 +13,9 @@ from PyQt6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF,
     pyqtProperty, pyqtSignal,
 )
-from PyQt6.QtGui import QCursor, QPainter, QColor, QPainterPath, QPen, QFont
+from PyQt6.QtGui import (
+    QCursor, QPainter, QColor, QPainterPath, QPen, QFont, QRegion,
+)
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QApplication, QFrame, QScrollArea,
@@ -31,6 +33,8 @@ REC_HOVER_W = 110                  # waveform + stop button on hover
 RESULT_W = 340                    # result popup width
 RADIUS = 19
 HOVER_COLLAPSE_DELAY_MS = 300
+HOVER_POLL_INTERVAL_MS = 120
+SCREEN_RELAYOUT_DELAY_MS = 120
 
 _BTN_STYLE = """
     QPushButton {{
@@ -182,6 +186,7 @@ class _ResultPopup(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
+            | Qt.WindowType.NoDropShadowWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
@@ -376,6 +381,7 @@ class MiniRecordingWindow(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
+            | Qt.WindowType.NoDropShadowWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
@@ -392,6 +398,7 @@ class MiniRecordingWindow(QWidget):
         self._shape_target: str | None = None
         self._target_size = (IDLE_W, IDLE_H)
         self._anim_interrupting = False
+        self._screen_connections: list[tuple[object, object]] = []
 
         self._result_popup = _ResultPopup()
         self._status_popup = _StatusPopup()
@@ -410,12 +417,21 @@ class MiniRecordingWindow(QWidget):
         self._deferred_shrink_timer = QTimer(self)
         self._deferred_shrink_timer.setSingleShot(True)
         self._deferred_shrink_timer.timeout.connect(self._shrink_to_idle)
+        self._hover_poll_timer = QTimer(self)
+        self._hover_poll_timer.setInterval(HOVER_POLL_INTERVAL_MS)
+        self._hover_poll_timer.timeout.connect(self._poll_hover_state)
+        self._screen_relayout_timer = QTimer(self)
+        self._screen_relayout_timer.setSingleShot(True)
+        self._screen_relayout_timer.timeout.connect(
+            lambda: self._apply_screen_relayout("debounced-screen-change")
+        )
         self._rec_status_timer: QTimer | None = None
 
         engine.state_changed.connect(self._on_engine_state)
         engine.audio_data.connect(self._on_audio)
         engine.transcription_done.connect(self._on_done)
         engine.countdown_tick.connect(self._on_countdown_tick)
+        self._install_screen_watchers()
 
         self._winevent_hook = None
         self._winevent_cb_ref = None
@@ -424,10 +440,17 @@ class MiniRecordingWindow(QWidget):
                 IDLE_W, IDLE_H, self._on_native_idle_enter,
             )
             self._install_foreground_hook()
+        QTimer.singleShot(0, lambda: self._apply_windows_surface_tweaks("init"))
 
     # ── Win32 topmost enforcement ──
 
     _SWP_FLAGS = 0x0002 | 0x0001 | 0x0010  # NOMOVE | NOSIZE | NOACTIVATE
+    _DWMWA_NCRENDERING_POLICY = 2
+    _DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    _DWMWA_BORDER_COLOR = 34
+    _DWMNCRP_DISABLED = 1
+    _DWMWCP_DONOTROUND = 1
+    _DWMWA_COLOR_NONE = 0xFFFFFFFE
 
     def _install_foreground_hook(self):
         from ctypes import wintypes
@@ -450,13 +473,141 @@ class MiniRecordingWindow(QWidget):
                 my_hwnd, -1, 0, 0, 0, 0, self._SWP_FLAGS,
             )
 
+    def _apply_windows_surface_tweaks(self, source: str):
+        if sys.platform != "win32":
+            return
+        hwnd = int(self.winId())
+        logger.debug(
+            f"[DEBUG] _apply_windows_surface_tweaks | source={source}, "
+            f"hwnd={hwnd}, flags={int(self.windowFlags())}"
+        )
+        try:
+            dwmapi = ctypes.windll.dwmapi
+        except Exception as e:
+            logger.debug(
+                f"[DEBUG] _apply_windows_surface_tweaks | "
+                f"DWM unavailable, error={e!r}"
+            )
+            return
+
+        attrs = [
+            (self._DWMWA_NCRENDERING_POLICY, self._DWMNCRP_DISABLED),
+            (self._DWMWA_WINDOW_CORNER_PREFERENCE, self._DWMWCP_DONOTROUND),
+            (self._DWMWA_BORDER_COLOR, self._DWMWA_COLOR_NONE),
+        ]
+        for attr, value in attrs:
+            c_value = ctypes.c_int(value)
+            try:
+                result = dwmapi.DwmSetWindowAttribute(
+                    ctypes.c_void_p(hwnd),
+                    ctypes.c_uint(attr),
+                    ctypes.byref(c_value),
+                    ctypes.sizeof(c_value),
+                )
+                logger.debug(
+                    f"[DEBUG] _apply_windows_surface_tweaks | "
+                    f"attr={attr}, value={value}, result={result}"
+                )
+            except Exception as e:
+                logger.debug(
+                    f"[DEBUG] _apply_windows_surface_tweaks | "
+                    f"attr={attr}, value={value}, error={e!r}"
+                )
+
+    def _apply_capsule_mask(self, source: str):
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        radius = min(RADIUS, self.height() // 2)
+        region = QRegion(0, 0, self.width(), self.height(),
+                         QRegion.RegionType.Rectangle)
+        mask = QRegion(0, 0, self.width(), self.height(),
+                       QRegion.RegionType.Ellipse)
+        if self.height() < self.width():
+            center_w = max(0, self.width() - self.height())
+            region = QRegion(radius, 0, center_w, self.height(),
+                             QRegion.RegionType.Rectangle)
+            left = QRegion(0, 0, self.height(), self.height(),
+                           QRegion.RegionType.Ellipse)
+            right = QRegion(self.width() - self.height(), 0,
+                            self.height(), self.height(),
+                            QRegion.RegionType.Ellipse)
+            mask = region.united(left).united(right)
+        self.setMask(mask)
+        logger.debug(
+            f"[DEBUG] _apply_capsule_mask | source={source}, "
+            f"size=({self.width()}, {self.height()}), radius={radius}"
+        )
+
+    def _install_screen_watchers(self):
+        app = QApplication.instance()
+        if app is None:
+            return
+        logger.debug("[DEBUG] _install_screen_watchers | installing")
+        app.primaryScreenChanged.connect(
+            lambda *_: self._schedule_screen_relayout("primaryScreenChanged")
+        )
+        app.screenAdded.connect(
+            lambda *_: self._refresh_screen_watchers("screenAdded")
+        )
+        app.screenRemoved.connect(
+            lambda *_: self._refresh_screen_watchers("screenRemoved")
+        )
+        self._refresh_screen_watchers("init")
+
+    def _refresh_screen_watchers(self, source: str):
+        app = QApplication.instance()
+        if app is None:
+            return
+        for signal, callback in self._screen_connections:
+            try:
+                signal.disconnect(callback)
+            except (TypeError, RuntimeError):
+                pass
+        self._screen_connections.clear()
+        screens = app.screens()
+        logger.debug(
+            f"[DEBUG] _refresh_screen_watchers | source={source}, "
+            f"screen_count={len(screens)}"
+        )
+        for screen in screens:
+            for signal_name in (
+                "geometryChanged",
+                "availableGeometryChanged",
+                "logicalDotsPerInchChanged",
+            ):
+                signal = getattr(screen, signal_name, None)
+                if signal is None:
+                    continue
+                callback = (
+                    lambda *_, s=source, n=signal_name:
+                    self._schedule_screen_relayout(f"{s}:{n}")
+                )
+                signal.connect(callback)
+                self._screen_connections.append((signal, callback))
+        self._schedule_screen_relayout(source)
+
+    def _schedule_screen_relayout(self, source: str):
+        logger.debug(
+            f"[DEBUG] _schedule_screen_relayout | source={source}, "
+            f"mode={self._mode}, visible={self.isVisible()}"
+        )
+        self._screen_relayout_timer.start(SCREEN_RELAYOUT_DELAY_MS)
+
     def closeEvent(self, event):
+        self._hover_poll_timer.stop()
+        self._screen_relayout_timer.stop()
         if self._native_idle:
             self._native_idle.destroy()
             self._native_idle = None
         if self._winevent_hook:
             ctypes.windll.user32.UnhookWinEvent(self._winevent_hook)
             self._winevent_hook = None
+        for signal, callback in self._screen_connections:
+            try:
+                signal.disconnect(callback)
+            except (TypeError, RuntimeError):
+                pass
+        self._screen_connections.clear()
         super().closeEvent(event)
 
     # ── UI build ──
@@ -724,7 +875,14 @@ class MiniRecordingWindow(QWidget):
             "native": self._using_native_idle(),
         }
         details.update(extra)
-        logger.debug(f"[MiniWinAnim] {event} | {details}")
+        logger.debug(f"[DEBUG] _log_anim | event={event}, details={details}")
+
+    def _current_screen_geometry(self) -> tuple[int, int, int, int] | None:
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return None
+        geo = screen.availableGeometry()
+        return geo.x(), geo.y(), geo.width(), geo.height()
 
     def _get_reveal_progress(self) -> float:
         return self._reveal_progress
@@ -769,6 +927,49 @@ class MiniRecordingWindow(QWidget):
         elif not self._hover_timer.isActive():
             self._hover_timer.start(HOVER_COLLAPSE_DELAY_MS)
 
+    def _start_hover_polling(self, source: str):
+        if not self._hover_poll_timer.isActive():
+            logger.debug(
+                f"[DEBUG] _start_hover_polling | source={source}, "
+                f"mode={self._mode}, geom={self.geometry().getRect()}"
+            )
+            self._hover_poll_timer.start()
+
+    def _stop_hover_polling(self, source: str):
+        if self._hover_poll_timer.isActive():
+            logger.debug(
+                f"[DEBUG] _stop_hover_polling | source={source}, "
+                f"mode={self._mode}"
+            )
+            self._hover_poll_timer.stop()
+
+    def _poll_hover_state(self):
+        cursor = QCursor.pos()
+        geom = self.geometry()
+        inside = geom.contains(cursor)
+        logger.debug(
+            f"[DEBUG] _poll_hover_state | mode={self._mode}, "
+            f"hovered={self._hovered}, cursor=({cursor.x()}, {cursor.y()}), "
+            f"geom={geom.getRect()}, inside={inside}"
+        )
+        if self._mode == "hover":
+            previous = self._hovered
+            self._hovered = inside or self._cursor_in_hover_region()
+            if previous and not self._hovered and not self._hover_timer.isActive():
+                self._hover_timer.start(HOVER_COLLAPSE_DELAY_MS)
+            if self._hovered:
+                self._hover_timer.stop()
+            return
+        if self._mode == "recording":
+            if self._hovered and not inside:
+                logger.debug(
+                    "[DEBUG] _poll_hover_state | recording hover lost, "
+                    "collapsing capsule"
+                )
+                self._collapse_recording_hover("hover-poll")
+            return
+        self._stop_hover_polling("mode-not-hoverable")
+
     def _show_idle_surface(self):
         if self._using_native_idle():
             pos = self._idle_top_left()
@@ -790,6 +991,44 @@ class MiniRecordingWindow(QWidget):
         if self._native_idle:
             self._log_anim("hide_native_idle")
             self._native_idle.hide()
+
+    def _apply_screen_relayout(self, source: str):
+        logger.debug(
+            f"[DEBUG] _apply_screen_relayout | source={source}, "
+            f"mode={self._mode}, engine={self._engine.state}, "
+            f"screen={self._current_screen_geometry()}, "
+            f"geom={self.geometry().getRect()}, target={self._target_size}, "
+            f"anchor_x={self._anchor_x}"
+        )
+        screen = QApplication.primaryScreen()
+        if not screen:
+            logger.debug(
+                f"[DEBUG] _apply_screen_relayout | source={source}, no screen"
+            )
+            return
+        self._anim_interrupting = True
+        self._geom_anim.stop()
+        self._anim_interrupting = False
+        if self._mode == "idle" and self._engine.state == "ready":
+            if self._engine.config.hide_mini_window_when_idle:
+                self._hide_native_idle()
+                self.hide()
+            else:
+                self._show_idle_surface()
+            return
+        if self._mode in ("hover", "recording", "processing", "done"):
+            w, h = self._target_size
+            if self._mode == "recording":
+                w = REC_HOVER_W if self._hovered else REC_W
+                h = REC_H
+            self._position_at(w, h)
+            self._reposition_popups()
+            self._apply_capsule_mask(source)
+            if sys.platform == "win32":
+                self._apply_windows_surface_tweaks(source)
+            return
+        if self._mode == "shrinking":
+            self._animate_hover_to_top(120)
 
     def _fade_to(self, opacity: float, duration: int, target: str | None = None):
         self._fade_target = target
@@ -835,6 +1074,9 @@ class MiniRecordingWindow(QWidget):
         self._geom_anim.setStartValue(start)
         self._geom_anim.setEndValue(target)
         self._geom_anim.start()
+        self._apply_capsule_mask(f"return_to_top:{target_w}x{target_h}")
+        if sys.platform == "win32":
+            self._apply_windows_surface_tweaks("return_to_top")
         self._log_anim("return_to_top_start", target_geom=(
             target.x(), target.y(), target.width(), target.height(),
         ), duration=duration)
@@ -919,12 +1161,20 @@ class MiniRecordingWindow(QWidget):
         x = self._get_x_for_width(w)
         y = geo.y() + 4
         target = QRect(x, y, w, h)
+        logger.debug(
+            f"[DEBUG] _animate_to | mode={self._mode}, "
+            f"start={start.getRect()}, target={target.getRect()}, "
+            f"screen={self._current_screen_geometry()}, duration={duration}"
+        )
 
         self._geom_anim.setEasingCurve(easing)
         self._geom_anim.setDuration(duration)
         self._geom_anim.setStartValue(start)
         self._geom_anim.setEndValue(target)
         self._geom_anim.start()
+        self._apply_capsule_mask(f"animate_to:{w}x{h}")
+        if sys.platform == "win32":
+            self._apply_windows_surface_tweaks("animate_to")
 
     def _on_anim_finished(self):
         if self._anim_interrupting:
@@ -955,12 +1205,19 @@ class MiniRecordingWindow(QWidget):
         y = geo.y() + 4
         self.setFixedSize(w, h)
         self.move(x, y)
+        self._apply_capsule_mask(f"position_at:{w}x{h}")
+        logger.debug(
+            f"[DEBUG] _position_at | mode={self._mode}, "
+            f"size=({w}, {h}), pos=({x}, {y}), "
+            f"screen={self._current_screen_geometry()}, anchor_x={self._anchor_x}"
+        )
 
     # ── state transitions ──
 
     def _apply_hover(self):
         was_returning = self._native_returning_to_idle or self._shape_target == "idle"
         self._log_anim("hover_start", was_returning=was_returning)
+        self._start_hover_polling("apply_hover")
         self._mode = "hover"
         self._fade_target = None
         self._shape_target = None
@@ -1003,6 +1260,7 @@ class MiniRecordingWindow(QWidget):
     def _apply_recording(self):
         self._log_anim("recording_start")
         self._cancel_deferred_shrink()
+        self._start_hover_polling("apply_recording")
         self._fade_target = None
         self._shape_target = None
         self._native_returning_to_idle = False
@@ -1031,6 +1289,7 @@ class MiniRecordingWindow(QWidget):
 
     def _apply_processing(self):
         self._cancel_deferred_shrink()
+        self._stop_hover_polling("processing")
         self._mode = "processing"
         self._waveform.freeze()
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_PROCESSING.name()};")
@@ -1046,6 +1305,7 @@ class MiniRecordingWindow(QWidget):
             return
         if self._mode in ("idle", "shrinking"):
             return
+        self._stop_hover_polling("shrink_to_idle")
         if self._using_native_idle():
             self._log_anim("shrink_start")
             self._mode = "shrinking"
@@ -1106,12 +1366,30 @@ class MiniRecordingWindow(QWidget):
         if not self._hovered and self._mode == "hover":
             self._shrink_to_idle()
 
+    def _collapse_recording_hover(self, source: str):
+        if self._mode != "recording":
+            return
+        self._hovered = False
+        self._hide_recording_status()
+        self._btn_rec_stop.setVisible(False)
+        self._animate_to(REC_W, REC_H, 150)
+        logger.debug(
+            f"[DEBUG] _collapse_recording_hover | source={source}, "
+            f"countdown_active={self._engine._countdown_active}, "
+            f"show_countdown={self._engine.config.show_countdown}"
+        )
+        if self._engine._countdown_active and self._engine.config.show_countdown:
+            self._countdown_popup.show_countdown(
+                self._engine._countdown_secs, self
+            )
+
     # ── painting ──
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._dot_status.move(self.width() - 13, 3)
         self._dot_status.raise_()
+        self._apply_capsule_mask("resize")
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -1134,11 +1412,17 @@ class MiniRecordingWindow(QWidget):
     # ── hover / drag ──
 
     def enterEvent(self, event):
+        logger.debug(
+            f"[DEBUG] enterEvent | mode={self._mode}, "
+            f"cursor={QCursor.pos().x(), QCursor.pos().y()}, "
+            f"geom={self.geometry().getRect()}"
+        )
         if self._mode in ("idle", "shrinking"):
             self._apply_hover()
         elif self._mode == "recording":
             self._hovered = True
             self._hover_timer.stop()
+            self._start_hover_polling("recording-enter")
             self._btn_rec_stop.setVisible(True)
             self._animate_to(REC_HOVER_W, REC_H, 150)
             self._show_recording_status()
@@ -1147,17 +1431,17 @@ class MiniRecordingWindow(QWidget):
         self.update()
 
     def leaveEvent(self, event):
-        self._hide_recording_status()
+        logger.debug(
+            f"[DEBUG] leaveEvent | mode={self._mode}, "
+            f"cursor={QCursor.pos().x(), QCursor.pos().y()}, "
+            f"geom={self.geometry().getRect()}"
+        )
         if self._mode == "hover":
             self._sync_hover_tracking("leave")
         elif self._mode == "recording":
-            self._hovered = False
-            self._btn_rec_stop.setVisible(False)
-            self._animate_to(REC_W, REC_H, 150)
-            if self._engine._countdown_active \
-                    and self._engine.config.show_countdown:
-                self._countdown_popup.show_countdown(
-                    self._engine._countdown_secs, self)
+            self._collapse_recording_hover("leaveEvent")
+        else:
+            self._hide_recording_status()
         self.update()
 
     def mousePressEvent(self, event):
@@ -1170,14 +1454,31 @@ class MiniRecordingWindow(QWidget):
     def mouseMoveEvent(self, event):
         if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
             new_pos = event.globalPosition().toPoint() - self._drag_pos
+            if self._engine.state == "ready":
+                screen = QApplication.primaryScreen()
+                top_y = screen.availableGeometry().y() + 4 if screen else self.y()
+                if new_pos.y() != top_y:
+                    logger.debug(
+                        f"[DEBUG] mouseMoveEvent | clamp idle hover y "
+                        f"from {new_pos.y()} to {top_y}"
+                    )
+                new_pos.setY(top_y)
             self.move(new_pos)
             self._anchor_x = new_pos.x() + self.width() // 2
             self._reposition_popups()
+            logger.debug(
+                f"[DEBUG] mouseMoveEvent | drag_pos=({new_pos.x()}, "
+                f"{new_pos.y()}), anchor_x={self._anchor_x}, "
+                f"size=({self.width()}, {self.height()})"
+            )
 
     def mouseReleaseEvent(self, event):
         if self._drag_pos is not None and self._anchor_x is not None:
             self._engine.config.mini_window_x = self._anchor_x
             self._engine.config.save()
+            logger.debug(
+                f"[DEBUG] mouseReleaseEvent | saved anchor_x={self._anchor_x}"
+            )
         self._drag_pos = None
 
     def reset_position(self):
@@ -1186,6 +1487,7 @@ class MiniRecordingWindow(QWidget):
         self._engine.config.save()
         w, h = self._target_size
         self._position_at(w, h)
+        logger.debug("[DEBUG] reset_position | anchor cleared")
 
     def contextMenuEvent(self, event):
         event.accept()

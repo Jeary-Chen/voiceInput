@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PyQt6.QtCore import QObject, QPoint, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, QPointF, pyqtSignal, Qt
 from PyQt6.QtCore import QRect
 from PyQt6.QtWidgets import QApplication
 
@@ -21,6 +21,7 @@ from ui.mini_window import (  # noqa: E402
     IDLE_W,
     MiniRecordingWindow,
     REC_H,
+    REC_HOVER_W,
     REC_W,
     _ResultPopup,
 )
@@ -31,7 +32,10 @@ class _Config:
     mini_window_x = None
     hide_mini_window_when_idle = False
     show_countdown = True
+    mini_bar_show_timer = True
     mode = "transcribe"
+    active_prompt_id = ""
+    custom_prompts = []
 
     def save(self):
         pass
@@ -49,6 +53,15 @@ class _Engine(QObject):
         self.state = "ready"
         self._countdown_active = False
         self._countdown_secs = 0
+        self.recorder = type("Recorder", (), {"device_name": ""})()
+        self.polisher = type("Polisher", (), {"_model": "test-model"})()
+
+    def get_duration(self):
+        return 0
+
+    @property
+    def effective_max_duration(self):
+        return 600
 
 
 class _Screen:
@@ -57,6 +70,21 @@ class _Screen:
 
     def availableGeometry(self):
         return self._rect
+
+
+class _MouseEvent:
+    def __init__(self, global_pos: QPoint, buttons=Qt.MouseButton.LeftButton):
+        self._global_pos = global_pos
+        self._buttons = buttons
+
+    def button(self):
+        return Qt.MouseButton.LeftButton
+
+    def buttons(self):
+        return self._buttons
+
+    def globalPosition(self):
+        return QPointF(self._global_pos)
 
 
 class MiniWindowLayoutTests(unittest.TestCase):
@@ -315,6 +343,76 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertEqual((start.width(), start.height()), (IDLE_W, IDLE_H))
         self.assertEqual((target.width(), target.height()), (REC_W, REC_H))
         native.hide.assert_called()
+
+    def test_windows_qt_surface_disables_system_shadow(self):
+        with patch("ui.mini_window.sys.platform", "win32"):
+            with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
+                with patch("ui.mini_window.NativeIdlePillWindow"):
+                    window = MiniRecordingWindow(_Engine())
+                    self.addCleanup(window.close)
+
+        self.assertTrue(
+            window.windowFlags() & Qt.WindowType.NoDropShadowWindowHint
+        )
+
+    def test_screen_metrics_change_repositions_recording_capsule(self):
+        first_screen = _Screen(QRect(0, 0, 1200, 900))
+        second_screen = _Screen(QRect(0, 0, 800, 600))
+
+        with patch("ui.mini_window.QApplication.primaryScreen",
+                   return_value=first_screen):
+            window = MiniRecordingWindow(_Engine())
+        self.addCleanup(window.close)
+        window._mode = "recording"
+        window._anchor_x = 1180
+        window.setFixedSize(REC_W, REC_H)
+        window.move(1140, 4)
+        window.show()
+
+        with patch("ui.mini_window.QApplication.primaryScreen",
+                   return_value=second_screen):
+            window._apply_screen_relayout("unit-test")
+
+        geo = second_screen.availableGeometry()
+        self.assertEqual(window.y(), geo.y() + 4)
+        self.assertLessEqual(window.geometry().right(), geo.right())
+
+    def test_recording_hover_poll_collapses_when_leave_event_is_missed(self):
+        window = MiniRecordingWindow(_Engine())
+        self.addCleanup(window.close)
+        window._mode = "recording"
+        window._hovered = True
+        window._btn_rec_stop.setVisible(True)
+        window.setFixedSize(REC_HOVER_W, REC_H)
+        window.move(500, 4)
+        window.show()
+
+        with patch("ui.mini_window.QCursor.pos", return_value=QPoint(10, 10)):
+            window._poll_hover_state()
+
+        self.assertFalse(window._hovered)
+        self.assertFalse(window._btn_rec_stop.isVisible())
+        self.assertEqual(window._target_size, (REC_W, REC_H))
+
+    def test_idle_hover_drag_updates_anchor_without_moving_off_top(self):
+        screen = _Screen(QRect(0, 0, 1200, 900))
+
+        with patch("ui.mini_window.QApplication.primaryScreen",
+                   return_value=screen):
+            window = MiniRecordingWindow(_Engine())
+        self.addCleanup(window.close)
+        window._mode = "hover"
+        window._target_size = (HOVER_W, HOVER_H)
+        window.setFixedSize(HOVER_W, HOVER_H)
+        window.move(540, 4)
+        window.show()
+
+        window.mousePressEvent(_MouseEvent(QPoint(600, 14)))
+        window.mouseMoveEvent(_MouseEvent(QPoint(640, 120)))
+        window.mouseReleaseEvent(_MouseEvent(QPoint(640, 120)))
+
+        self.assertEqual(window.y(), screen.availableGeometry().y() + 4)
+        self.assertEqual(window._anchor_x, 640)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import shutil
 import sys
 import subprocess
 import tempfile
+import time
 import urllib.request
 import urllib.error
 import zipfile
@@ -21,6 +22,52 @@ from core.network import open_update_url
 _REPO = "myuan19/voiceInput"
 _API_URL = f"https://api.github.com/repos/{_REPO}/releases?per_page=20"
 _CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000  # 4 hours
+
+
+def _elapsed_ms(start: float) -> int:
+    return int((time.perf_counter() - start) * 1000)
+
+
+def _update_install_log_path() -> Path:
+    root = Path(os.environ.get("USERPROFILE", os.path.expanduser("~")))
+    log_dir = root / ".voiceinput" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "update_install.log"
+
+
+def _build_install_script(
+    *,
+    source: Path,
+    app_dir: Path,
+    exe_path: Path,
+    staged: Path,
+    log_path: Path,
+) -> str:
+    return (
+        f'$ErrorActionPreference = "Continue"\n'
+        f'$LogPath = "{log_path}"\n'
+        f'function Write-DebugLog([string]$Message) {{\n'
+        f'  $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"\n'
+        f'  Add-Content -Path $LogPath -Encoding UTF8 -Value "$ts | [DEBUG] update_install.ps1 | $Message"\n'
+        f'}}\n'
+        f'$TotalStart = Get-Date\n'
+        f'Write-DebugLog "start source={source} app_dir={app_dir} exe={exe_path} staged={staged}"\n'
+        f'$StepStart = Get-Date\n'
+        f'Start-Sleep -Seconds 1\n'
+        f'Write-DebugLog "sleep_before_copy elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'$StepStart = Get-Date\n'
+        f'robocopy "{source}" "{app_dir}" /E /IS /IT /NFL /NDL /NJH /NJS /R:3 /W:1\n'
+        f'$CopyExitCode = $LASTEXITCODE\n'
+        f'Write-DebugLog "robocopy_copy exit_code=$CopyExitCode elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'$StepStart = Get-Date\n'
+        f'Start-Process "{exe_path}"\n'
+        f'Write-DebugLog "start_process elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'$StepStart = Get-Date\n'
+        f'Remove-Item "{staged}" -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'Write-DebugLog "cleanup_staging elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'Write-DebugLog "total elapsed_ms=$([int]((Get-Date) - $TotalStart).TotalMilliseconds)"\n'
+        f'Remove-Item $MyInvocation.MyCommand.Path -Force\n'
+    )
 
 
 class UpdateInfo(NamedTuple):
@@ -114,21 +161,34 @@ class _CheckWorker(QThread):
     result = pyqtSignal(object)  # UpdateInfo | _NO_UPDATE | _CHECK_ERROR
 
     def run(self):
+        started = time.perf_counter()
         logger.debug(f"[DEBUG] _CheckWorker.run | started, local VERSION={VERSION}")
         try:
             req = urllib.request.Request(_API_URL, headers={
                 "Accept": "application/vnd.github+json",
                 "User-Agent": "VoiceInput-Updater",
             })
+            request_started = time.perf_counter()
             logger.debug(f"[DEBUG] _CheckWorker.run | requesting {_API_URL}")
             with open_update_url(req, timeout=10) as resp:
                 raw = resp.read()
-                logger.debug(f"[DEBUG] _CheckWorker.run | response length={len(raw)}")
+                logger.debug(
+                    f"[DEBUG] _CheckWorker.run | response length={len(raw)}, "
+                    f"request_elapsed_ms={_elapsed_ms(request_started)}"
+                )
+            parse_started = time.perf_counter()
             data = json.loads(raw)
             releases = data if isinstance(data, list) else [data]
             release = _select_latest_release(releases, VERSION)
+            logger.debug(
+                f"[DEBUG] _CheckWorker.run | parse_select_elapsed_ms={_elapsed_ms(parse_started)}, "
+                f"release_count={len(releases)}"
+            )
             if release is None:
-                logger.debug("[DEBUG] _CheckWorker.run | no newer release with matching asset")
+                logger.debug(
+                    f"[DEBUG] _CheckWorker.run | no newer release with matching asset, "
+                    f"total_elapsed_ms={_elapsed_ms(started)}"
+                )
                 self.result.emit(_NO_UPDATE)
                 return
             tag = release.get("tag_name", "")
@@ -155,10 +215,16 @@ class _CheckWorker(QThread):
                 published_at=release.get("published_at", "") or "",
             )
             logger.info(f"[Updater] New version available: v{info.version} ({info.filename})")
-            logger.debug(f"[DEBUG] _CheckWorker.run | emitting UpdateInfo: {info}")
+            logger.debug(
+                f"[DEBUG] _CheckWorker.run | emitting UpdateInfo: {info}, "
+                f"total_elapsed_ms={_elapsed_ms(started)}"
+            )
             self.result.emit(info)
         except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
-            logger.debug(f"[DEBUG] _CheckWorker.run | exception: {type(e).__name__}: {e}")
+            logger.debug(
+                f"[DEBUG] _CheckWorker.run | exception: {type(e).__name__}: {e}, "
+                f"total_elapsed_ms={_elapsed_ms(started)}"
+            )
             self.result.emit(_CHECK_ERROR)
 
 
@@ -173,6 +239,7 @@ class _DownloadWorker(QThread):
         self._filename = filename
 
     def run(self):
+        started = time.perf_counter()
         logger.debug(f"[DEBUG] _DownloadWorker.run | url={self._url}, filename={self._filename}")
         try:
             dest = Path(tempfile.gettempdir()) / self._filename
@@ -180,10 +247,16 @@ class _DownloadWorker(QThread):
             req = urllib.request.Request(self._url, headers={
                 "User-Agent": "VoiceInput-Updater",
             })
+            open_started = time.perf_counter()
             with open_update_url(req, timeout=60) as resp:
                 total = int(resp.headers.get("Content-Length", 0))
-                logger.debug(f"[DEBUG] _DownloadWorker.run | Content-Length={total}")
+                logger.debug(
+                    f"[DEBUG] _DownloadWorker.run | Content-Length={total}, "
+                    f"open_elapsed_ms={_elapsed_ms(open_started)}"
+                )
                 downloaded = 0
+                write_started = time.perf_counter()
+                last_progress_log = 0
                 with open(dest, "wb") as f:
                     while True:
                         chunk = resp.read(256 * 1024)
@@ -192,7 +265,15 @@ class _DownloadWorker(QThread):
                         f.write(chunk)
                         downloaded += len(chunk)
                         if total > 0:
-                            self.progress.emit(int(downloaded * 100 / total))
+                            percent = int(downloaded * 100 / total)
+                            self.progress.emit(percent)
+                            if percent >= last_progress_log + 25:
+                                logger.debug(
+                                    f"[DEBUG] _DownloadWorker.run | progress={percent}%, "
+                                    f"downloaded={downloaded}, total={total}, "
+                                    f"write_elapsed_ms={_elapsed_ms(write_started)}"
+                                )
+                                last_progress_log = percent
             if total > 0 and downloaded != total:
                 logger.error(f"[Updater] Incomplete download: {downloaded}/{total} bytes ({downloaded*100//total}%)")
                 try:
@@ -202,11 +283,17 @@ class _DownloadWorker(QThread):
                 self.failed.emit(f"下载不完整 ({downloaded}/{total} 字节)")
                 return
             logger.info(f"[Updater] Downloaded: {dest} ({downloaded} bytes)")
-            logger.debug(f"[DEBUG] _DownloadWorker.run | download complete, size={downloaded}, emitting finished_ok")
+            logger.debug(
+                f"[DEBUG] _DownloadWorker.run | download complete, size={downloaded}, "
+                f"total_elapsed_ms={_elapsed_ms(started)}, emitting finished_ok"
+            )
             self.finished_ok.emit(str(dest), total)
         except Exception as e:
             logger.error(f"[Updater] Download failed: {e}")
-            logger.debug(f"[DEBUG] _DownloadWorker.run | exception: {type(e).__name__}: {e}")
+            logger.debug(
+                f"[DEBUG] _DownloadWorker.run | exception: {type(e).__name__}: {e}, "
+                f"total_elapsed_ms={_elapsed_ms(started)}"
+            )
             self.failed.emit(str(e))
 
 
@@ -228,23 +315,60 @@ class _StageWorker(QThread):
         self._version = version
 
     def run(self):
+        started = time.perf_counter()
         staging_dir = Path(tempfile.gettempdir()) / _STAGING_DIR_NAME
         logger.debug(f"[DEBUG] _StageWorker.run | zip={self._zip_path}, staging={staging_dir}")
         try:
             if staging_dir.exists():
+                clean_started = time.perf_counter()
                 shutil.rmtree(staging_dir)
+                logger.debug(
+                    f"[DEBUG] _StageWorker.run | clean_existing_staging elapsed_ms={_elapsed_ms(clean_started)}"
+                )
+            mkdir_started = time.perf_counter()
             staging_dir.mkdir(parents=True, exist_ok=True)
+            logger.debug(
+                f"[DEBUG] _StageWorker.run | mkdir_staging elapsed_ms={_elapsed_ms(mkdir_started)}"
+            )
+            extract_started = time.perf_counter()
             with zipfile.ZipFile(self._zip_path, "r") as zf:
                 members = zf.namelist()
                 total = len(members)
+                total_uncompressed = sum(info.file_size for info in zf.infolist())
+                logger.debug(
+                    f"[DEBUG] _StageWorker.run | zip_opened members={total}, "
+                    f"uncompressed_bytes={total_uncompressed}"
+                )
+                last_progress_log = 0
                 for i, member in enumerate(members, 1):
                     zf.extract(member, staging_dir)
-                    self.progress.emit(int(i * 100 / total))
+                    percent = int(i * 100 / total) if total else 100
+                    self.progress.emit(percent)
+                    if percent >= last_progress_log + 25:
+                        logger.debug(
+                            f"[DEBUG] _StageWorker.run | extract_progress={percent}%, "
+                            f"files={i}/{total}, elapsed_ms={_elapsed_ms(extract_started)}"
+                        )
+                        last_progress_log = percent
+            logger.debug(
+                f"[DEBUG] _StageWorker.run | extract_complete elapsed_ms={_elapsed_ms(extract_started)}"
+            )
+            version_started = time.perf_counter()
             (staging_dir / _STAGE_VERSION_FILE).write_text(self._version, encoding="utf-8")
+            logger.debug(
+                f"[DEBUG] _StageWorker.run | write_version elapsed_ms={_elapsed_ms(version_started)}"
+            )
             logger.info(f"[Updater] Staged {total} files to {staging_dir} (v{self._version})")
+            logger.debug(
+                f"[DEBUG] _StageWorker.run | total_elapsed_ms={_elapsed_ms(started)}"
+            )
             self.finished_ok.emit(str(staging_dir))
         except Exception as e:
             logger.error(f"[Updater] Staging failed: {e}")
+            logger.debug(
+                f"[DEBUG] _StageWorker.run | exception={type(e).__name__}: {e}, "
+                f"total_elapsed_ms={_elapsed_ms(started)}"
+            )
             self.failed.emit(str(e))
 
 
@@ -324,7 +448,11 @@ class UpdateChecker:
             return
         if self.is_ready_to_install:
             return
-        logger.debug(f"[DEBUG] UpdateChecker.download_update | starting download: {self._latest.download_url}")
+        logger.debug(
+            f"[DEBUG] UpdateChecker.download_update | starting download: "
+            f"url={self._latest.download_url}, filename={self._latest.filename}, "
+            f"expected_size={self._latest.size}"
+        )
         self._dl_worker = _DownloadWorker(self._latest.download_url, self._latest.filename)
         self._dl_worker.progress.connect(self._on_dl_progress)
         self._dl_worker.finished_ok.connect(self._on_dl_done)
@@ -333,6 +461,7 @@ class UpdateChecker:
 
     def install(self):
         """Copy staged files over the app directory and restart."""
+        started = time.perf_counter()
         if not self._staged_dir:
             logger.debug("[DEBUG] UpdateChecker.install | no staged_dir, returning")
             return
@@ -348,22 +477,46 @@ class UpdateChecker:
         source = inner if inner.is_dir() else staged
         logger.info(f"[Updater] Installing from staged: {source} → {app_dir}")
         script = Path(tempfile.gettempdir()) / "voiceinput_update.ps1"
-        ps_content = (
-            f'Start-Sleep -Seconds 1\n'
-            f'robocopy "{source}" "{app_dir}" /E /IS /IT /NFL /NDL /NJH /NJS /R:3 /W:1\n'
-            f'Start-Process "{exe_path}"\n'
-            f'Remove-Item "{staged}" -Recurse -Force -ErrorAction SilentlyContinue\n'
-            f'Remove-Item $MyInvocation.MyCommand.Path -Force\n'
+        install_log = _update_install_log_path()
+        logger.debug(
+            f"[DEBUG] UpdateChecker.install | source={source}, app_dir={app_dir}, "
+            f"exe_path={exe_path}, staged={staged}, script={script}, "
+            f"install_log={install_log}"
         )
+        build_started = time.perf_counter()
+        ps_content = _build_install_script(
+            source=source,
+            app_dir=app_dir,
+            exe_path=exe_path,
+            staged=staged,
+            log_path=install_log,
+        )
+        logger.debug(
+            f"[DEBUG] UpdateChecker.install | build_script elapsed_ms={_elapsed_ms(build_started)}"
+        )
+        write_started = time.perf_counter()
         script.write_text(ps_content, encoding="utf-8")
+        logger.debug(
+            f"[DEBUG] UpdateChecker.install | write_script elapsed_ms={_elapsed_ms(write_started)}, "
+            f"bytes={len(ps_content.encode('utf-8'))}"
+        )
         logger.debug(f"[DEBUG] UpdateChecker.install | ps_content:\n{ps_content}")
         cmd = ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
                "-File", str(script)]
         try:
+            launch_started = time.perf_counter()
             proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
-            logger.debug(f"[DEBUG] UpdateChecker.install | swap script pid={proc.pid}")
+            logger.debug(
+                f"[DEBUG] UpdateChecker.install | swap script pid={proc.pid}, "
+                f"launch_elapsed_ms={_elapsed_ms(launch_started)}, "
+                f"pre_quit_total_elapsed_ms={_elapsed_ms(started)}"
+            )
         except Exception as e:
             logger.error(f"[Updater] Install script launch failed: {e}")
+            logger.debug(
+                f"[DEBUG] UpdateChecker.install | launch_exception={type(e).__name__}: {e}, "
+                f"total_elapsed_ms={_elapsed_ms(started)}"
+            )
             return
         logger.debug("[DEBUG] UpdateChecker.install | calling QApplication.quit()")
         from PyQt6.QtWidgets import QApplication
@@ -393,7 +546,11 @@ class UpdateChecker:
             self._cb_dl_progress(percent)
 
     def _on_dl_done(self, path: str, expected_size: int):
-        logger.debug(f"[DEBUG] UpdateChecker._on_dl_done | path={path}, expected_size={expected_size}")
+        actual_size = Path(path).stat().st_size if Path(path).exists() else -1
+        logger.debug(
+            f"[DEBUG] UpdateChecker._on_dl_done | path={path}, expected_size={expected_size}, "
+            f"actual_size={actual_size}"
+        )
         self._downloaded_path = path
         self._downloaded_expected_size = expected_size
         if self._cb_dl_done:
@@ -427,7 +584,10 @@ class UpdateChecker:
         return True
 
     def _start_staging(self, zip_path: str):
-        logger.debug(f"[DEBUG] UpdateChecker._start_staging | zip_path={zip_path}")
+        zip_size = Path(zip_path).stat().st_size if Path(zip_path).exists() else -1
+        logger.debug(
+            f"[DEBUG] UpdateChecker._start_staging | zip_path={zip_path}, zip_size={zip_size}"
+        )
         self._stage_worker = _StageWorker(zip_path, self._latest.version if self._latest else "")
         self._stage_worker.progress.connect(self._on_stage_progress)
         self._stage_worker.finished_ok.connect(self._on_stage_done)
@@ -444,8 +604,16 @@ class UpdateChecker:
         # Clean up the downloaded zip
         if self._downloaded_path:
             try:
+                cleanup_started = time.perf_counter()
                 Path(self._downloaded_path).unlink(missing_ok=True)
+                logger.debug(
+                    f"[DEBUG] UpdateChecker._on_stage_done | cleanup_zip elapsed_ms={_elapsed_ms(cleanup_started)}, "
+                    f"path={self._downloaded_path}"
+                )
             except OSError:
+                logger.debug(
+                    f"[DEBUG] UpdateChecker._on_stage_done | cleanup_zip failed, path={self._downloaded_path}"
+                )
                 pass
         if self._cb_stage_done:
             self._cb_stage_done()
