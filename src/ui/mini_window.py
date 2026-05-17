@@ -845,15 +845,11 @@ class MiniRecordingWindow(QWidget):
 
     def refresh_visibility(self):
         """Apply the current hide-when-idle preference to the minimal idle state."""
-        if not self._engine.config.hide_mini_window_when_idle:
-            if self._mode == "idle" and self._engine.state == "ready":
-                self._show_idle_surface()
-                return
-            self.show()
-            return
         if self._mode == "idle" and self._engine.state == "ready":
-            self._hide_native_idle()
-            self.hide()
+            self._show_idle_surface()
+            return
+        if not self._engine.config.hide_mini_window_when_idle:
+            self.show()
 
     def _on_action_click(self):
         if self._mode == "hover":
@@ -994,6 +990,12 @@ class MiniRecordingWindow(QWidget):
         self._stop_hover_polling("mode-not-hoverable")
 
     def _show_idle_surface(self):
+        if (self._engine.config.hide_mini_window_when_idle
+                and self._engine.state == "ready"):
+            self._position_at(IDLE_W, IDLE_H)
+            self._hide_native_idle()
+            self.hide()
+            return
         if self._using_native_idle():
             pos = self._idle_top_left()
             if pos is None:
@@ -1025,7 +1027,6 @@ class MiniRecordingWindow(QWidget):
                 f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
                 f"mask={self.mask().boundingRect().getRect()}, pos={pos}, scale={scale}"
             )
-            # Show native idle before hiding Qt so the handoff has no blank frame.
             self._native_idle.show_at(*pos, scale=scale)
             logger.debug(
                 f"[DEBUG] _show_idle_surface | after native show_at | "
@@ -1038,9 +1039,9 @@ class MiniRecordingWindow(QWidget):
                 f"qt_visible={self.isVisible()}, native_visible="
                 f"{getattr(self._native_idle, '_visible', None)}"
             )
-            return
-        self._log_anim("show_qt_idle_fallback")
-        self.show()
+        else:
+            self._log_anim("show_qt_idle_fallback")
+            self.show()
 
     def _hide_native_idle(self):
         if self._native_idle:
@@ -1062,10 +1063,8 @@ class MiniRecordingWindow(QWidget):
             return
         if self.isVisible():
             return
-        pos = self._idle_top_left()
-        if pos is None:
+        if not self._idle_top_left():
             return
-        scale = self._native_idle_scale()
         logger.debug(
             f"[DEBUG] _prewarm_hover_surface | start | native_visible="
             f"{getattr(self._native_idle, '_visible', None)}, "
@@ -1088,7 +1087,8 @@ class MiniRecordingWindow(QWidget):
         self._update_show_result_style()
         self._set_widgets_for_mode("hover")
         self._reset_reveal_progress(0.0, "prewarm_hover")
-        self._position_at(HOVER_W, HOVER_H)
+        self.setFixedSize(HOVER_W, HOVER_H)
+        self.move(-HOVER_W * 2, -HOVER_H * 2)
         self.setWindowOpacity(0.0)
         self.show()
         self.hide()
@@ -1098,13 +1098,7 @@ class MiniRecordingWindow(QWidget):
         self._set_widgets_for_mode("idle")
         self._reset_reveal_progress(1.0, "prewarm_idle_restore")
         self.setWindowOpacity(1.0)
-        self._position_at(IDLE_W, IDLE_H)
-        self._native_idle.show_at(*pos, scale=scale)
-        logger.debug(
-            f"[DEBUG] _prewarm_hover_surface | done | qt_visible={self.isVisible()}, "
-            f"native_visible={getattr(self._native_idle, '_visible', None)}, "
-            f"geom={self.geometry().getRect()}"
-        )
+        self._show_idle_surface()
 
     def _apply_screen_relayout(self, source: str):
         logger.debug(
@@ -1124,11 +1118,7 @@ class MiniRecordingWindow(QWidget):
         self._geom_anim.stop()
         self._anim_interrupting = False
         if self._mode == "idle" and self._engine.state == "ready":
-            if self._engine.config.hide_mini_window_when_idle:
-                self._hide_native_idle()
-                self.hide()
-            else:
-                self._show_idle_surface()
+            self._show_idle_surface()
             return
         if self._mode in ("hover", "recording", "processing", "done"):
             w, h = self._target_size
@@ -1230,7 +1220,6 @@ class MiniRecordingWindow(QWidget):
             )
             self._show_idle_surface()
             self._mode = "idle"
-            self._native_returning_to_idle = False
             self._reveal_progress = 1.0
             logger.debug(
                 f"[DEBUG] _on_reveal_anim_finished | idle handoff done | "
@@ -1313,9 +1302,8 @@ class MiniRecordingWindow(QWidget):
                 self._position_at(w, h)
                 self.show()
                 return
+            self._position_at(IDLE_W, IDLE_H)
             self.show()
-            if self.width() < 2 or self.height() < 2:
-                self._position_at(IDLE_W, IDLE_H)
 
         if self._geom_anim.state() == QPropertyAnimation.State.Running:
             start = self._geom_anim.currentValue()
@@ -1360,14 +1348,7 @@ class MiniRecordingWindow(QWidget):
         if self._mode == "shrinking":
             self._mode = "idle"
             self.update()
-            if (self._engine.config.hide_mini_window_when_idle
-                    and self._engine.state == "ready"):
-                self._hide_native_idle()
-                self.hide()
-            elif self._using_native_idle():
-                self._show_idle_surface()
-            else:
-                self.show()
+            self._show_idle_surface()
 
     def _on_geometry_anim_value_changed(self, value):
         if not isinstance(value, QRect):
@@ -1552,6 +1533,7 @@ class MiniRecordingWindow(QWidget):
                 self._reset_reveal_progress(1.0, "shrink_hidden")
                 self.setWindowOpacity(1.0)
                 self._show_idle_surface()
+                self._mode = "idle"
             return
         self._mode = "shrinking"
         self._hide_recording_status()
@@ -1590,7 +1572,8 @@ class MiniRecordingWindow(QWidget):
         self._apply_done()
         if self._show_result:
             self._result_popup.show_text(text, self)
-        self._schedule_deferred_shrink(800)
+        delay = 0 if self._engine.config.hide_mini_window_when_idle else 800
+        self._schedule_deferred_shrink(delay)
 
     def _on_hover_timeout(self):
         if not self._hovered and self._mode == "hover":
