@@ -2482,6 +2482,12 @@ class VoiceTray(QSystemTrayIcon):
         self._act_show_countdown.triggered.connect(self._toggle_show_countdown)
         menu.addAction(self._act_show_countdown)
 
+        self._act_paste_result = QAction("处理完成后自动粘贴", menu)
+        self._act_paste_result.setCheckable(True)
+        self._act_paste_result.setChecked(self._config.paste_result)
+        self._act_paste_result.triggered.connect(self._toggle_paste_result)
+        menu.addAction(self._act_paste_result)
+
         # ── 界面显示 ──
         menu.addSeparator()
 
@@ -2517,6 +2523,10 @@ class VoiceTray(QSystemTrayIcon):
         act_log = QAction("查看日志", menu)
         act_log.triggered.connect(self._open_log)
         menu.addAction(act_log)
+
+        act_config = QAction("打开配置文件", menu)
+        act_config.triggered.connect(self._open_config_file)
+        menu.addAction(act_config)
 
         self._act_save_audio = QAction("保存录音文件", menu)
         self._act_save_audio.setCheckable(True)
@@ -2918,6 +2928,11 @@ class VoiceTray(QSystemTrayIcon):
         self._engine.polisher.update_api_key(dlg.api_key)
         logger.info("[Tray] API Key updated")
         self.set_credential_fault(not bool(dlg.api_key))
+
+    def _toggle_paste_result(self, checked: bool):
+        self._config.paste_result = checked
+        self._config.save()
+        logger.info(f"[Tray] Paste result → {'on' if checked else 'off'}")
 
     def _toggle_save_audio(self, checked: bool):
         self._config.save_audio = checked
@@ -3464,6 +3479,15 @@ class VoiceTray(QSystemTrayIcon):
     def _open_log(self):
         from core.log import _LOG_DIR
         os.startfile(str(_LOG_DIR))
+
+    def _open_config_file(self):
+        from config import _config_path
+        path = _config_path()
+        if path.exists():
+            os.startfile(str(path))
+        else:
+            self._config.save()
+            os.startfile(str(path))
 
     def _quit(self):
         logger.info("[Tray] Quit requested")
