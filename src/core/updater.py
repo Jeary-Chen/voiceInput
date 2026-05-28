@@ -101,6 +101,22 @@ def _is_newer(remote_tag: str, local_version: str) -> bool:
     return _parse_version(remote_tag) > _parse_version(local_version)
 
 
+def can_self_update() -> bool:
+    """Return True if the current launch mode supports in-app updates.
+
+    Portable and installer builds have VoiceInput.exe alongside python/ and
+    src/.  PyInstaller onefile extracts to a temp dir (_MEIPASS), and dev-mode
+    (run.ps1 / .venv) has no VoiceInput.exe — neither can self-update.
+    """
+    if getattr(sys, "_MEIPASS", None):
+        return False
+    try:
+        app_dir = Path(__file__).resolve().parent.parent.parent
+        return (app_dir / "VoiceInput.exe").is_file()
+    except Exception:
+        return False
+
+
 def _is_installed_version() -> bool:
     """Detect if running from an Inno Setup installed location.
 

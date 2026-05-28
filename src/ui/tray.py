@@ -28,7 +28,7 @@ from config import Config
 _T_modal = TypeVar("_T_modal")
 from core.log import logger
 from core.engine import VoiceEngine
-from core.updater import UpdateChecker, UpdateInfo
+from core.updater import UpdateChecker, UpdateInfo, can_self_update
 from core.polisher import DEFAULT_INSTRUCTIONS
 POLISH_MODELS: list[tuple[str, str]] = [
     ("qwen3.6-flash", "Qwen3.6 Flash"),
@@ -2244,6 +2244,9 @@ class _UpdateMenuHelper:
         text = "下载失败，点击重试" if is_download else "检查失败，点击重试"
         self._set_action(text, self._CLR_WHITE)
 
+    def set_unsupported(self):
+        self._set_action("程序不支持更新", self._CLR_DIMMED, clickable=False)
+
     def set_no_update(self):
         self._set_action("已是最新版本", self._CLR_DIMMED, clickable=False)
 
@@ -2374,18 +2377,24 @@ class VoiceTray(QSystemTrayIcon):
         self._device_watcher.signals.changed.connect(self._device_change_timer.start)
         self._device_watcher.start()
 
-        self._updater = UpdateChecker()
-        self._updater.start(
-            on_available=self._on_update_available,
-            on_no_update=self._on_no_update,
-            on_check_failed=self._on_check_failed,
-            on_dl_progress=self._on_download_progress,
-            on_dl_done=self._on_download_done,
-            on_dl_failed=self._on_download_failed,
-            on_stage_progress=self._on_stage_progress,
-            on_stage_done=self._on_stage_done,
-            on_stage_failed=self._on_stage_failed,
-        )
+        self._can_update = can_self_update()
+        if self._can_update:
+            self._updater = UpdateChecker()
+            self._updater.start(
+                on_available=self._on_update_available,
+                on_no_update=self._on_no_update,
+                on_check_failed=self._on_check_failed,
+                on_dl_progress=self._on_download_progress,
+                on_dl_done=self._on_download_done,
+                on_dl_failed=self._on_download_failed,
+                on_stage_progress=self._on_stage_progress,
+                on_stage_done=self._on_stage_done,
+                on_stage_failed=self._on_stage_failed,
+            )
+        else:
+            self._updater = None
+            self._update_widget.set_unsupported()
+            logger.info("[Tray] Self-update not available for this launch mode")
 
         self.show()
 
@@ -3109,6 +3118,8 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_update_click(self):
         """Dispatches based on current updater state."""
+        if not self._updater:
+            return
         logger.debug(f"[DEBUG] _on_update_click | is_ready={self._updater.is_ready_to_install}, "
                      f"is_downloading={self._updater.is_downloading}, is_staging={self._updater.is_staging}, "
                      f"latest={self._updater.latest}")
