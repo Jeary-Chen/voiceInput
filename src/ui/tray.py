@@ -2241,7 +2241,7 @@ class _UpdateMenuHelper:
         self._set_action(text, self._CLR_WHITE)
 
     def set_unsupported(self):
-        self._set_action("程序不支持更新", self._CLR_DIMMED, clickable=False)
+        self._set_action("该版本不支持更新", self._CLR_DIMMED, clickable=False)
 
     def set_no_update(self):
         self._set_action("已是最新版本", self._CLR_DIMMED, clickable=False)
