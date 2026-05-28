@@ -1,11 +1,13 @@
 """Core voice engine — coordinates recording, ASR, and text injection."""
 import time
+import wave
 
+import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer
 
 from config import Config
 from core.log import logger
-from core.recorder import VoiceRecorder
+from core.recorder import VoiceRecorder, _resample, _mix_to_mono
 from core.asr import DashScopeASR
 from core.injector import TextInjector
 from core.history import HistoryManager
@@ -16,6 +18,52 @@ from core.chunked_asr import transcribe_chunked, MAX_CHUNK_SEC
 _TAG = "[Engine]"
 
 COUNTDOWN_SEC = 10
+_MAX_UPLOAD_DURATION_SEC = 20 * 60  # 20 minutes
+
+
+def _load_audio_file(path: str) -> tuple[bytes, float]:
+    """Read an audio file and return (16-bit mono PCM at 16 kHz, duration_sec).
+
+    WAV is handled natively; other formats use pydub (requires ffmpeg).
+    """
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+
+    if ext == "wav":
+        with wave.open(path, "rb") as wf:
+            channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            rate = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+
+        if sampwidth == 1:
+            samples_u8 = np.frombuffer(raw, dtype=np.uint8)
+            raw = ((samples_u8.astype(np.int16) - 128) * 256).tobytes()
+        elif sampwidth == 3:
+            raise ValueError("24-bit WAV 暂不支持，请转换为 16-bit")
+        elif sampwidth == 4:
+            samples_i32 = np.frombuffer(raw, dtype=np.int32)
+            raw = (samples_i32 >> 16).astype(np.int16).tobytes()
+        elif sampwidth != 2:
+            raise ValueError(f"不支持的 WAV 位深: {sampwidth * 8}-bit")
+
+        if channels > 1:
+            raw = _mix_to_mono(raw, channels)
+        if rate != VoiceRecorder.TARGET_RATE:
+            raw = _resample(raw, rate, VoiceRecorder.TARGET_RATE)
+    else:
+        try:
+            from pydub import AudioSegment
+        except ImportError:
+            raise ValueError(
+                f"不支持 .{ext} 格式（缺少 pydub/ffmpeg）。\n"
+                f"请使用 WAV 格式，或安装 pydub + ffmpeg。"
+            )
+        seg = AudioSegment.from_file(path)
+        seg = seg.set_channels(1).set_frame_rate(VoiceRecorder.TARGET_RATE).set_sample_width(2)
+        raw = seg.raw_data
+
+    duration = len(raw) / (VoiceRecorder.TARGET_RATE * 2)
+    return raw, duration
 
 
 class _TranscribeWorker(QThread):
@@ -167,6 +215,30 @@ class VoiceEngine(QObject):
             logger.info(f"{_TAG} Recording cancelled by user")
             self.recorder.cancel()
             self._set_state("ready")
+
+    def transcribe_file(self, file_path: str):
+        """Load a local audio file and run the ASR → polish → paste pipeline."""
+        if self._state != "ready":
+            return
+        logger.info(f"{_TAG} transcribe_file: {file_path}")
+        try:
+            pcm, duration = _load_audio_file(file_path)
+        except Exception as e:
+            logger.error(f"{_TAG} Failed to load audio file: {e}")
+            self.error_occurred.emit(f"音频文件加载失败：{e}")
+            return
+        if not pcm:
+            self.error_occurred.emit("音频文件为空")
+            return
+        if duration > _MAX_UPLOAD_DURATION_SEC:
+            self.error_occurred.emit(
+                f"音频时长 {duration / 60:.1f} 分钟，超过上限 "
+                f"{_MAX_UPLOAD_DURATION_SEC // 60} 分钟"
+            )
+            return
+        logger.info(f"{_TAG} Audio file loaded: {duration:.1f}s, "
+                    f"PCM {len(pcm)} bytes")
+        self._start_batch_transcribe(pcm, duration)
 
     def get_duration(self) -> float:
         return self.recorder.get_duration()

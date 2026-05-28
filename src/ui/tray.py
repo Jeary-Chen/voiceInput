@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QTextBrowser, QTextEdit, QListWidget, QListWidgetItem,
     QStyledItemDelegate, QStyleOptionViewItem,
     QMessageBox, QSplitter, QWidget,
-    QWidgetAction,
+    QWidgetAction, QFileDialog,
 )
 
 from typing import Any, TypeVar
@@ -2411,6 +2411,10 @@ class VoiceTray(QSystemTrayIcon):
         self._rec_info_timer.setInterval(1000)
         self._rec_info_timer.timeout.connect(self._update_rec_info)
 
+        self._act_upload = QAction("上传音频文件", menu)
+        self._act_upload.triggered.connect(self._on_upload_audio)
+        menu.addAction(self._act_upload)
+
         # ── 设备与模式 ──
         menu.addSeparator()
 
@@ -3104,6 +3108,27 @@ class VoiceTray(QSystemTrayIcon):
             self._audio.play_stop()
         self._engine.toggle_record()
 
+    def _on_upload_audio(self):
+        if self._engine.state != "ready":
+            return
+        if not self._config.api_key:
+            self._configure_apikey()
+            return
+        if self._credential_fault:
+            self.show_api_key_invalid_notice()
+            return
+        with self.hotkey_paused():
+            path, _ = QFileDialog.getOpenFileName(
+                None,
+                "选择音频文件",
+                "",
+                "音频文件 (*.wav *.mp3 *.flac *.m4a *.ogg *.aac *.opus);;"
+                "WAV (*.wav);;所有文件 (*)",
+            )
+        if path:
+            logger.info(f"[Tray] Upload audio file: {path}")
+            self._engine.transcribe_file(path)
+
     def _on_cancel(self):
         self._hotkey_hold_active = False
         if self._engine.state == "recording":
@@ -3310,17 +3335,20 @@ class VoiceTray(QSystemTrayIcon):
         if state == "recording":
             self._act_record.setText("停止录音")
             self._act_rec_info.setVisible(True)
+            self._act_upload.setVisible(False)
             self._update_rec_info()
             self._rec_info_timer.start()
         elif state == "processing":
             self._act_record.setText("处理中...")
             self._act_record.setEnabled(False)
             self._act_rec_info.setVisible(False)
+            self._act_upload.setVisible(False)
             self._rec_info_timer.stop()
         elif state == "ready":
             self._act_record.setText("开始录音")
             self._act_record.setEnabled(True)
             self._act_rec_info.setVisible(False)
+            self._act_upload.setVisible(True)
             self._rec_info_timer.stop()
 
     def _update_rec_info(self):
