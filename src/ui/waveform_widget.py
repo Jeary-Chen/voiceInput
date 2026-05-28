@@ -101,6 +101,8 @@ class WaveformWidget(QWidget):
         self._agc_primed = False
         self.update()
 
+    _IDLE_THRESHOLD = 0.005
+
     def _tick(self):
         diff = self._raw_target - self._levels
         lerp = np.where(diff > 0, self._lerp_up, self._lerp_down)
@@ -108,7 +110,10 @@ class WaveformWidget(QWidget):
 
         if not self._frozen:
             self._raw_target *= self.DECAY
-        self.update()
+
+        if (np.max(self._levels) > self._IDLE_THRESHOLD
+                or np.max(self._raw_target) > self._IDLE_THRESHOLD):
+            self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)

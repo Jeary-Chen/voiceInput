@@ -1,4 +1,3 @@
-import struct
 import time
 from typing import Callable
 
@@ -473,16 +472,9 @@ class VoiceRecorder:
 
     @staticmethod
     def _chunk_peak_amplitude(data: bytes) -> int:
-        n = len(data) // 2
-        if n == 0:
+        if len(data) < 2:
             return 0
-        samples = struct.unpack(f"<{n}h", data)
-        peak = 0
-        for s in samples:
-            v = s if s >= 0 else -s
-            if v > peak:
-                peak = v
-        return peak
+        return int(np.max(np.abs(np.frombuffer(data, dtype=np.int16).astype(np.int32))))
 
     # ── device enumeration ──
 

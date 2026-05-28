@@ -2337,16 +2337,11 @@ class VoiceTray(QSystemTrayIcon):
         self._audio = AudioCues()
         self._audio.set_enabled(config.play_sounds)
 
-        self._key_warning = not config.api_key
-        self._mic_warning = False
+        self._credential_fault = not config.api_key
+        self._device_fault = False
         self._pending_device_apply = False
         self._sync_autostart_state(save_if_changed=True)
-        if self._key_warning:
-            self.setIcon(icons.icon_key_invalid())
-            self._update_tooltip("API Key 未配置，右键点击配置")
-        else:
-            self.setIcon(icons.icon_idle())
-            self._update_tooltip("就绪")
+        self.refresh_idle_icon()
 
         self._build_menu()
 
@@ -2355,7 +2350,6 @@ class VoiceTray(QSystemTrayIcon):
 
         engine.state_changed.connect(self._on_state)
         engine.transcription_done.connect(self._on_done)
-        engine.mic_unavailable.connect(self._on_mic_unavailable)
         engine.countdown_tick.connect(self._on_countdown_tick)
 
         mini.request_record.connect(self._on_tray_click)
@@ -2424,6 +2418,7 @@ class VoiceTray(QSystemTrayIcon):
         self._dev_refresh_repeat = False
         self._dev_refresh_ready = False
         self._dev_refresh_worker: _DeviceRefreshWorker | None = None
+        self._dev_menu_dirty = True
         menu.addMenu(self._device_menu)
 
         self._mode_menu = QMenu("切换模式", menu)
@@ -2547,7 +2542,9 @@ class VoiceTray(QSystemTrayIcon):
         act_quit.triggered.connect(self._quit)
         menu.addAction(act_quit)
 
-        menu.aboutToShow.connect(self._start_async_refresh)
+        self._menu_refresh_min_interval = 10.0
+        self._last_menu_refresh_time = 0.0
+        menu.aboutToShow.connect(self._on_menu_about_to_show)
         self.setContextMenu(menu)
 
         self._rebuild_prompt_menu()
@@ -2555,6 +2552,13 @@ class VoiceTray(QSystemTrayIcon):
         self._start_async_refresh()
 
     # ── device refresh (background thread) ──
+
+    def _on_menu_about_to_show(self):
+        now = time.monotonic()
+        if now - self._last_menu_refresh_time < self._menu_refresh_min_interval:
+            return
+        self._last_menu_refresh_time = now
+        self._start_async_refresh()
 
     def _release_recorder_pa(self):
         if (self._engine.state != "recording"
@@ -2587,6 +2591,8 @@ class VoiceTray(QSystemTrayIcon):
         self._cached_default_name = default_name
         self._cached_devices = devices
         self._dev_refresh_ready = True
+        self._last_menu_refresh_time = time.monotonic()
+        self._dev_menu_dirty = True
         logger.info(f"[Tray] Device refresh done: "
                     f"default='{default_name}', {len(devices)} device(s)")
         if not self._skip_pa_restore:
@@ -2608,7 +2614,8 @@ class VoiceTray(QSystemTrayIcon):
             act.setEnabled(False)
             self._device_menu.addAction(act)
             return
-        self._rebuild_device_menu()
+        if self._dev_menu_dirty:
+            self._rebuild_device_menu()
 
     def _sync_system_default_device(self):
         """If following system default, rebind recorder when default device changed."""
@@ -2670,6 +2677,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _rebuild_device_menu(self):
         self._device_menu.clear()
+        self._dev_menu_dirty = False
 
         label = f"系统默认 ({self._cached_default_name})" if self._cached_default_name else "系统默认"
         act_default = QAction(label, self._device_menu)
@@ -2900,7 +2908,7 @@ class VoiceTray(QSystemTrayIcon):
         self._engine.asr.api_key = dlg.api_key
         self._engine.polisher.update_api_key(dlg.api_key)
         logger.info("[Tray] API Key updated")
-        self.set_key_warning(not bool(dlg.api_key))
+        self.set_credential_fault(not bool(dlg.api_key))
 
     def _toggle_save_audio(self, checked: bool):
         self._config.save_audio = checked
@@ -3037,7 +3045,7 @@ class VoiceTray(QSystemTrayIcon):
             self._engine.recorder.set_device(None, "")
             logger.info("[Tray] Input device → system default (index=None)")
         self._rebuild_device_menu()
-        self._mic_warning = False
+        self._device_fault = False
         self._sync_tray_icon_with_engine()
 
     def _set_device(self, name: str, idx: int | None = None):
@@ -3056,7 +3064,7 @@ class VoiceTray(QSystemTrayIcon):
             self._engine.recorder.set_device(resolved, name)
             logger.info(f"[Tray] Input device → {name} (index={resolved})")
         self._rebuild_device_menu()
-        self._mic_warning = False
+        self._device_fault = False
         self._sync_tray_icon_with_engine()
 
     def _maybe_apply_deferred_input_device(self):
@@ -3083,7 +3091,7 @@ class VoiceTray(QSystemTrayIcon):
             if not self._config.api_key:
                 self._configure_apikey()
                 return
-            if self._key_warning:
+            if self._credential_fault:
                 self.show_api_key_invalid_notice()
                 return
             self._audio.play_start(source="tray_or_mini")
@@ -3245,7 +3253,7 @@ class VoiceTray(QSystemTrayIcon):
             if not self._config.api_key:
                 self._configure_apikey()
                 return
-            if self._key_warning:
+            if self._credential_fault:
                 self.show_api_key_invalid_notice()
                 return
             self._audio.play_start(source="hotkey")
@@ -3290,7 +3298,7 @@ class VoiceTray(QSystemTrayIcon):
         if state != "recording":
             self._maybe_apply_deferred_input_device()
         if state == "recording":
-            self._mic_warning = False
+            self._device_fault = False
         self._sync_tray_icon_with_engine()
         if state == "recording":
             self._act_record.setText("停止录音")
@@ -3346,32 +3354,46 @@ class VoiceTray(QSystemTrayIcon):
     ):
         self.showMessage(title, body, icon, milliseconds)
 
-    def show_api_key_invalid_notice(self):
-        self.showMessage(
-            "VoiceInput",
-            "API Key 不可用，请右键点击托盘图标重新配置",
-            QSystemTrayIcon.MessageIcon.Critical,
-            5000,
-        )
+    def show_api_error_notice(self, detail: str | None = None):
+        """Tray balloon for API failures. Uses provider text when given."""
+        from core.user_errors import single_line_preview
 
-    def set_key_warning(self, warning: bool):
-        self._key_warning = warning
-        self._restore_idle_icon()
-
-    def _on_mic_unavailable(self, msg: str):
-        if self._engine.recorder.no_device:
-            self._mic_warning = False
+        if detail and detail.strip():
+            body = single_line_preview(detail.strip())
         else:
-            self._mic_warning = True
-        text = (msg or "").strip() or "未找到输入设备"
-        logger.warning(f"[Tray] Mic unavailable: {text}")
+            body = "API Key 不可用，请右键点击托盘图标重新配置"
         self.showMessage(
             "VoiceInput",
-            text,
-            QSystemTrayIcon.MessageIcon.Warning,
-            5000,
+            body,
+            QSystemTrayIcon.MessageIcon.Critical,
+            8000,
         )
+
+    def show_api_key_invalid_notice(self):
+        self.show_api_error_notice(None)
+
+    @property
+    def engine(self) -> VoiceEngine:
+        return self._engine
+
+    def set_credential_fault(self, active: bool) -> None:
+        self._credential_fault = active
+
+    def set_device_fault(self, active: bool) -> None:
+        self._device_fault = active
+
+    def set_key_warning(self, warning: bool) -> None:
+        """Backward-compatible alias for credential fault state."""
+        self.set_credential_fault(warning)
+
+    @property
+    def credential_fault(self) -> bool:
+        return self._credential_fault
+
+    def refresh_idle_icon(self) -> None:
         self._restore_idle_icon()
+
+    def request_device_refresh(self) -> None:
         self._start_async_refresh()
 
     def _restore_idle_icon(self):
@@ -3381,13 +3403,16 @@ class VoiceTray(QSystemTrayIcon):
         if self._update_status in ("downloading", "staging", "ready"):
             self._set_update_status(self._update_status)
             return
-        if self._key_warning:
+        if self._credential_fault:
             self.setIcon(icons.icon_key_invalid())
-            self._update_tooltip("API Key 无效，右键点击配置")
+            if not self._config.api_key:
+                self._update_tooltip("API Key 未配置，右键点击配置")
+            else:
+                self._update_tooltip("API Key 无效，右键点击配置")
         elif self._engine.recorder.no_device:
             self.setIcon(icons.icon_key_invalid())
             self._update_tooltip("未找到输入设备")
-        elif self._mic_warning:
+        elif self._device_fault:
             self.setIcon(icons.icon_key_invalid())
             self._update_tooltip("麦克风不可用，右键切换输入设备")
         else:

@@ -1,25 +1,38 @@
 """
-User-visible error taxonomy for VoiceInput.
-
-All string matching for presentation routing lives here so UI code does not
-accumulate ad-hoc ``if "401" in msg`` branches. Engine emits plain messages;
-this module classifies them for notification policy.
-
-Mic/device errors use ``mic_unavailable`` (not ``error_occurred``) and bypass
-this classification entirely.
+Backward-compatible re-exports. New code should use :mod:`core.faults`.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from core.faults import (
+    FaultKind,
+    FaultSource,
+    classify_fault,
+    extract_api_error as extract_api_error_detail,
+    is_local_credential_error,
+    single_line_preview,
+)
+
 
 class UserErrorDomain(Enum):
     API_CREDENTIALS = auto()
+    API_REMOTE = auto()
     CAPTURE = auto()
     SPEECH_EMPTY = auto()
     SPEECH_SILENT = auto()
     GENERAL = auto()
+
+
+_DOMAIN_BY_KIND = {
+    FaultKind.CREDENTIAL: UserErrorDomain.API_CREDENTIALS,
+    FaultKind.API_REMOTE: UserErrorDomain.API_REMOTE,
+    FaultKind.CAPTURE: UserErrorDomain.CAPTURE,
+    FaultKind.SPEECH_EMPTY: UserErrorDomain.SPEECH_EMPTY,
+    FaultKind.SPEECH_SILENT: UserErrorDomain.SPEECH_SILENT,
+    FaultKind.GENERAL: UserErrorDomain.GENERAL,
+}
 
 
 @dataclass(frozen=True)
@@ -29,32 +42,6 @@ class UserErrorContext:
 
 
 def classify_user_error(message: str) -> UserErrorContext:
-    """Map engine ``error_occurred`` text to a domain."""
-    m = (message or "").strip()
-    if not m:
-        return UserErrorContext(UserErrorDomain.GENERAL, m)
-
-    if (
-        "API 401:" in m
-        or "API 403:" in m
-        or "Missing credentials" in m
-        or "OPENAI_API_KEY" in m
-        or "OPENAI_ADMIN_KEY" in m
-    ):
-        return UserErrorContext(UserErrorDomain.API_CREDENTIALS, m)
-
-    if m.startswith("未录到音频"):
-        return UserErrorContext(UserErrorDomain.CAPTURE, m)
-    if m == "识别结果为空":
-        return UserErrorContext(UserErrorDomain.SPEECH_EMPTY, m)
-    if m == "未检测到语音":
-        return UserErrorContext(UserErrorDomain.SPEECH_SILENT, m)
-
-    return UserErrorContext(UserErrorDomain.GENERAL, m)
-
-
-def single_line_preview(text: str, max_len: int = 320) -> str:
-    line = text.replace("\n", " ").strip()
-    if len(line) > max_len:
-        return line[: max_len - 1] + "…"
-    return line
+    event = classify_fault(FaultSource.ENGINE, message)
+    domain = _DOMAIN_BY_KIND.get(event.kind, UserErrorDomain.GENERAL)
+    return UserErrorContext(domain, event.message)

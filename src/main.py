@@ -24,7 +24,7 @@ from core.engine import VoiceEngine
 from ui import icons
 from ui.mini_window import MiniRecordingWindow
 from ui.tray import VoiceTray
-from ui.user_notification_hub import UserNotificationHub
+from ui.fault_coordinator import FaultCoordinator
 
 _APP_KEY = "VoiceInput_SingleInstance_Lock"
 _APP_MUTEX_NAME = "VoiceInput_InstallAware_Mutex"
@@ -152,7 +152,7 @@ def main():
     engine = VoiceEngine(config)
     mini = MiniRecordingWindow(engine)
     tray = VoiceTray(engine, mini, config)
-    UserNotificationHub(engine, tray, parent=app)
+    FaultCoordinator(engine, tray, parent=app)
     _start_shutdown_watcher(tray._quit)
 
     hotkey_display = config.hotkey.replace("+", " + ").title()
