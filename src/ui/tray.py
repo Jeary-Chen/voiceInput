@@ -30,11 +30,7 @@ from core.log import logger
 from core.engine import VoiceEngine
 from core.updater import UpdateChecker, UpdateInfo, can_self_update
 from core.polisher import DEFAULT_INSTRUCTIONS
-POLISH_MODELS: list[tuple[str, str]] = [
-    ("qwen3.6-flash", "Qwen3.6 Flash"),
-    ("qwen3.6-plus",  "Qwen3.6 Plus"),
-    ("qwen3-max",     "Qwen3 Max"),
-]
+from config import POLISH_MODELS
 from core.prompt_templates import default_prompt_templates
 from ui.mini_window import MiniRecordingWindow
 from ui.sounds import AudioCues

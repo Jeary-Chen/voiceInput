@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import uuid
@@ -14,6 +15,29 @@ def _config_path() -> Path:
 
 
 LATEST_ASR_MODEL = "qwen3-asr-flash-2026-02-10"
+
+POLISH_MODELS: list[tuple[str, str]] = [
+    ("qwen3.6-flash", "Qwen3.6 Flash"),
+    ("qwen3.6-plus",  "Qwen3.6 Plus"),
+    ("qwen3-max",     "Qwen3 Max"),
+]
+
+# 配置升级规则：(目标版本, {字段: 新值})
+# 按版本顺序排列，升级时依次应用。被覆盖的旧值会备份到 config.json 的
+# upgraded_backup 字段中，用户可自行查看或恢复。
+_CONFIG_UPGRADES: list[tuple[str, dict]] = [
+    # ("1.4.0", {"asr_model": "qwen3-asr-flash-2026-xx-xx"}),
+]
+
+
+def _parse_ver(v: str) -> tuple[int, ...]:
+    parts = []
+    for p in (v or "0").split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            break
+    return tuple(parts) or (0,)
 
 
 @dataclass
@@ -52,6 +76,9 @@ class Config:
     mini_bar_show_timer: bool = True
 
     mini_window_x: int | None = None
+
+    config_version: str = ""
+    upgraded_backup: dict = field(default_factory=dict)
 
     @property
     def active_prompt_text(self) -> str:
@@ -96,7 +123,20 @@ class Config:
         if not cfg.api_key:
             cfg.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
 
-        cfg.asr_model = LATEST_ASR_MODEL
+        from _version import VERSION
+        if cfg.config_version != VERSION:
+            cur = _parse_ver(cfg.config_version)
+            for ver, changes in _CONFIG_UPGRADES:
+                if _parse_ver(ver) > cur:
+                    backup = {}
+                    for field_name, new_val in changes.items():
+                        old_val = getattr(cfg, field_name, None)
+                        if old_val != new_val:
+                            backup[field_name] = copy.deepcopy(old_val)
+                            setattr(cfg, field_name, copy.deepcopy(new_val))
+                    if backup:
+                        cfg.upgraded_backup[ver] = backup
+            cfg.config_version = VERSION
 
         _VALID_KEYS = set("abcdefghijklmnopqrstuvwxyz")
         _VALID_KEYS |= {str(i) for i in range(10)}
