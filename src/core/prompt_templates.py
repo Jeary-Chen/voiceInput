@@ -1,5 +1,4 @@
-"""Built-in polish prompt templates and seed helpers."""
-import copy
+"""Built-in polish prompt templates."""
 
 
 def default_prompt_templates() -> list[dict]:
@@ -16,10 +15,3 @@ def default_prompt_templates() -> list[dict]:
             "content": "翻译为英语",
         },
     ]
-
-
-def seed_default_prompt_templates(cfg) -> None:
-    """Populate empty custom_prompts with defaults (no prompt active by default)."""
-    tpls = default_prompt_templates()
-    cfg.custom_prompts = copy.deepcopy(tpls)
-    cfg.active_prompt_id = ""

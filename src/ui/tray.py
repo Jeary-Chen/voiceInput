@@ -2482,36 +2482,34 @@ class VoiceTray(QSystemTrayIcon):
         self._act_show_countdown.triggered.connect(self._toggle_show_countdown)
         menu.addAction(self._act_show_countdown)
 
-        self._act_paste_result = QAction("处理完成后自动粘贴", menu)
+        self._act_paste_result = QAction("自动粘贴", menu)
         self._act_paste_result.setCheckable(True)
         self._act_paste_result.setChecked(self._config.paste_result)
         self._act_paste_result.triggered.connect(self._toggle_paste_result)
         menu.addAction(self._act_paste_result)
 
-        # ── 界面显示 ──
-        menu.addSeparator()
-
-        self._act_show_result_text = QAction("识别后显示原文", menu)
+        self._mini_bar_menu = QMenu("磁吸栏", menu)
+        self._mini_bar_menu.setStyleSheet(MENU_STYLE)
+        self._act_show_result_text = QAction("识别后显示原文", self._mini_bar_menu)
         self._act_show_result_text.setCheckable(True)
         self._act_show_result_text.setChecked(self._config.show_result_text)
         self._act_show_result_text.triggered.connect(self._toggle_show_result_text)
-        menu.addAction(self._act_show_result_text)
-
-        self._act_mini_bar_timer = QAction("悬停显示录音计时", menu)
+        self._mini_bar_menu.addAction(self._act_show_result_text)
+        self._act_mini_bar_timer = QAction("悬停显示录音计时", self._mini_bar_menu)
         self._act_mini_bar_timer.setCheckable(True)
         self._act_mini_bar_timer.setChecked(self._config.mini_bar_show_timer)
         self._act_mini_bar_timer.triggered.connect(self._toggle_mini_bar_timer)
-        menu.addAction(self._act_mini_bar_timer)
-
-        self._act_hide_idle_mini = QAction("空闲时隐藏磁吸栏", menu)
+        self._mini_bar_menu.addAction(self._act_mini_bar_timer)
+        self._act_hide_idle_mini = QAction("空闲时隐藏磁吸栏", self._mini_bar_menu)
         self._act_hide_idle_mini.setCheckable(True)
         self._act_hide_idle_mini.setChecked(self._config.hide_mini_window_when_idle)
         self._act_hide_idle_mini.triggered.connect(self._toggle_hide_idle_mini)
-        menu.addAction(self._act_hide_idle_mini)
-
-        act_reset_pos = QAction("重置磁吸栏位置", menu)
+        self._mini_bar_menu.addAction(self._act_hide_idle_mini)
+        self._mini_bar_menu.addSeparator()
+        act_reset_pos = QAction("重置磁吸栏位置", self._mini_bar_menu)
         act_reset_pos.triggered.connect(self._reset_mini_position)
-        menu.addAction(act_reset_pos)
+        self._mini_bar_menu.addAction(act_reset_pos)
+        menu.addMenu(self._mini_bar_menu)
 
         # ── 记录与日志 ──
         menu.addSeparator()
@@ -3136,7 +3134,7 @@ class VoiceTray(QSystemTrayIcon):
             path, _ = QFileDialog.getOpenFileName(
                 None,
                 "选择音频文件",
-                "",
+                str(Config.history_dir()),
                 "音频文件 (*.wav *.mp3 *.flac *.m4a *.ogg *.aac *.opus);;"
                 "WAV (*.wav);;所有文件 (*)",
             )
