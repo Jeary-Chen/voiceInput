@@ -1,5 +1,5 @@
 """Update-related UI widgets: release-notes dialog, restart dialog, and tray menu helpers."""
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, QTimer, Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTextBrowser, QMenu, QWidgetAction,
@@ -340,3 +340,28 @@ MENU_STYLE = """
         margin: 4px 12px;
     }
 """
+
+
+def apply_tray_menu_style(menu: QMenu) -> None:
+    menu.setStyleSheet(MENU_STYLE)
+
+
+def install_left_cascade_submenu(submenu: QMenu, parent_menu: QMenu) -> None:
+    """Keep v1.4.2 LTR visuals; anchor hover cascade popups left of *parent_menu*."""
+    def anchor_left() -> None:
+        if not submenu.isVisible():
+            return
+        submenu.ensurePolished()
+        submenu.adjustSize()
+        parent_left = parent_menu.frameGeometry().x()
+        submenu.move(parent_left - submenu.width(), submenu.y())
+
+    submenu.aboutToShow.connect(lambda: QTimer.singleShot(0, anchor_left))
+
+
+def popup_tray_submenu(menu: QMenu, global_pos: QPoint) -> None:
+    """Re-show a submenu with its right edge at *global_pos* (opens leftward)."""
+    menu.ensurePolished()
+    menu.adjustSize()
+    width = menu.sizeHint().width()
+    menu.popup(QPoint(global_pos.x() - width, global_pos.y()))

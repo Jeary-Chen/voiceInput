@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, TypeVar
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QCoreApplication,
 )
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QCursor
 from PyQt6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication,
     QDialog, QFileDialog,
@@ -29,7 +29,8 @@ from ui import icons
 from ui.hotkey import ComboHotkeyThread, _HotkeyDialog, _hotkey_display
 from ui.apikey_dialog import _ApiKeyDialog
 from ui.update_ui import (
-    _UpdateNotesDialog, _UpdateReadyDialog, _UpdateMenuHelper, MENU_STYLE,
+    _UpdateNotesDialog, _UpdateReadyDialog, _UpdateMenuHelper,
+    apply_tray_menu_style, install_left_cascade_submenu, popup_tray_submenu,
 )
 from ui.prompt_dialog import _PolishPromptDialog
 
@@ -193,7 +194,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _build_menu(self):
         menu = QMenu()
-        menu.setStyleSheet(MENU_STYLE)
+        apply_tray_menu_style(menu)
 
         self._act_record = QAction("开始录音", menu)
         self._act_record.triggered.connect(self._on_tray_click)
@@ -216,7 +217,8 @@ class VoiceTray(QSystemTrayIcon):
         menu.addSeparator()
 
         self._device_menu = QMenu("输入设备", menu)
-        self._device_menu.setStyleSheet(MENU_STYLE)
+        apply_tray_menu_style(self._device_menu)
+        install_left_cascade_submenu(self._device_menu, menu)
         self._device_menu.aboutToShow.connect(self._on_device_menu_show)
         self._cached_default_name = ""
         self._cached_devices: list[dict] = []
@@ -228,7 +230,8 @@ class VoiceTray(QSystemTrayIcon):
         menu.addMenu(self._device_menu)
 
         self._mode_menu = QMenu("切换模式", menu)
-        self._mode_menu.setStyleSheet(MENU_STYLE)
+        apply_tray_menu_style(self._mode_menu)
+        install_left_cascade_submenu(self._mode_menu, menu)
         for mode_id, mode_name in [("transcribe", "纯转录"), ("polish", "智能润色")]:
             act = QAction(mode_name, self._mode_menu)
             act.setCheckable(True)
@@ -238,13 +241,15 @@ class VoiceTray(QSystemTrayIcon):
         menu.addMenu(self._mode_menu)
 
         self._polish_model_menu = QMenu("润色模型", menu)
-        self._polish_model_menu.setStyleSheet(MENU_STYLE)
+        apply_tray_menu_style(self._polish_model_menu)
+        install_left_cascade_submenu(self._polish_model_menu, menu)
         self._polish_models = list(POLISH_MODELS)
         self._populate_polish_menu()
         menu.addMenu(self._polish_model_menu)
 
         self._prompt_menu = QMenu("自定义提示词", menu)
-        self._prompt_menu.setStyleSheet(MENU_STYLE)
+        apply_tray_menu_style(self._prompt_menu)
+        install_left_cascade_submenu(self._prompt_menu, menu)
         self._prompt_menu.aboutToShow.connect(self._sync_prompt_menu_checks)
         menu.addMenu(self._prompt_menu)
 
@@ -252,7 +257,8 @@ class VoiceTray(QSystemTrayIcon):
         menu.addSeparator()
 
         self._duration_menu = QMenu("录音上限", menu)
-        self._duration_menu.setStyleSheet(MENU_STYLE)
+        apply_tray_menu_style(self._duration_menu)
+        install_left_cascade_submenu(self._duration_menu, menu)
         self._duration_presets = [
             (300, "5 分钟"),
             (600, "10 分钟"),
@@ -286,7 +292,8 @@ class VoiceTray(QSystemTrayIcon):
         menu.addAction(self._act_paste_result)
 
         self._mini_bar_menu = QMenu("磁吸栏", menu)
-        self._mini_bar_menu.setStyleSheet(MENU_STYLE)
+        apply_tray_menu_style(self._mini_bar_menu)
+        install_left_cascade_submenu(self._mini_bar_menu, menu)
         self._act_show_result_text = QAction("识别后显示原文", self._mini_bar_menu)
         self._act_show_result_text.setCheckable(True)
         self._act_show_result_text.setChecked(self._config.show_result_text)
@@ -402,11 +409,15 @@ class VoiceTray(QSystemTrayIcon):
         worker.start()
 
     def _on_refresh_result(self, default_name: str, devices: list):
+        unchanged = (
+            self._dev_refresh_ready
+            and default_name == self._cached_default_name
+            and devices == self._cached_devices
+        )
         self._cached_default_name = default_name
         self._cached_devices = devices
         self._dev_refresh_ready = True
         self._last_menu_refresh_time = time.monotonic()
-        self._dev_menu_dirty = True
         logger.info(f"[Tray] Device refresh done: "
                     f"default='{default_name}', {len(devices)} device(s)")
         if not self._skip_pa_restore:
@@ -414,7 +425,8 @@ class VoiceTray(QSystemTrayIcon):
         self._skip_pa_restore = False
         self._sync_system_default_device()
         self._auto_fallback_if_device_gone()
-        self._rebuild_device_menu()
+        if not unchanged:
+            self._rebuild_device_menu()
         self._sync_tray_icon_with_engine()
         self._dev_refresh_running = False
         if self._dev_refresh_repeat:
@@ -490,6 +502,12 @@ class VoiceTray(QSystemTrayIcon):
                     f"switched to system default")
 
     def _rebuild_device_menu(self):
+        # Qt does not repaint an open QMenu popup after clear()+rebuild; close and
+        # reopen so hot-plugged devices appear while the submenu stays under the cursor.
+        reopen_pos = QCursor.pos() if self._device_menu.isVisible() else None
+        if reopen_pos is not None:
+            self._device_menu.close()
+
         self._device_menu.clear()
         self._dev_menu_dirty = False
 
@@ -505,16 +523,21 @@ class VoiceTray(QSystemTrayIcon):
             act = QAction("(未发现兼容设备)", self._device_menu)
             act.setEnabled(False)
             self._device_menu.addAction(act)
-            return
+        else:
+            for dev in self._cached_devices:
+                display = dev.get("display_name", dev["name"])
+                act = QAction(display, self._device_menu)
+                act.setCheckable(True)
+                act.setChecked(self._config.mic_name == dev["name"])
+                act.triggered.connect(
+                    lambda checked, idx=dev.get("index"), name=dev["name"]: self._set_device(name, idx))
+                self._device_menu.addAction(act)
 
-        for dev in self._cached_devices:
-            display = dev.get("display_name", dev["name"])
-            act = QAction(display, self._device_menu)
-            act.setCheckable(True)
-            act.setChecked(self._config.mic_name == dev["name"])
-            act.triggered.connect(
-                lambda checked, idx=dev.get("index"), name=dev["name"]: self._set_device(name, idx))
-            self._device_menu.addAction(act)
+        if reopen_pos is not None:
+            QTimer.singleShot(
+                0,
+                lambda p=reopen_pos: popup_tray_submenu(self._device_menu, p),
+            )
 
     def _set_mode(self, mode_id: str):
         self._config.mode = mode_id

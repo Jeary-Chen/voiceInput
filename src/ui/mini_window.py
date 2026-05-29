@@ -1028,12 +1028,6 @@ class MiniRecordingWindow(QWidget):
             self._anim_interrupting = False
             self._native_returning_to_idle = False
             logger.debug(
-                f"[DEBUG] _show_idle_surface | before position_at | "
-                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
-                f"mask={self.mask().boundingRect().getRect()}"
-            )
-            self._position_at(IDLE_W, IDLE_H)
-            logger.debug(
                 f"[DEBUG] _show_idle_surface | before native show_at | "
                 f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
                 f"mask={self.mask().boundingRect().getRect()}, pos={pos}, scale={scale}"
@@ -1045,6 +1039,7 @@ class MiniRecordingWindow(QWidget):
                 f"{getattr(self._native_idle, '_visible', None)}"
             )
             self.hide()
+            self._position_at(IDLE_W, IDLE_H, apply_mask=False)
             logger.debug(
                 f"[DEBUG] _show_idle_surface | after qt hide | "
                 f"qt_visible={self.isVisible()}, native_visible="
@@ -1380,7 +1375,7 @@ class MiniRecordingWindow(QWidget):
             in_region=self._hovered,
         )
 
-    def _position_at(self, w, h):
+    def _position_at(self, w, h, *, apply_mask: bool = True):
         screen = QApplication.primaryScreen()
         if not screen:
             return
@@ -1389,7 +1384,8 @@ class MiniRecordingWindow(QWidget):
         y = geo.y() + 4
         self.setFixedSize(w, h)
         self.move(x, y)
-        self._apply_capsule_mask(f"position_at:{w}x{h}")
+        if apply_mask:
+            self._apply_capsule_mask(f"position_at:{w}x{h}")
         logger.debug(
             f"[DEBUG] _position_at | mode={self._mode}, "
             f"size=({w}, {h}), pos=({x}, {y}), "
@@ -1537,7 +1533,7 @@ class MiniRecordingWindow(QWidget):
                 self._reset_reveal_progress(1.0, "shrink_start")
                 self.setWindowOpacity(1.0)
                 self._set_widgets_for_mode("idle")
-                self._animate_hover_to_top(160)
+                self._animate_hover_to_top(180)
                 self._reveal_to(0.0, 180, "idle")
             else:
                 self._set_widgets_for_mode("idle")

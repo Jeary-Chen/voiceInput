@@ -387,6 +387,35 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertEqual(visible_during_native_show, [True])
         self.assertFalse(window.isVisible())
 
+    def test_native_idle_handoff_positions_qt_after_hide(self):
+        with patch("ui.mini_window.sys.platform", "win32"):
+            with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
+                with patch("ui.mini_window.NativeIdlePillWindow") as native_cls:
+                    native = native_cls.return_value
+                    native.available = True
+
+                    window = MiniRecordingWindow(_Engine())
+                    self.addCleanup(window.close)
+                    window._mode = "shrinking"
+                    window.setFixedSize(HOVER_W, HOVER_H)
+                    window.show()
+
+                    call_order = []
+
+                    def record_hide():
+                        call_order.append("hide")
+                        window.setVisible(False)
+
+                    with patch.object(window, "hide", side_effect=record_hide):
+                        with patch.object(
+                            window,
+                            "_position_at",
+                            side_effect=lambda w, h, **_: call_order.append("position"),
+                        ):
+                            window._show_idle_surface()
+
+        self.assertEqual(call_order, ["hide", "position"])
+
     def test_windows_native_idle_reveal_finish_keeps_idle_mask_before_handoff(self):
         with patch("ui.mini_window.sys.platform", "win32"):
             with patch("ui.mini_window.MiniRecordingWindow._install_foreground_hook"):
