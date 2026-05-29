@@ -1,9 +1,11 @@
+﻿from __future__ import annotations
+
 import os
 import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 import time
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QCoreApplication,
@@ -17,6 +19,8 @@ from PyQt6.QtWidgets import (
 from config import Config, POLISH_MODELS
 from core.log import logger
 from core.engine import VoiceEngine
+from core.config_sync import ConfigSync
+from core.faults import FaultKind
 from core.updater import UpdateChecker, UpdateInfo, can_self_update
 from core.polisher import DEFAULT_INSTRUCTIONS
 from ui.mini_window import MiniRecordingWindow
@@ -28,6 +32,10 @@ from ui.update_ui import (
     _UpdateNotesDialog, _UpdateReadyDialog, _UpdateMenuHelper, MENU_STYLE,
 )
 from ui.prompt_dialog import _PolishPromptDialog
+
+if TYPE_CHECKING:
+    from ui.fault_coordinator import FaultCoordinator
+    from ui.notifier import Notifier
 
 _T_modal = TypeVar("_T_modal")
 
@@ -87,11 +95,18 @@ class _DeviceRefreshWorker(QThread):
 
 class VoiceTray(QSystemTrayIcon):
 
-    def __init__(self, engine: VoiceEngine, mini: MiniRecordingWindow, config: Config):
+    def __init__(
+        self,
+        engine: VoiceEngine,
+        mini: MiniRecordingWindow,
+        config: Config,
+        config_sync: ConfigSync | None = None,
+    ):
         super().__init__()
         self._engine = engine
         self._mini = mini
         self._config = config
+        self._config_sync = config_sync
         self._prompt_dlg: _PolishPromptDialog | None = None
         self._apikey_dlg: _ApiKeyDialog | None = None
         self._update_notes_dlg: _UpdateNotesDialog | None = None
@@ -102,8 +117,8 @@ class VoiceTray(QSystemTrayIcon):
         self._audio = AudioCues()
         self._audio.set_enabled(config.play_sounds)
 
-        self._credential_fault = not config.api_key
-        self._device_fault = False
+        self._faults: FaultCoordinator | None = None
+        self._notifier: Notifier | None = None
         self._pending_device_apply = False
         self._sync_autostart_state(save_if_changed=True)
         self.refresh_idle_icon()
@@ -158,7 +173,23 @@ class VoiceTray(QSystemTrayIcon):
             self._update_widget.set_unsupported()
             logger.info("[Tray] Self-update not available for this launch mode")
 
-        self.show()
+    def reveal(self) -> None:
+        """Show tray icon — call only after startup config checks pass."""
+        if not self.isVisible():
+            self.show()
+
+    def set_fault_coordinator(self, coordinator: FaultCoordinator) -> None:
+        self._faults = coordinator
+
+    def set_notifier(self, notifier: Notifier) -> None:
+        self._notifier = notifier
+
+    @property
+    def config(self) -> Config:
+        return self._config
+
+    def open_api_key_dialog(self) -> None:
+        self._configure_apikey()
 
     def _build_menu(self):
         menu = QMenu()
@@ -691,7 +722,13 @@ class VoiceTray(QSystemTrayIcon):
         self._engine.asr.api_key = dlg.api_key
         self._engine.polisher.update_api_key(dlg.api_key)
         logger.info("[Tray] API Key updated")
-        self.set_credential_fault(not bool(dlg.api_key))
+        if self._faults is not None:
+            self._faults.set_active(
+                FaultKind.CREDENTIAL,
+                not bool(dlg.api_key),
+                notify=False,
+            )
+            self.refresh_idle_icon()
 
     def _toggle_paste_result(self, checked: bool):
         self._config.paste_result = checked
@@ -806,7 +843,7 @@ class VoiceTray(QSystemTrayIcon):
             self._write_autostart_enabled(checked)
         except Exception as e:
             logger.warning(f"[Tray] Autostart toggle failed: {e}")
-            self.showMessage(
+            self.show_tray_message(
                 "VoiceInput",
                 f"设置开机自启失败：{e}",
                 QSystemTrayIcon.MessageIcon.Warning,
@@ -826,14 +863,16 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "recording":
             self._pending_device_apply = True
             logger.info("[Tray] Input device saved for next session → system default")
-            self.showMessage("VoiceInput", "输入设备已切换，下次录音生效",
-                             QSystemTrayIcon.MessageIcon.Information, 2000)
+            self.show_tray_message(
+                "VoiceInput", "输入设备已切换，下次录音生效",
+                QSystemTrayIcon.MessageIcon.Information, 2000,
+            )
         else:
             self._pending_device_apply = False
             self._engine.recorder.set_device(None, "")
             logger.info("[Tray] Input device → system default (index=None)")
         self._rebuild_device_menu()
-        self._device_fault = False
+        self._clear_device_fault()
         self._sync_tray_icon_with_engine()
 
     def _set_device(self, name: str, idx: int | None = None):
@@ -845,14 +884,16 @@ class VoiceTray(QSystemTrayIcon):
             self._pending_device_apply = True
             logger.info(f"[Tray] Input device saved for next session "
                         f"→ {name} (index={resolved})")
-            self.showMessage("VoiceInput", "输入设备已切换，下次录音生效",
-                             QSystemTrayIcon.MessageIcon.Information, 2000)
+            self.show_tray_message(
+                "VoiceInput", "输入设备已切换，下次录音生效",
+                QSystemTrayIcon.MessageIcon.Information, 2000,
+            )
         else:
             self._pending_device_apply = False
             self._engine.recorder.set_device(resolved, name)
             logger.info(f"[Tray] Input device → {name} (index={resolved})")
         self._rebuild_device_menu()
-        self._device_fault = False
+        self._clear_device_fault()
         self._sync_tray_icon_with_engine()
 
     def _maybe_apply_deferred_input_device(self):
@@ -863,6 +904,105 @@ class VoiceTray(QSystemTrayIcon):
         name = self._config.mic_name
         self._engine.recorder.set_device(idx, name)
         logger.info(f"[Tray] Deferred input device applied (name='{name or 'system default'}', index={idx})")
+
+    def is_idle_for_config_reload(self) -> bool:
+        return self._engine.state == "ready"
+
+    def on_config_reloaded(self, changed: frozenset) -> None:
+        """Handle external config.json edits: refresh UI and runtime services."""
+        self._apply_config_reload(set(changed))
+
+    def _apply_config_reload(self, changed: set[str]) -> None:
+        if not changed:
+            return
+
+        self._refresh_ui_from_config(changed)
+
+        engine_fields = changed & {
+            "api_key", "asr_model", "api_base_url", "polish_model",
+            "mic_name", "mic_index",
+        }
+        if engine_fields:
+            self._engine.apply_config(engine_fields)
+
+        self._mini.apply_config(changed)
+
+        if "hotkey" in changed:
+            self._apply_hotkey_from_config()
+
+    def _apply_hotkey_from_config(self) -> None:
+        combo = self._config.hotkey
+        self._act_hotkey.setText(f"快捷键: {_hotkey_display(combo)}")
+        self._stop_hotkey_listener()
+        self._spawn_hotkey_thread(combo)
+        logger.info(f"[Tray] Hotkey reloaded → {_hotkey_display(combo)}")
+
+    def _refresh_ui_from_config(self, changed: set[str]) -> None:
+        """Sync tray menu / audio state after config reload."""
+
+        def _set_checked(action, value: bool) -> None:
+            if action is None:
+                return
+            action.blockSignals(True)
+            action.setChecked(value)
+            action.blockSignals(False)
+
+        if "mode" in changed:
+            self._sync_mode_menu()
+
+        if "polish_model" in changed:
+            self._populate_polish_menu()
+
+        if changed & {"custom_prompts", "active_prompt_id"}:
+            self._rebuild_prompt_menu()
+            dlg = self._prompt_dlg
+            if dlg is not None:
+                dlg.sync_from_config()
+
+        if "smart_chunk_max_duration_sec" in changed:
+            cur = self._config.smart_chunk_max_duration_sec
+            for act in self._duration_menu.actions():
+                for dur_sec, display in self._duration_presets:
+                    if act.text() == display:
+                        _set_checked(act, dur_sec == cur)
+                        break
+
+        for field, action in (
+            ("silence_trim", self._act_silence_trim),
+            ("show_countdown", self._act_show_countdown),
+            ("paste_result", self._act_paste_result),
+            ("show_result_text", self._act_show_result_text),
+            ("mini_bar_show_timer", self._act_mini_bar_timer),
+            ("hide_mini_window_when_idle", self._act_hide_idle_mini),
+            ("save_audio", self._act_save_audio),
+        ):
+            if field in changed:
+                _set_checked(action, getattr(self._config, field))
+
+        if "autostart_enabled" in changed:
+            self._sync_autostart_state()
+
+        if "play_sounds" in changed:
+            self._audio.set_enabled(self._config.play_sounds)
+
+        if "api_key" in changed and self._faults is not None:
+            self._faults.sync_credential_from_config()
+
+        if "hotkey" in changed:
+            self._act_hotkey.setText(
+                f"快捷键: {_hotkey_display(self._config.hotkey)}"
+            )
+
+        if changed & {"mic_name", "mic_index"}:
+            self._dev_menu_dirty = True
+
+        if "tray_click_to_record" in changed:
+            try:
+                self.activated.disconnect(self._on_activated)
+            except TypeError:
+                pass
+            if self._config.tray_click_to_record:
+                self.activated.connect(self._on_activated)
 
     # ── tray interaction ──
 
@@ -876,11 +1016,7 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "processing":
             return
         if self._engine.state == "ready":
-            if not self._config.api_key:
-                self._configure_apikey()
-                return
-            if self._credential_fault:
-                self.show_api_key_invalid_notice()
+            if self._faults and self._faults.guard_recording_start():
                 return
             self._audio.play_start(source="tray_or_mini")
         elif self._engine.state == "recording":
@@ -890,17 +1026,13 @@ class VoiceTray(QSystemTrayIcon):
     def _on_upload_audio(self):
         if self._engine.state != "ready":
             return
-        if not self._config.api_key:
-            self._configure_apikey()
-            return
-        if self._credential_fault:
-            self.show_api_key_invalid_notice()
+        if self._faults and self._faults.guard_recording_start():
             return
         with self.hotkey_paused():
             path, _ = QFileDialog.getOpenFileName(
                 None,
                 "选择音频文件",
-                str(Config.history_dir()),
+                "",
                 "音频文件 (*.wav *.mp3 *.flac *.m4a *.ogg *.aac *.opus);;"
                 "WAV (*.wav);;所有文件 (*)",
             )
@@ -1061,11 +1193,7 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "processing":
             return
         if self._engine.state == "ready":
-            if not self._config.api_key:
-                self._configure_apikey()
-                return
-            if self._credential_fault:
-                self.show_api_key_invalid_notice()
+            if self._faults and self._faults.guard_recording_start():
                 return
             self._audio.play_start(source="hotkey")
             self._engine.toggle_record()
@@ -1108,8 +1236,8 @@ class VoiceTray(QSystemTrayIcon):
     def _on_state(self, state: str):
         if state != "recording":
             self._maybe_apply_deferred_input_device()
-        if state == "recording":
-            self._device_fault = False
+        if state == "ready" and self._config_sync is not None:
+            self._config_sync.flush_pending_reload()
         self._sync_tray_icon_with_engine()
         if state == "recording":
             self._act_record.setText("停止录音")
@@ -1168,41 +1296,28 @@ class VoiceTray(QSystemTrayIcon):
     ):
         self.showMessage(title, body, icon, milliseconds)
 
-    def show_api_error_notice(self, detail: str | None = None):
-        """Tray balloon for API failures. Uses provider text when given."""
-        from core.user_errors import single_line_preview
-
-        if detail and detail.strip():
-            body = single_line_preview(detail.strip())
-        else:
-            body = "API Key 不可用，请右键点击托盘图标重新配置"
-        self.showMessage(
-            "VoiceInput",
-            body,
-            QSystemTrayIcon.MessageIcon.Critical,
-            8000,
-        )
-
-    def show_api_key_invalid_notice(self):
-        self.show_api_error_notice(None)
+    def show_notification_spec(self, spec) -> None:
+        if self._notifier is not None:
+            self._notifier.show(spec)
+            return
+        icon = QSystemTrayIcon.MessageIcon.Information
+        if spec.severity.value == "error":
+            icon = QSystemTrayIcon.MessageIcon.Critical
+        elif spec.severity.value == "warning":
+            icon = QSystemTrayIcon.MessageIcon.Warning
+        self.showMessage(spec.title, spec.body, icon, spec.duration_ms)
 
     @property
     def engine(self) -> VoiceEngine:
         return self._engine
 
-    def set_credential_fault(self, active: bool) -> None:
-        self._credential_fault = active
-
-    def set_device_fault(self, active: bool) -> None:
-        self._device_fault = active
-
-    def set_key_warning(self, warning: bool) -> None:
-        """Backward-compatible alias for credential fault state."""
-        self.set_credential_fault(warning)
+    def _clear_device_fault(self) -> None:
+        if self._faults is not None:
+            self._faults.set_active(FaultKind.DEVICE, False, notify=False)
 
     @property
     def credential_fault(self) -> bool:
-        return self._credential_fault
+        return self._faults.credential_fault if self._faults is not None else False
 
     def refresh_idle_icon(self) -> None:
         self._restore_idle_icon()
@@ -1217,18 +1332,11 @@ class VoiceTray(QSystemTrayIcon):
         if self._update_status in ("downloading", "staging", "ready"):
             self._set_update_status(self._update_status)
             return
-        if self._credential_fault:
+        profile_state = self._faults.idle_icon_profile() if self._faults else None
+        if profile_state is not None:
+            _profile, tooltip = profile_state
             self.setIcon(icons.icon_key_invalid())
-            if not self._config.api_key:
-                self._update_tooltip("API Key 未配置，右键点击配置")
-            else:
-                self._update_tooltip("API Key 无效，右键点击配置")
-        elif self._engine.recorder.no_device:
-            self.setIcon(icons.icon_key_invalid())
-            self._update_tooltip("未找到输入设备")
-        elif self._device_fault:
-            self.setIcon(icons.icon_key_invalid())
-            self._update_tooltip("麦克风不可用，右键切换输入设备")
+            self._update_tooltip(tooltip)
         else:
             self.setIcon(icons.icon_idle())
             self._update_tooltip("就绪")
@@ -1245,13 +1353,9 @@ class VoiceTray(QSystemTrayIcon):
         os.startfile(str(_LOG_DIR))
 
     def _open_config_file(self):
-        from config import _config_path
-        path = _config_path()
-        if path.exists():
-            os.startfile(str(path))
-        else:
-            self._config.save()
-            os.startfile(str(path))
+        from ui.config_dialog import open_config_file
+
+        open_config_file(config=self._config)
 
     def _quit(self):
         logger.info("[Tray] Quit requested")

@@ -18,13 +18,26 @@ from core.log import logger
 from core.prompt_templates import default_prompt_templates
 from ui import icons
 from ui.dialog_styles import (
-    _DIALOG_PANEL_BG, _DIALOG_PANEL_BORDER,
-    _DIALOG_READONLY_BG, _DIALOG_READONLY_BORDER,
-    _DIALOG_BG, _DIALOG_FOCUS,
-    _DIALOG_TEXT, _DIALOG_TOOLTIP_BG,
-    _DIALOG_SB_HANDLE, _DIALOG_SB_HANDLE_HOVER,
-    _DIALOG_BTN_METRICS,
+    COLOR_TEXT_PRIMARY,
+    _DIALOG_BTN_ACTIVATE_OFF,
+    _DIALOG_BTN_ACTIVATE_ON,
+    _DIALOG_BTN_OUTLINE_DANGER,
+    _DIALOG_BTN_REVERT_INACTIVE,
+    _DIALOG_BTN_SAVE_CLEAN,
+    _DIALOG_BTN_SAVE_DIRTY,
+    _DIALOG_BTN_SECONDARY,
+    _DIALOG_INPUT_EDIT_QSS,
+    _DIALOG_INPUT_READONLY_QSS,
+    _DIALOG_LBL_FORM_HINT,
+    _DIALOG_LBL_FORM_MUTED,
+    _DIALOG_LBL_FORM_STAR,
+    _DIALOG_LIST_QSS,
+    _DIALOG_SPLITTER_QSS,
+    _DIALOG_TEXTEDIT_EDIT_QSS,
+    _DIALOG_TEXTEDIT_READONLY_QSS,
+    apply_dialog_chrome,
 )
+from ui.styled_message_box import apply_message_box_style
 
 _T_modal = TypeVar("_T_modal")
 
@@ -34,8 +47,10 @@ class _KeepWhiteTextDelegate(QStyledItemDelegate):
 
     def initStyleOption(self, option: QStyleOptionViewItem, index):
         super().initStyleOption(option, index)
-        option.palette.setColor(option.palette.ColorRole.Text, QColor("#fff"))
-        option.palette.setColor(option.palette.ColorRole.HighlightedText, QColor("#fff"))
+        option.palette.setColor(option.palette.ColorRole.Text, QColor(COLOR_TEXT_PRIMARY))
+        option.palette.setColor(
+            option.palette.ColorRole.HighlightedText, QColor(COLOR_TEXT_PRIMARY)
+        )
 
 
 class _DragReorderListWidget(QListWidget):
@@ -93,155 +108,6 @@ class _DragReorderListWidget(QListWidget):
 
 _DEFAULT_PROMPT_ID = "__default__"
 
-# ── QSS 调色板与组合样式（颜色单源；滚动条仅一处实现） ──
-_PROMPT_QSS_PANEL_BG = _DIALOG_PANEL_BG
-_PROMPT_QSS_PANEL_BORDER = _DIALOG_PANEL_BORDER
-_PROMPT_QSS_READONLY_BG = _DIALOG_READONLY_BG
-_PROMPT_QSS_READONLY_BORDER = _DIALOG_READONLY_BORDER
-_PROMPT_QSS_DIALOG_BG = _DIALOG_BG
-_PROMPT_QSS_SPLITTER_HANDLE = "#444"
-_PROMPT_QSS_SB_HANDLE = _DIALOG_SB_HANDLE
-_PROMPT_QSS_SB_HANDLE_HOVER = _DIALOG_SB_HANDLE_HOVER
-_PROMPT_QSS_FOCUS = _DIALOG_FOCUS
-_PROMPT_QSS_MSGBOX_FG = _DIALOG_TEXT
-_PROMPT_QSS_TOOLTIP_BG = _DIALOG_TOOLTIP_BG
-
-
-def _prompt_qss_scrollbar(widget_prefix: str, track_bg: str) -> str:
-    """列表/编辑区滚动条：轨道与面板同色，滑块统一灰阶；避免在多处复制 QSS。"""
-    h, hh = _PROMPT_QSS_SB_HANDLE, _PROMPT_QSS_SB_HANDLE_HOVER
-    return f"""
-    {widget_prefix} QScrollBar:vertical {{ background: {track_bg}; }}
-    {widget_prefix} QScrollBar::handle:vertical {{ background: {h}; }}
-    {widget_prefix} QScrollBar::handle:vertical:hover {{ background: {hh}; }}
-    {widget_prefix} QScrollBar:horizontal {{ background: {track_bg}; }}
-    {widget_prefix} QScrollBar::handle:horizontal {{ background: {h}; }}
-    {widget_prefix} QScrollBar::handle:horizontal:hover {{ background: {hh}; }}
-    """
-
-
-# 主对话框外壳（与二级 QMessageBox、列表面板样式表分离，避免互相套用）
-_PROMPT_DIALOG_CHROME_QSS = f"""
-    QDialog {{
-        background: {_PROMPT_QSS_DIALOG_BG};
-        color: #fff;
-        border: none;
-        border-radius: 0px;
-    }}
-    QToolTip {{
-        background-color: {_PROMPT_QSS_TOOLTIP_BG};
-        color: {_PROMPT_QSS_MSGBOX_FG};
-        border: 1px solid {_PROMPT_QSS_PANEL_BORDER};
-        padding: 6px 9px;
-        border-radius: 4px;
-        font-size: 12px;
-        max-width: 420px;
-    }}
-"""
-
-_INPUT_STYLE = f"""
-    QLineEdit {{
-        background: {_PROMPT_QSS_PANEL_BG};
-        color: #fff;
-        border: 1px solid {_PROMPT_QSS_PANEL_BORDER};
-        border-radius: 6px;
-        padding: 8px;
-        font-size: 13px;
-    }}
-    QLineEdit:focus {{ border: 1px solid {_PROMPT_QSS_FOCUS}; }}
-    QLineEdit:read-only {{ color: #999; }}
-"""
-_TEXTEDIT_STYLE = f"""
-    QTextEdit {{
-        background: {_PROMPT_QSS_PANEL_BG};
-        color: #fff;
-        border: 1px solid {_PROMPT_QSS_PANEL_BORDER};
-        border-radius: 6px;
-        padding: 8px;
-        font-size: 13px;
-    }}
-    QTextEdit:focus {{ border: 1px solid {_PROMPT_QSS_FOCUS}; }}
-""" + _prompt_qss_scrollbar("QTextEdit", _PROMPT_QSS_PANEL_BG)
-
-_TEXTEDIT_READONLY_STYLE = f"""
-    QTextEdit {{
-        background: {_PROMPT_QSS_READONLY_BG};
-        color: #999;
-        border: 1px solid {_PROMPT_QSS_READONLY_BORDER};
-        border-radius: 6px;
-        padding: 8px;
-        font-size: 13px;
-    }}
-""" + _prompt_qss_scrollbar("QTextEdit", _PROMPT_QSS_READONLY_BG)
-
-_INPUT_READONLY_STYLE = f"""
-    QLineEdit {{
-        background: {_PROMPT_QSS_READONLY_BG};
-        color: #999;
-        border: 1px solid {_PROMPT_QSS_READONLY_BORDER};
-        border-radius: 6px;
-        padding: 8px;
-        font-size: 13px;
-    }}
-"""
-_LIST_STYLE = f"""
-    QListWidget {{
-        background: {_PROMPT_QSS_PANEL_BG};
-        border: 1px solid {_PROMPT_QSS_PANEL_BORDER};
-        border-radius: 6px;
-        padding: 4px;
-        font-size: 13px;
-        color: #fff;
-        outline: none;
-    }}
-    QListWidget::item {{
-        padding: 8px 10px;
-        border-radius: 4px;
-        margin: 2px 0;
-        border: 1px solid transparent;
-        color: #fff;
-    }}
-    QListWidget::item:selected {{
-        background: transparent;
-        border: 1px solid {_PROMPT_QSS_FOCUS};
-        color: #fff;
-    }}
-    QListWidget::item:hover:!selected {{ background: #333; color: #fff; }}
-""" + _prompt_qss_scrollbar("QListWidget", _PROMPT_QSS_PANEL_BG)
-
-# 管理提示词按钮：统一尺寸；主色按钮用与底色同色的 1px 边框（勿用 border:none），否则比灰底按钮少 2px 高
-_PROMPT_QSS_BTN_METRICS = _DIALOG_BTN_METRICS
-
-_BTN = f"""
-    QPushButton {{ background:#333; color:#fff; border:1px solid #555;
-                  {_PROMPT_QSS_BTN_METRICS} }}
-    QPushButton:hover {{ background:#444; border-color:#666; }}
-    QPushButton:disabled {{ color:#555; border-color:#444; }}
-"""
-_BTN_DANGER = f"""
-    QPushButton {{ background:transparent; color:#ff6b60; border:1px solid #553030;
-                  {_PROMPT_QSS_BTN_METRICS} }}
-    QPushButton:hover {{ background:#3a1a1a; border-color:#ff3b30; }}
-    QPushButton:disabled {{ color:#553030; border-color:#444; }}
-"""
-_BTN_PRIMARY = f"""
-    QPushButton {{ background:{_PROMPT_QSS_FOCUS}; color:#fff; border:1px solid {_PROMPT_QSS_FOCUS};
-                  {_PROMPT_QSS_BTN_METRICS} }}
-    QPushButton:hover {{ background:#0066dd; border-color:#0066dd; }}
-"""
-# 二级 QMessageBox：背景与列表面板一致；按钮样式与主面板底栏相同（_BTN / _BTN_PRIMARY / _BTN_DANGER）
-_PROMPT_MSGBOX_STYLE = f"""
-    QMessageBox {{
-        background-color: {_PROMPT_QSS_PANEL_BG};
-        color: {_PROMPT_QSS_MSGBOX_FG};
-        border: 1px solid {_PROMPT_QSS_PANEL_BORDER};
-    }}
-    QMessageBox QLabel {{
-        color: {_PROMPT_QSS_MSGBOX_FG};
-        font-size: 13px;
-    }}
-"""
-
 
 class _PolishPromptDialog(QDialog):
     """Split-pane prompt manager.
@@ -254,32 +120,6 @@ class _PolishPromptDialog(QDialog):
     写回内存时只按 id 查找，绝不使用「行号 − 1」当下标，以免拖拽重排后错位。
     """
 
-    _BTN_SAVE_CLEAN = f"""
-        QPushButton {{ background:#333; color:#888; border:1px solid #555;
-                      {_PROMPT_QSS_BTN_METRICS} }}
-        QPushButton:hover {{ background:#444; color:#aaa; }}
-    """
-    _BTN_SAVE_DIRTY = f"""
-        QPushButton {{ background:{_PROMPT_QSS_FOCUS}; color:#fff; border:1px solid {_PROMPT_QSS_FOCUS};
-                      {_PROMPT_QSS_BTN_METRICS} }}
-        QPushButton:hover {{ background:#0066dd; border-color:#0066dd; }}
-    """
-    _BTN_ACTIVATE_ON = f"""
-        QPushButton {{ background:#0a5c2a; color:#4cdf90; border:1px solid #1a8040;
-                      {_PROMPT_QSS_BTN_METRICS} }}
-    """
-    _BTN_ACTIVATE_OFF = f"""
-        QPushButton {{ background:#333; color:#fff; border:1px solid #555;
-                      {_PROMPT_QSS_BTN_METRICS} }}
-        QPushButton:hover {{ background:#444; border-color:#666; }}
-    """
-    # 与 _BTN 同尺寸；用于「还原此项」不可用时的视觉灰化（保持 enabled 以便显示悬停提示）
-    _BTN_REVERT_INACTIVE = f"""
-        QPushButton {{ background:{_PROMPT_QSS_PANEL_BG}; color:#666; border:1px solid #444;
-                      {_PROMPT_QSS_BTN_METRICS} }}
-        QPushButton:hover {{ background:#333; color:#888; border-color:#555; }}
-    """
-
     def __init__(self, prompts: list, active_id: str, default_text: str = "",
                  config: Config | None = None, parent=None,
                  on_active_applied: Callable[[], None] | None = None,
@@ -290,7 +130,7 @@ class _PolishPromptDialog(QDialog):
         self.setWindowTitle("管理提示词")
         self.setWindowIcon(icons.app_icon())
         self.setMinimumSize(680, 420)
-        self.setStyleSheet(_PROMPT_DIALOG_CHROME_QSS)
+        apply_dialog_chrome(self)
 
         self._prompts: list[dict] = copy.deepcopy(prompts) if prompts else []
         self._active_id: str = active_id or ""
@@ -309,8 +149,7 @@ class _PolishPromptDialog(QDialog):
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setHandleWidth(1)
-        splitter.setStyleSheet(
-            f"QSplitter::handle {{ background:{_PROMPT_QSS_SPLITTER_HANDLE}; }}")
+        splitter.setStyleSheet(_DIALOG_SPLITTER_QSS)
 
         # ── left panel ──
         left = QWidget()
@@ -319,7 +158,7 @@ class _PolishPromptDialog(QDialog):
         left_lay.setSpacing(6)
 
         self._list = _DragReorderListWidget()
-        self._list.setStyleSheet(_LIST_STYLE)
+        self._list.setStyleSheet(_DIALOG_LIST_QSS)
         self._list.setItemDelegate(_KeepWhiteTextDelegate(self._list))
         self._list.orderChanged.connect(self._on_list_order_swapped)
         left_lay.addWidget(self._list)
@@ -329,17 +168,17 @@ class _PolishPromptDialog(QDialog):
         left_btns.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         btn_add = QPushButton("+ 新增")
         btn_add.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_add.setStyleSheet(_BTN)
+        btn_add.setStyleSheet(_DIALOG_BTN_SECONDARY)
         btn_add.clicked.connect(self._add_item)
         left_btns.addWidget(btn_add)
         self._btn_duplicate = QPushButton("复制")
         self._btn_duplicate.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_duplicate.setStyleSheet(_BTN)
+        self._btn_duplicate.setStyleSheet(_DIALOG_BTN_SECONDARY)
         self._btn_duplicate.clicked.connect(self._duplicate_item)
         left_btns.addWidget(self._btn_duplicate)
         self._btn_delete = QPushButton("删除")
         self._btn_delete.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_delete.setStyleSheet(_BTN_DANGER)
+        self._btn_delete.setStyleSheet(_DIALOG_BTN_OUTLINE_DANGER)
         self._btn_delete.clicked.connect(self._delete_item)
         left_btns.addWidget(self._btn_delete)
         left_btns.addStretch()
@@ -353,18 +192,14 @@ class _PolishPromptDialog(QDialog):
         right_lay.setContentsMargins(4, 0, 0, 0)
         right_lay.setSpacing(8)
 
-        _LBL_MUTED = "font-size:12px; color:#aaa;"
-        _LBL_STAR = "font-size:12px; color:#ff9f0a; padding:0 1px;"
-        _LBL_HINT = "font-size:12px; color:#ff9f0a; padding:0 2px;"
-
         top_row = QHBoxLayout()
         top_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         name_title = QHBoxLayout()
         name_title.setSpacing(0)
         self._lbl_name_text = QLabel("名称")
-        self._lbl_name_text.setStyleSheet(_LBL_MUTED)
+        self._lbl_name_text.setStyleSheet(_DIALOG_LBL_FORM_MUTED)
         self._lbl_name_star = QLabel("")
-        self._lbl_name_star.setStyleSheet(_LBL_STAR)
+        self._lbl_name_star.setStyleSheet(_DIALOG_LBL_FORM_STAR)
         self._lbl_name_star.setVisible(False)
         name_title.addWidget(self._lbl_name_text)
         name_title.addWidget(self._lbl_name_star)
@@ -372,36 +207,36 @@ class _PolishPromptDialog(QDialog):
         top_row.addStretch()
         self._btn_revert_row = QPushButton("还原此项")
         self._btn_revert_row.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_revert_row.setStyleSheet(self._BTN_REVERT_INACTIVE)
+        self._btn_revert_row.setStyleSheet(_DIALOG_BTN_REVERT_INACTIVE)
         self._btn_revert_row.setToolTip("将本条名称与内容恢复为已保存的磁盘版本")
         self._btn_revert_row.clicked.connect(self._revert_current_row_from_disk)
         top_row.addWidget(self._btn_revert_row)
         self._btn_activate = QPushButton("设为当前")
         self._btn_activate.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_activate.setStyleSheet(self._BTN_ACTIVATE_OFF)
+        self._btn_activate.setStyleSheet(_DIALOG_BTN_ACTIVATE_OFF)
         self._btn_activate.clicked.connect(self._activate_selected)
         top_row.addWidget(self._btn_activate)
         right_lay.addLayout(top_row)
 
         self._name_input = QLineEdit()
         self._name_input.setPlaceholderText("例：学术论文风格")
-        self._name_input.setStyleSheet(_INPUT_STYLE)
+        self._name_input.setStyleSheet(_DIALOG_INPUT_EDIT_QSS)
         right_lay.addWidget(self._name_input)
 
         content_row = QHBoxLayout()
         content_title = QHBoxLayout()
         content_title.setSpacing(0)
         self._lbl_content_text = QLabel("提示词内容")
-        self._lbl_content_text.setStyleSheet(_LBL_MUTED)
+        self._lbl_content_text.setStyleSheet(_DIALOG_LBL_FORM_MUTED)
         self._lbl_content_star = QLabel("")
-        self._lbl_content_star.setStyleSheet(_LBL_STAR)
+        self._lbl_content_star.setStyleSheet(_DIALOG_LBL_FORM_STAR)
         self._lbl_content_star.setVisible(False)
         content_title.addWidget(self._lbl_content_text)
         content_title.addWidget(self._lbl_content_star)
         content_row.addLayout(content_title)
         content_row.addStretch()
         self._lbl_row_unsaved = QLabel("")
-        self._lbl_row_unsaved.setStyleSheet(_LBL_HINT)
+        self._lbl_row_unsaved.setStyleSheet(_DIALOG_LBL_FORM_HINT)
         self._lbl_row_unsaved.setVisible(False)
         self._lbl_row_unsaved.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -410,7 +245,7 @@ class _PolishPromptDialog(QDialog):
 
         self._content_edit = QTextEdit()
         self._content_edit.setPlaceholderText("输入润色提示词内容…")
-        self._content_edit.setStyleSheet(_TEXTEDIT_STYLE)
+        self._content_edit.setStyleSheet(_DIALOG_TEXTEDIT_EDIT_QSS)
         right_lay.addWidget(self._content_edit)
 
         right_btns = QHBoxLayout()
@@ -418,25 +253,25 @@ class _PolishPromptDialog(QDialog):
         right_btns.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self._btn_restore_factory = QPushButton("恢复默认模板")
         self._btn_restore_factory.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_restore_factory.setStyleSheet(_BTN)
+        self._btn_restore_factory.setStyleSheet(_DIALOG_BTN_SECONDARY)
         self._btn_restore_factory.clicked.connect(self._restore_factory_defaults)
         right_btns.addWidget(self._btn_restore_factory)
         right_btns.addStretch()
         self._btn_revert_all = QPushButton("全部还原")
         self._btn_revert_all.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_revert_all.setStyleSheet(self._BTN_REVERT_INACTIVE)
+        self._btn_revert_all.setStyleSheet(_DIALOG_BTN_REVERT_INACTIVE)
         self._btn_revert_all.setToolTip(
             "将全部提示词列表恢复为最后一次保存的磁盘版本（丢弃未保存修改）")
         self._btn_revert_all.clicked.connect(self._revert_all_from_disk)
         right_btns.addWidget(self._btn_revert_all)
         self._btn_save = QPushButton("保存")
         self._btn_save.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_save.setStyleSheet(self._BTN_SAVE_CLEAN)
+        self._btn_save.setStyleSheet(_DIALOG_BTN_SAVE_CLEAN)
         self._btn_save.clicked.connect(self._do_save)
         right_btns.addWidget(self._btn_save)
         btn_close = QPushButton("关闭")
         btn_close.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_close.setStyleSheet(_BTN)
+        btn_close.setStyleSheet(_DIALOG_BTN_SECONDARY)
         btn_close.clicked.connect(self.close)
         right_btns.addWidget(btn_close)
         right_lay.addLayout(right_btns)
@@ -582,42 +417,42 @@ class _PolishPromptDialog(QDialog):
         保持 QPushButton 为 enabled，用样式区分可点/灰显。调用方须已 flush。"""
         row = self._last_row
         if self._config_ref is None or row < 0:
-            self._btn_revert_row.setStyleSheet(self._BTN_REVERT_INACTIVE)
+            self._btn_revert_row.setStyleSheet(_DIALOG_BTN_REVERT_INACTIVE)
             return
         if self._is_default_row(row):
-            self._btn_revert_row.setStyleSheet(self._BTN_REVERT_INACTIVE)
+            self._btn_revert_row.setStyleSheet(_DIALOG_BTN_REVERT_INACTIVE)
             return
         pid = self._selected_prompt_id(row)
         if not pid:
-            self._btn_revert_row.setStyleSheet(self._BTN_REVERT_INACTIVE)
+            self._btn_revert_row.setStyleSheet(_DIALOG_BTN_REVERT_INACTIVE)
             return
         d = self._disk_custom_entry(pid)
         if d is None:
-            self._btn_revert_row.setStyleSheet(self._BTN_REVERT_INACTIVE)
+            self._btn_revert_row.setStyleSheet(_DIALOG_BTN_REVERT_INACTIVE)
             return
         if self._is_custom_entry_unsaved(pid):
-            self._btn_revert_row.setStyleSheet(_BTN)
+            self._btn_revert_row.setStyleSheet(_DIALOG_BTN_SECONDARY)
         else:
-            self._btn_revert_row.setStyleSheet(self._BTN_REVERT_INACTIVE)
+            self._btn_revert_row.setStyleSheet(_DIALOG_BTN_REVERT_INACTIVE)
 
     def _update_save_button(self):
         if self._prompt_data_differs_from_disk():
-            self._btn_save.setStyleSheet(self._BTN_SAVE_DIRTY)
+            self._btn_save.setStyleSheet(_DIALOG_BTN_SAVE_DIRTY)
             self._btn_save.setText("● 保存")
         else:
-            self._btn_save.setStyleSheet(self._BTN_SAVE_CLEAN)
+            self._btn_save.setStyleSheet(_DIALOG_BTN_SAVE_CLEAN)
             self._btn_save.setText("保存")
         self._update_revert_all_button()
 
     def _update_revert_all_button(self):
         """「全部还原」：有磁盘快照且与内存不一致时可点，与「保存」脏状态一致。"""
         if self._config_ref is None:
-            self._btn_revert_all.setStyleSheet(self._BTN_REVERT_INACTIVE)
+            self._btn_revert_all.setStyleSheet(_DIALOG_BTN_REVERT_INACTIVE)
             return
         if self._prompt_data_differs_from_disk():
-            self._btn_revert_all.setStyleSheet(_BTN)
+            self._btn_revert_all.setStyleSheet(_DIALOG_BTN_SECONDARY)
         else:
-            self._btn_revert_all.setStyleSheet(self._BTN_REVERT_INACTIVE)
+            self._btn_revert_all.setStyleSheet(_DIALOG_BTN_REVERT_INACTIVE)
 
     def sync_from_config(self) -> None:
         """托盘等处已更新 config 时，将对话框与磁盘状态对齐。"""
@@ -724,8 +559,8 @@ class _PolishPromptDialog(QDialog):
             self._content_edit.setPlainText(self._default_text)
             self._name_input.setReadOnly(True)
             self._content_edit.setReadOnly(True)
-            self._name_input.setStyleSheet(_INPUT_READONLY_STYLE)
-            self._content_edit.setStyleSheet(_TEXTEDIT_READONLY_STYLE)
+            self._name_input.setStyleSheet(_DIALOG_INPUT_READONLY_QSS)
+            self._content_edit.setStyleSheet(_DIALOG_TEXTEDIT_READONLY_QSS)
         else:
             pid = self._selected_prompt_id(row)
             self._editing_prompt_id = pid or ""
@@ -735,8 +570,8 @@ class _PolishPromptDialog(QDialog):
                 self._content_edit.setPlainText(p.get("content", ""))
             self._name_input.setReadOnly(False)
             self._content_edit.setReadOnly(False)
-            self._name_input.setStyleSheet(_INPUT_STYLE)
-            self._content_edit.setStyleSheet(_TEXTEDIT_STYLE)
+            self._name_input.setStyleSheet(_DIALOG_INPUT_EDIT_QSS)
+            self._content_edit.setStyleSheet(_DIALOG_TEXTEDIT_EDIT_QSS)
         self._btn_delete.setEnabled(not is_default)
         self._btn_duplicate.setEnabled(not is_default)
         self._update_activate_button(row)
@@ -751,11 +586,11 @@ class _PolishPromptDialog(QDialog):
                          (not is_default and pid == self._active_id)
         if already_active:
             self._btn_activate.setText("✓ 当前使用中")
-            self._btn_activate.setStyleSheet(self._BTN_ACTIVATE_ON)
+            self._btn_activate.setStyleSheet(_DIALOG_BTN_ACTIVATE_ON)
             self._btn_activate.setEnabled(False)
         else:
             self._btn_activate.setText("设为当前")
-            self._btn_activate.setStyleSheet(self._BTN_ACTIVATE_OFF)
+            self._btn_activate.setStyleSheet(_DIALOG_BTN_ACTIVATE_OFF)
             self._btn_activate.setEnabled(True)
 
     def _flush_editing_prompt(self) -> None:
@@ -826,9 +661,7 @@ class _PolishPromptDialog(QDialog):
                 btn_save = box.addButton("保存并设为当前", QMessageBox.ButtonRole.AcceptRole)
                 btn_cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
                 box.setDefaultButton(btn_save)
-                box.setStyleSheet(_PROMPT_MSGBOX_STYLE)
-                btn_save.setStyleSheet(_BTN_PRIMARY)
-                btn_cancel.setStyleSheet(_BTN)
+                apply_message_box_style(box)
                 box.exec()
                 return box.clickedButton() is btn_save
 
@@ -966,12 +799,10 @@ class _PolishPromptDialog(QDialog):
             box.setWindowTitle("全部还原")
             box.setText("将放弃本次全部更改，是否继续？")
             box.setIcon(QMessageBox.Icon.Warning)
-            btn_yes = box.addButton("是", QMessageBox.ButtonRole.AcceptRole)
+            btn_yes = box.addButton("是", QMessageBox.ButtonRole.DestructiveRole)
             btn_no = box.addButton("否", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(btn_no)
-            box.setStyleSheet(_PROMPT_MSGBOX_STYLE)
-            btn_yes.setStyleSheet(_BTN_DANGER)
-            btn_no.setStyleSheet(_BTN)
+            apply_message_box_style(box, destructive="outline")
             box.exec()
             return box.clickedButton() is btn_yes
 
@@ -991,12 +822,10 @@ class _PolishPromptDialog(QDialog):
             box.setText(
                 "将提示词列表恢复为默认模板，当前编辑将丢失。是否继续？")
             box.setIcon(QMessageBox.Icon.Warning)
-            btn_yes = box.addButton("是", QMessageBox.ButtonRole.AcceptRole)
+            btn_yes = box.addButton("是", QMessageBox.ButtonRole.DestructiveRole)
             btn_no = box.addButton("否", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(btn_no)
-            box.setStyleSheet(_PROMPT_MSGBOX_STYLE)
-            btn_yes.setStyleSheet(_BTN_DANGER)
-            btn_no.setStyleSheet(_BTN)
+            apply_message_box_style(box, destructive="outline")
             box.exec()
             return box.clickedButton() is btn_yes
 
@@ -1042,10 +871,7 @@ class _PolishPromptDialog(QDialog):
                 btn_discard = box.addButton("不保存", QMessageBox.ButtonRole.DestructiveRole)
                 btn_cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
                 box.setDefaultButton(btn_save)
-                box.setStyleSheet(_PROMPT_MSGBOX_STYLE)
-                btn_save.setStyleSheet(_BTN_PRIMARY)
-                btn_discard.setStyleSheet(_BTN_DANGER)
-                btn_cancel.setStyleSheet(_BTN)
+                apply_message_box_style(box, destructive="outline")
                 box.exec()
                 clicked = box.clickedButton()
                 if clicked is btn_save:

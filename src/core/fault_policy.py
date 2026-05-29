@@ -2,19 +2,21 @@
 Per-fault-kind presentation policy (no Qt dependencies).
 
 Consumed only by :mod:`ui.fault_coordinator`. Edit this table to change UX
-without touching tray or engine code. See ``docs/fault-handling.md``.
+without touching tray or engine code.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from core.faults import FaultKind
+from core.notification_spec import NotificationSeverity
 
 
 class TrayIconProfile(Enum):
     NONE = auto()
     CREDENTIAL = auto()
+    CONFIG = auto()
     DEVICE = auto()
 
 
@@ -23,84 +25,77 @@ class BalloonMode(Enum):
     GENERIC_KEY = auto()
     MESSAGE = auto()
     PREFIX_MESSAGE = auto()
+    STATIC = auto()
 
 
 @dataclass(frozen=True)
 class FaultPolicy:
-    persist_credential_fault: bool
-    persist_device_fault: bool
-    clear_credential_fault: bool
-    tray_icon_profile: TrayIconProfile
-    balloon_mode: BalloonMode
-    block_hotkey_when_ready: bool
-    balloon_cooldown_sec: float
+    """How to react when a fault event of the matching kind is dispatched."""
+
+    activate_self: bool = False
+    clears: frozenset[FaultKind] = field(default_factory=frozenset)
+    tray_icon_profile: TrayIconProfile = TrayIconProfile.NONE
+    balloon_mode: BalloonMode = BalloonMode.NONE
+    block_recording_start: bool = False
+    balloon_cooldown_sec: float = 0.0
+    balloon_message: str | None = None
+    icon_tooltip: str | None = None
     log_suppressed_as_info: bool = False
+    notification_severity: NotificationSeverity | None = None
+    notification_duration_ms: int | None = None
 
 
 FAULT_POLICIES: dict[FaultKind, FaultPolicy] = {
     FaultKind.CREDENTIAL: FaultPolicy(
-        persist_credential_fault=True,
-        persist_device_fault=False,
-        clear_credential_fault=False,
+        activate_self=True,
         tray_icon_profile=TrayIconProfile.CREDENTIAL,
         balloon_mode=BalloonMode.GENERIC_KEY,
-        block_hotkey_when_ready=True,
+        block_recording_start=True,
         balloon_cooldown_sec=12.0,
     ),
+    FaultKind.CONFIG_DISK: FaultPolicy(
+        activate_self=True,
+        tray_icon_profile=TrayIconProfile.CONFIG,
+        balloon_mode=BalloonMode.NONE,
+        block_recording_start=True,
+        icon_tooltip="配置文件异常，请修复后使用",
+    ),
+    FaultKind.CONFIG_BUSY: FaultPolicy(
+        balloon_mode=BalloonMode.STATIC,
+        block_recording_start=True,
+        balloon_cooldown_sec=1.5,
+        balloon_message="正在更新配置，请稍后再试",
+        notification_severity=NotificationSeverity.INFO,
+        notification_duration_ms=1500,
+    ),
     FaultKind.API_REMOTE: FaultPolicy(
-        persist_credential_fault=False,
-        persist_device_fault=False,
-        clear_credential_fault=True,
-        tray_icon_profile=TrayIconProfile.NONE,
+        clears=frozenset({FaultKind.CREDENTIAL}),
         balloon_mode=BalloonMode.MESSAGE,
-        block_hotkey_when_ready=False,
         balloon_cooldown_sec=12.0,
     ),
     FaultKind.CAPTURE: FaultPolicy(
-        persist_credential_fault=False,
-        persist_device_fault=False,
-        clear_credential_fault=False,
-        tray_icon_profile=TrayIconProfile.NONE,
         balloon_mode=BalloonMode.PREFIX_MESSAGE,
-        block_hotkey_when_ready=False,
-        balloon_cooldown_sec=0.0,
     ),
     FaultKind.SPEECH_EMPTY: FaultPolicy(
-        persist_credential_fault=False,
-        persist_device_fault=False,
-        clear_credential_fault=False,
-        tray_icon_profile=TrayIconProfile.NONE,
-        balloon_mode=BalloonMode.NONE,
-        block_hotkey_when_ready=False,
-        balloon_cooldown_sec=0.0,
         log_suppressed_as_info=True,
     ),
     FaultKind.SPEECH_SILENT: FaultPolicy(
-        persist_credential_fault=False,
-        persist_device_fault=False,
-        clear_credential_fault=False,
-        tray_icon_profile=TrayIconProfile.NONE,
-        balloon_mode=BalloonMode.NONE,
-        block_hotkey_when_ready=False,
-        balloon_cooldown_sec=0.0,
         log_suppressed_as_info=True,
     ),
     FaultKind.DEVICE: FaultPolicy(
-        persist_credential_fault=False,
-        persist_device_fault=True,
-        clear_credential_fault=False,
+        activate_self=True,
         tray_icon_profile=TrayIconProfile.DEVICE,
         balloon_mode=BalloonMode.MESSAGE,
-        block_hotkey_when_ready=False,
-        balloon_cooldown_sec=0.0,
+        icon_tooltip="麦克风不可用，右键切换输入设备",
     ),
     FaultKind.GENERAL: FaultPolicy(
-        persist_credential_fault=False,
-        persist_device_fault=False,
-        clear_credential_fault=False,
-        tray_icon_profile=TrayIconProfile.NONE,
         balloon_mode=BalloonMode.PREFIX_MESSAGE,
-        block_hotkey_when_ready=False,
-        balloon_cooldown_sec=0.0,
     ),
 }
+
+# Highest priority first when choosing idle tray icon / tooltip.
+FAULT_ICON_PRIORITY: tuple[FaultKind, ...] = (
+    FaultKind.CONFIG_DISK,
+    FaultKind.CREDENTIAL,
+    FaultKind.DEVICE,
+)

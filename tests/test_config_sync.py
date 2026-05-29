@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from config import Config, _config_path  # noqa: E402
-from core.config_sync import ConfigSync, _SUPPRESS_AFTER_WRITE_MS  # noqa: E402
+from core.config_sync import ConfigSync, _CORRUPT_RETRY_COUNT, _SUPPRESS_AFTER_WRITE_MS  # noqa: E402
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -73,6 +73,19 @@ class ConfigSyncTests(unittest.TestCase):
         sync._request_external_reload("test")
         self.assertEqual(cfg.polish_model, "qwen3-max")
         self.assertFalse(sync.has_pending_reload)
+
+    def test_runtime_reload_persists_missing_fields(self):
+        cfg, sync, path = self._setup()
+        _write_json(path, {"mode": "raw"})
+
+        sync._request_external_reload("test")
+
+        self.assertEqual(cfg.mode, "raw")
+        self.assertEqual(cfg.hotkey, Config().hotkey)
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(disk["mode"], "raw")
+        self.assertIn("hotkey", disk)
+        self.assertEqual(disk["hotkey"], Config().hotkey)
 
     def test_external_reload_queued_when_busy(self):
         cfg, sync, path = self._setup(idle=False)
@@ -234,6 +247,36 @@ class ConfigSyncTests(unittest.TestCase):
                         "_pending_reload cleared by debounce after _write_touched_only")
 
         self.assertEqual(cfg.polish_model, "qwen3.6-flash")
+
+    def test_corrupt_disk_emits_fault_and_keeps_memory(self):
+        cfg, sync, path = self._setup()
+        faults: list[bool] = []
+        sync.config_disk_fault.connect(lambda: faults.append(True))
+        sync._corrupt_retries = _CORRUPT_RETRY_COUNT
+
+        path.write_text("", encoding="utf-8")
+        sync._request_external_reload("test")
+
+        self.assertEqual(faults, [True])
+        self.assertTrue(sync.disk_fault_active)
+        self.assertEqual(cfg.polish_model, "qwen3.6-flash")
+
+    def test_corrupt_disk_recovery_clears_fault(self):
+        cfg, sync, path = self._setup()
+        sync._corrupt_retries = _CORRUPT_RETRY_COUNT
+        path.write_text("", encoding="utf-8")
+        sync._request_external_reload("test")
+        self.assertTrue(sync.disk_fault_active)
+
+        recovered: list[bool] = []
+        sync.config_disk_recovered.connect(lambda: recovered.append(True))
+        disk = _base_config(polish_model="qwen3-max")
+        _write_json(path, disk)
+        sync._request_external_reload("test")
+
+        self.assertEqual(recovered, [True])
+        self.assertFalse(sync.disk_fault_active)
+        self.assertEqual(cfg.polish_model, "qwen3-max")
 
     def test_debounce_after_idle_merge_clears_pending(self):
         """After an idle merge already synced memory, a stale debounce should clear pending."""

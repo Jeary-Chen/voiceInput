@@ -8,10 +8,14 @@ from PyQt6.QtWidgets import (
 from core.updater import UpdateInfo
 from ui import icons
 from ui.dialog_styles import (
-    _DIALOG_CHROME_QSS,
-    _DIALOG_TITLE_QSS, _DIALOG_SUBTITLE_QSS, _DIALOG_META_QSS,
-    _DIALOG_HINT_QSS, _DIALOG_TEXTEDIT_QSS,
-    _DIALOG_BTN_SECONDARY, _DIALOG_BTN_PRIMARY,
+    _DIALOG_BTN_SECONDARY,
+    _DIALOG_BTN_PRIMARY,
+    _DIALOG_HINT_QSS,
+    _DIALOG_TEXTEDIT_QSS,
+    _DIALOG_TITLE_QSS,
+    _DIALOG_SUBTITLE_QSS,
+    _DIALOG_META_QSS,
+    apply_dialog_chrome,
 )
 
 
@@ -47,7 +51,7 @@ class _UpdateNotesDialog(QDialog):
         self.setWindowTitle(f"发现新版本 v{info.version}")
         self.setWindowIcon(icons.app_icon())
         self.setFixedSize(560, 520)
-        self.setStyleSheet(_DIALOG_CHROME_QSS)
+        apply_dialog_chrome(self)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -116,7 +120,7 @@ class _UpdateReadyDialog(QDialog):
         self.setWindowTitle("更新已准备好")
         self.setWindowIcon(icons.app_icon())
         self.setFixedSize(420, 180)
-        self.setStyleSheet(_DIALOG_CHROME_QSS)
+        apply_dialog_chrome(self)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)

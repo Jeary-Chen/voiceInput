@@ -32,6 +32,8 @@ _CREDENTIAL_DETAIL_HINTS = (
 
 class FaultKind(Enum):
     CREDENTIAL = auto()
+    CONFIG_DISK = auto()
+    CONFIG_BUSY = auto()
     API_REMOTE = auto()
     CAPTURE = auto()
     SPEECH_EMPTY = auto()
@@ -43,6 +45,7 @@ class FaultKind(Enum):
 class FaultSource(Enum):
     ENGINE = auto()
     MIC = auto()
+    CONFIG = auto()
 
 
 @dataclass(frozen=True)
@@ -159,3 +162,7 @@ def single_line_preview(text: str, max_len: int = 320) -> str:
     if len(line) > max_len:
         return line[: max_len - 1] + "…"
     return line
+
+
+class ConfigDiskFault(Exception):
+    """Raised when config.json on disk is unreadable and a write was attempted."""

@@ -14,6 +14,18 @@ from PyQt6.QtWidgets import (
 
 from core.log import logger
 from ui import icons
+from ui.dialog_styles import (
+    _DIALOG_BTN_GHOST,
+    _DIALOG_BTN_PRIMARY,
+    _DIALOG_HINT_QSS,
+    _DIALOG_HOTKEY_CAPTURE_DEFAULT,
+    _DIALOG_HOTKEY_CAPTURE_ERR,
+    _DIALOG_HOTKEY_CAPTURE_OK,
+    _DIALOG_STATUS_ERROR,
+    _DIALOG_STATUS_ERROR_STRONG,
+    _DIALOG_STATUS_SUCCESS,
+    apply_dialog_chrome,
+)
 
 
 _MOD_KEYS = frozenset({
@@ -405,25 +417,12 @@ def _test_system_conflict(combo: str) -> bool | None:
 class _HotkeyDialog(QDialog):
     """Captures a key/mouse combo — order-independent, with conflict check."""
 
-    _STYLE_DEFAULT = """
-        background:#2a2a2a; color:#fff; border:1px solid #555;
-        border-radius:8px; font-size:18px; font-weight:bold;
-    """
-    _STYLE_OK = """
-        background:#1a3a1a; color:#34c759; border:1px solid #34c759;
-        border-radius:8px; font-size:18px; font-weight:bold;
-    """
-    _STYLE_ERR = """
-        background:#3a1a1a; color:#ff3b30; border:1px solid #ff3b30;
-        border-radius:8px; font-size:18px; font-weight:bold;
-    """
-
     def __init__(self, current: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置快捷键")
         self.setWindowIcon(icons.app_icon())
         self.setFixedSize(360, 180)
-        self.setStyleSheet("background:#1e1e1e; color:#fff;")
+        apply_dialog_chrome(self)
         self._current = _canonical(current.split("+"))
         self._result: str | None = None
         self._captured: str | None = None
@@ -441,18 +440,17 @@ class _HotkeyDialog(QDialog):
         layout.setSpacing(10)
 
         hint = QLabel("按下新的快捷键或快捷键组合：")
-        hint.setStyleSheet("font-size:13px;")
         layout.addWidget(hint)
 
         self._key_display = QLabel(_hotkey_display(self._current))
         self._key_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._key_display.setFixedHeight(44)
-        self._key_display.setStyleSheet(self._STYLE_DEFAULT)
+        self._key_display.setStyleSheet(_DIALOG_HOTKEY_CAPTURE_DEFAULT)
         layout.addWidget(self._key_display)
 
         self._status = QLabel("")
         self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._status.setStyleSheet("font-size:12px; color:#999;")
+        self._status.setStyleSheet(_DIALOG_HINT_QSS)
         layout.addWidget(self._status)
 
         btn_row = QHBoxLayout()
@@ -461,22 +459,13 @@ class _HotkeyDialog(QDialog):
         self._btn_ok.setFixedWidth(80)
         self._btn_ok.setEnabled(False)
         self._btn_ok.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_ok.setStyleSheet("""
-            QPushButton { background:#007aff; color:#fff; border:none;
-                          border-radius:6px; padding:6px 14px; font-size:13px; }
-            QPushButton:hover { background:#0066dd; }
-            QPushButton:disabled { background:#333; color:#666; }
-        """)
+        self._btn_ok.setStyleSheet(_DIALOG_BTN_PRIMARY)
         self._btn_ok.clicked.connect(self._do_accept)
         btn_row.addWidget(self._btn_ok)
         btn_cancel = QPushButton("取消")
         btn_cancel.setFixedWidth(80)
         btn_cancel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_cancel.setStyleSheet("""
-            QPushButton { background:transparent; color:#999; border:1px solid #444;
-                          border-radius:6px; padding:6px 14px; font-size:13px; }
-            QPushButton:hover { background:#2a2a2a; color:#fff; }
-        """)
+        btn_cancel.setStyleSheet(_DIALOG_BTN_GHOST)
         btn_cancel.clicked.connect(self.reject)
         btn_row.addWidget(btn_cancel)
         layout.addLayout(btn_row)
@@ -651,8 +640,9 @@ class _HotkeyDialog(QDialog):
         if self._best:
             combo = _canonical(self._best)
             self._key_display.setText(_hotkey_display(combo))
-            self._key_display.setStyleSheet(self._STYLE_DEFAULT)
+            self._key_display.setStyleSheet(_DIALOG_HOTKEY_CAPTURE_DEFAULT)
             self._status.setText("")
+            self._status.setStyleSheet(_DIALOG_HINT_QSS)
             self._btn_ok.setEnabled(False)
             self._available = False
 
@@ -671,30 +661,30 @@ class _HotkeyDialog(QDialog):
             p = parts[0]
             is_fkey = p.startswith("f") and p[1:].isdigit()
             if not (p in _MOD_KEYS or is_fkey or p.startswith("mouse_")):
-                self._key_display.setStyleSheet(self._STYLE_ERR)
+                self._key_display.setStyleSheet(_DIALOG_HOTKEY_CAPTURE_ERR)
                 self._status.setText("不允许使用单个常用按键，请搭配其他键使用。")
-                self._status.setStyleSheet("font-size:12px; color:#ff6b60;")
+                self._status.setStyleSheet(_DIALOG_STATUS_ERROR)
                 self._btn_ok.setEnabled(False)
                 return
 
         if combo == self._current:
             self._status.setText("与当前快捷键相同")
-            self._status.setStyleSheet("font-size:12px; color:#999;")
+            self._status.setStyleSheet(_DIALOG_HINT_QSS)
             self._btn_ok.setEnabled(False)
             return
 
         conflict = _test_system_conflict(combo)
         if conflict is False:
-            self._key_display.setStyleSheet(self._STYLE_ERR)
+            self._key_display.setStyleSheet(_DIALOG_HOTKEY_CAPTURE_ERR)
             self._status.setText("✕ 已被系统或其他程序占用")
-            self._status.setStyleSheet("font-size:12px; color:#ff3b30;")
+            self._status.setStyleSheet(_DIALOG_STATUS_ERROR_STRONG)
             self._btn_ok.setEnabled(False)
             self._available = False
             return
 
-        self._key_display.setStyleSheet(self._STYLE_OK)
+        self._key_display.setStyleSheet(_DIALOG_HOTKEY_CAPTURE_OK)
         self._status.setText("✓ 快捷键可用")
-        self._status.setStyleSheet("font-size:12px; color:#34c759;")
+        self._status.setStyleSheet(_DIALOG_STATUS_SUCCESS)
         self._btn_ok.setEnabled(True)
         self._available = True
 

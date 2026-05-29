@@ -18,14 +18,15 @@ from PyQt6.QtCore import Qt, QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
-from config import Config
 from core.config_sync import ConfigSync
 from core.log import logger, install_qt_handler
 from core.engine import VoiceEngine
 from ui import icons
+from ui.config_dialog import ConfigFaultHandler, load_config_at_startup
 from ui.mini_window import MiniRecordingWindow
 from ui.tray import VoiceTray
 from ui.fault_coordinator import FaultCoordinator
+from ui.notifier import Notifier
 
 _APP_KEY = "VoiceInput_SingleInstance_Lock"
 _APP_MUTEX_NAME = "VoiceInput_InstallAware_Mutex"
@@ -126,14 +127,18 @@ def _start_shutdown_watcher(quit_fn):
 def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    app.setApplicationName("VoiceInput")
-    app.setWindowIcon(icons.app_icon())
     install_qt_handler()
-    logger.info(f"[Runtime] {_runtime_summary()}")
 
     if _is_already_running():
         logger.warning("VoiceInput is already running, exiting.")
         sys.exit(0)
+
+    # Config must be validated before any application icon or tray UI appears.
+    config = load_config_at_startup()
+
+    app.setApplicationName("VoiceInput")
+    app.setWindowIcon(icons.app_icon())
+    logger.info(f"[Runtime] {_runtime_summary()}")
 
     server = QLocalServer()
     server.removeServer(_APP_KEY)
@@ -143,7 +148,6 @@ def main():
     app.aboutToQuit.connect(_release_app_mutex)
     app.aboutToQuit.connect(_release_shutdown_event)
 
-    config = Config.load()
     config_sync = ConfigSync(config)
     app.aboutToQuit.connect(config_sync.stop)
 
@@ -155,16 +159,25 @@ def main():
     engine = VoiceEngine(config)
     mini = MiniRecordingWindow(engine)
     tray = VoiceTray(engine, mini, config, config_sync)
+    notifier = Notifier(tray, parent=app)
+    tray.set_notifier(notifier)
     config_sync.config_reloaded.connect(tray.on_config_reloaded)
     config_sync.bind_idle_checker(tray.is_idle_for_config_reload)
-    config_sync.start()
-    FaultCoordinator(engine, tray, parent=app)
+    faults = FaultCoordinator(engine, tray, config_sync, notifier, parent=app)
+    config_fault = ConfigFaultHandler(config, config_sync, faults, parent=app)
+    faults.set_config_fault_handler(config_fault)
+    config_sync.set_disk_fault_handler(faults.on_config_disk_save_blocked)
+    faults.bind_tray()
+    faults.initialize(config)
+    config_fault.mark_app_ready()
     _start_shutdown_watcher(tray._quit)
 
     hotkey_display = config.hotkey.replace("+", " + ").title()
     logger.success(f"VoiceInput started. Press {hotkey_display} to record.")
 
+    tray.reveal()
     mini.refresh_visibility()
+    config_sync.start()
 
     sys.exit(app.exec())
 

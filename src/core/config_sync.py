@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtCore import QFileSystemWatcher
 
-from config import Config, _config_path
+from config import Config, LoadStatus, ReloadResult, _config_path
 from core.log import logger
 
 if TYPE_CHECKING:
@@ -20,6 +20,8 @@ _TAG = "[ConfigSync]"
 
 _DEBOUNCE_MS = 400
 _SUPPRESS_AFTER_WRITE_MS = 250
+_CORRUPT_RETRY_COUNT = 3
+_CORRUPT_RETRY_MS = 250
 
 
 class ConfigSync(QObject):
@@ -43,6 +45,8 @@ class ConfigSync(QObject):
     """
 
     config_reloaded = pyqtSignal(frozenset)
+    config_disk_fault = pyqtSignal()
+    config_disk_recovered = pyqtSignal()
     apply_started = pyqtSignal()
     apply_finished = pyqtSignal()
 
@@ -60,6 +64,14 @@ class ConfigSync(QObject):
         self._pending_reload = False
         self._applying = False
         self._is_idle: Callable[[], bool] | None = None
+        self._corrupt_retries = 0
+        self._disk_fault_active = False
+        self._disk_fault_handler: Callable[[], None] | None = None
+
+        self._corrupt_retry = QTimer(self)
+        self._corrupt_retry.setSingleShot(True)
+        self._corrupt_retry.setInterval(_CORRUPT_RETRY_MS)
+        self._corrupt_retry.timeout.connect(self._on_corrupt_retry)
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -73,6 +85,10 @@ class ConfigSync(QObject):
 
     def bind_idle_checker(self, checker: Callable[[], bool]) -> None:
         self._is_idle = checker
+
+    def set_disk_fault_handler(self, handler: Callable[[], None] | None) -> None:
+        """Notify when save is attempted while on-disk config is unreadable."""
+        self._disk_fault_handler = handler
 
     def start(self) -> None:
         path = str(_config_path())
@@ -103,6 +119,10 @@ class ConfigSync(QObject):
         return self._pending_reload
 
     @property
+    def disk_fault_active(self) -> bool:
+        return self._disk_fault_active
+
+    @property
     def blocks_recording(self) -> bool:
         return self._applying or self._pending_reload or self._debounce.isActive()
 
@@ -112,6 +132,11 @@ class ConfigSync(QObject):
 
     def save(self, *, touched: frozenset[str] | None = None) -> None:
         """Persist in-memory config to disk, merging with external edits if needed."""
+        if self._disk_fault_active:
+            logger.debug(f"{_TAG} Save skipped (disk fault active)")
+            if self._disk_fault_handler is not None:
+                self._disk_fault_handler()
+            return
         fields = (
             touched
             if touched is not None
@@ -176,6 +201,17 @@ class ConfigSync(QObject):
             self._emit_reload(frozenset(changed), source=source)
         return frozenset(changed)
 
+    def try_recover_from_disk(self) -> bool:
+        """When disk becomes readable again, reload memory and clear fault state."""
+        self._corrupt_retries = _CORRUPT_RETRY_COUNT
+        self._corrupt_retry.stop()
+        changed = self._reload_memory(source="fault_recovery")
+        if self._disk_fault_active:
+            return False
+        if changed:
+            self._emit_reload(frozenset(changed), source="fault_recovery")
+        return True
+
     def _request_external_reload(self, source: str) -> None:
         """Decide whether to apply or queue an external reload.
 
@@ -237,6 +273,17 @@ class ConfigSync(QObject):
                 self._check_external_change_after_write,
             )
 
+    def _guarded_migration_persist(self, fields: frozenset[str]) -> None:
+        """Persist normalized defaults after reload (backup + watcher suppression)."""
+        if not fields:
+            return
+        self._writing = True
+        try:
+            Config.persist_migration(self._config, fields)
+        finally:
+            self._writing = False
+            self._suppress_until = time.monotonic() + (_SUPPRESS_AFTER_WRITE_MS / 1000)
+
     def _patch_disk_json(self, fields: frozenset[str]) -> None:
         """Low-level: overwrite *fields* in on-disk JSON, keep everything else."""
         path = _config_path()
@@ -257,17 +304,56 @@ class ConfigSync(QObject):
             json.dump(on_disk, f, indent=2, ensure_ascii=False)
 
     def _reload_memory(self, *, source: str) -> set[str]:
+        result = self._read_disk_into_memory(source=source)
+        return self._handle_reload_result(result, source=source)
+
+    def _read_disk_into_memory(self, *, source: str) -> ReloadResult:
         try:
-            changed = Config.reload_into(self._config, fill_env_api_key=False)
+            return Config.reload_into(self._config, fill_env_api_key=False)
         except Exception as e:
             logger.warning(f"{_TAG} Reload failed ({source}): {e}")
+            return ReloadResult(frozenset(), LoadStatus.CORRUPT)
+
+    def _handle_reload_result(self, result: ReloadResult, *, source: str) -> set[str]:
+        if result.status in (LoadStatus.CORRUPT, LoadStatus.MISSING):
+            if self._corrupt_retries < _CORRUPT_RETRY_COUNT:
+                self._corrupt_retries += 1
+                logger.warning(
+                    f"{_TAG} Config unreadable ({source}), "
+                    f"retry {self._corrupt_retries}/{_CORRUPT_RETRY_COUNT}"
+                )
+                self._corrupt_retry.start()
+                return set()
+
+            self._corrupt_retries = 0
+            if not self._disk_fault_active:
+                self._disk_fault_active = True
+                logger.error(
+                    f"{_TAG} Config file unreadable ({result.status.value}); "
+                    "memory unchanged"
+                )
+                self.config_disk_fault.emit()
             return set()
+
+        self._corrupt_retries = 0
+        self._corrupt_retry.stop()
+        if self._disk_fault_active:
+            self._disk_fault_active = False
+            self.config_disk_recovered.emit()
+
+        if result.migration_fields:
+            self._guarded_migration_persist(result.migration_fields)
+
         self._capture_sync_token()
+        changed = set(result.changed)
         if changed:
             logger.debug(
                 f"{_TAG} Memory updated ({source}): {', '.join(sorted(changed))}"
             )
         return changed
+
+    def _on_corrupt_retry(self) -> None:
+        self._request_external_reload("retry")
 
     # ------------------------------------------------------------------
     # Watcher plumbing
