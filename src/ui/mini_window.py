@@ -706,7 +706,7 @@ class MiniRecordingWindow(QWidget):
     def _toggle_polish(self):
         cfg = self._engine.config
         cfg.mode = "transcribe" if cfg.mode == "polish" else "polish"
-        cfg.save()
+        cfg.save(touched=frozenset({"mode"}))
         self._update_polish_style()
         self.mode_changed.emit(cfg.mode)
         logger.info(f"[MiniWin] Mode toggled → {cfg.mode}")
@@ -719,6 +719,17 @@ class MiniRecordingWindow(QWidget):
         """Refresh ◳ button after tray menu toggles show_result_text."""
         self._show_result = self._engine.config.show_result_text
         self._update_show_result_style()
+
+    def apply_config(self, changed: set[str]) -> None:
+        """Apply hot-reloaded config to mini bar UI."""
+        if "mode" in changed:
+            self.sync_mode()
+        if "show_result_text" in changed:
+            self.sync_show_result()
+        if changed & {"hide_mini_window_when_idle", "mini_window_x"}:
+            if "mini_window_x" in changed:
+                self._anchor_x = self._engine.config.mini_window_x
+            self.refresh_visibility()
 
     def _update_show_result_style(self):
         if self._show_result:
@@ -738,7 +749,7 @@ class MiniRecordingWindow(QWidget):
         self._show_result = not self._show_result
         cfg = self._engine.config
         cfg.show_result_text = self._show_result
-        cfg.save()
+        cfg.save(touched=frozenset({"show_result_text"}))
         self._update_show_result_style()
         self.show_result_changed.emit(self._show_result)
 
@@ -1677,7 +1688,7 @@ class MiniRecordingWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if self._drag_pos is not None and self._anchor_x is not None:
             self._engine.config.mini_window_x = self._anchor_x
-            self._engine.config.save()
+            self._engine.config.save(touched=frozenset({"mini_window_x"}))
             logger.debug(
                 f"[DEBUG] mouseReleaseEvent | saved anchor_x={self._anchor_x}"
             )
@@ -1691,7 +1702,7 @@ class MiniRecordingWindow(QWidget):
     def reset_position(self):
         self._anchor_x = None
         self._engine.config.mini_window_x = None
-        self._engine.config.save()
+        self._engine.config.save(touched=frozenset({"mini_window_x"}))
         w, h = self._target_size
         self._position_at(w, h)
         logger.debug("[DEBUG] reset_position | anchor cleared")

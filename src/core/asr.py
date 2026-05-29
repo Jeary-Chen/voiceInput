@@ -21,6 +21,21 @@ class DashScopeASR:
         dashscope.base_http_api_url = base_url
         logger.info(f"{_TAG} Initialized (model={model})")
 
+    def update_settings(
+        self,
+        *,
+        api_key: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        if api_key is not None:
+            self.api_key = api_key
+        if model is not None:
+            self.model = model
+        if base_url is not None:
+            dashscope.base_http_api_url = base_url
+        logger.info(f"{_TAG} Settings updated (model={self.model})")
+
     def transcribe(self, pcm_data: bytes,
                    sample_rate: int = 16000, channels: int = 1) -> str:
         wav_buf = io.BytesIO()

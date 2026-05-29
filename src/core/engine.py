@@ -154,7 +154,7 @@ class VoiceEngine(QObject):
             resolved = VoiceRecorder.resolve_device(config.mic_name, config.mic_index)
             if resolved != config.mic_index:
                 config.mic_index = resolved
-                config.save()
+                config.save(touched=frozenset({"mic_index"}))
 
         self.recorder = VoiceRecorder(device_index=resolved, preferred_name=config.mic_name)
         self.recorder.prepare()
@@ -184,6 +184,38 @@ class VoiceEngine(QObject):
         self._watchdog.timeout.connect(self._check_recording_health)
         logger.info(f"{_TAG} Initialized (mode={config.mode}, "
                     f"asr={config.asr_model}, polish={config.polish_model})")
+
+    def apply_config(self, changed: set[str]) -> None:
+        """Apply hot-reloaded config fields to runtime services."""
+        cfg = self.config
+        if changed & {"api_key", "asr_model", "api_base_url"}:
+            self.asr.update_settings(
+                api_key=cfg.api_key,
+                model=cfg.asr_model,
+                base_url=cfg.api_base_url,
+            )
+        if changed & {"api_key", "polish_model", "api_base_url"}:
+            self.polisher.update_settings(
+                api_key=cfg.api_key,
+                model=cfg.polish_model,
+                base_url=cfg.api_base_url,
+            )
+        if changed & {"mic_name", "mic_index"} and self.state != "recording":
+            self._apply_mic_device()
+
+    def _apply_mic_device(self) -> None:
+        cfg = self.config
+        resolved = None
+        if cfg.mic_name:
+            resolved = VoiceRecorder.resolve_device(cfg.mic_name, cfg.mic_index)
+            if resolved != cfg.mic_index:
+                cfg.mic_index = resolved
+                cfg.save(touched=frozenset({"mic_index"}))
+        self.recorder.set_device(resolved, cfg.mic_name or "")
+        logger.info(
+            f"{_TAG} Mic device applied (name={cfg.mic_name or 'system default'}, "
+            f"index={resolved})"
+        )
 
     @property
     def state(self) -> str:

@@ -22,6 +22,7 @@ _docs/
 _experiments/
 _reference/
 _release/
+_*
 
 # 未使用的静态资源
 src/ui/assets/*

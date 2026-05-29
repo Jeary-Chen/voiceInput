@@ -39,7 +39,7 @@ class _Config:
     active_prompt_id = ""
     custom_prompts = []
 
-    def save(self):
+    def save(self, touched=None):
         pass
 
 

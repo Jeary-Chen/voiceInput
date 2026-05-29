@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from config import Config
+from core.config_sync import ConfigSync
 from core.log import logger, install_qt_handler
 from core.engine import VoiceEngine
 from ui import icons
@@ -143,6 +144,8 @@ def main():
     app.aboutToQuit.connect(_release_shutdown_event)
 
     config = Config.load()
+    config_sync = ConfigSync(config)
+    app.aboutToQuit.connect(config_sync.stop)
 
     if not config.api_key:
         from config import _config_path
@@ -151,7 +154,10 @@ def main():
 
     engine = VoiceEngine(config)
     mini = MiniRecordingWindow(engine)
-    tray = VoiceTray(engine, mini, config)
+    tray = VoiceTray(engine, mini, config, config_sync)
+    config_sync.config_reloaded.connect(tray.on_config_reloaded)
+    config_sync.bind_idle_checker(tray.is_idle_for_config_reload)
+    config_sync.start()
     FaultCoordinator(engine, tray, parent=app)
     _start_shutdown_watcher(tray._quit)
 

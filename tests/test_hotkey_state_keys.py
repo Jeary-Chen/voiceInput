@@ -11,7 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-from ui import tray
+from ui.hotkey import _NAME_TO_VK, ComboHotkeyThread
 
 
 WM_KEYDOWN = 0x0100
@@ -58,12 +58,12 @@ class HotkeyStateKeyTests(unittest.TestCase):
         for key_name in ("capslock", "numlock", "scrolllock"):
             with self.subTest(key_name=key_name):
                 _FakeListener.events = [
-                    (WM_KEYDOWN, tray._NAME_TO_VK[key_name]),
-                    (WM_KEYUP, tray._NAME_TO_VK[key_name]),
+                    (WM_KEYDOWN, _NAME_TO_VK[key_name]),
+                    (WM_KEYUP, _NAME_TO_VK[key_name]),
                 ]
 
                 with patch.dict(sys.modules, {"pynput.keyboard": keyboard_module}):
-                    tray.ComboHotkeyThread(f"{key_name}+a").run()
+                    ComboHotkeyThread(f"{key_name}+a").run()
 
                 self.assertEqual(_FakeListener.suppressed, _FakeListener.events)
 

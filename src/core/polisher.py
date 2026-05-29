@@ -88,6 +88,27 @@ class TextPolisher:
         self._model = model
         logger.info(f"{_TAG} Model changed: {old} → {model}")
 
+    def update_settings(
+        self,
+        *,
+        api_key: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        base_changed = False
+        if base_url is not None:
+            new_base = _to_compatible_url(base_url)
+            if new_base != self._base_url:
+                self._base_url = new_base
+                base_changed = True
+        if api_key is not None:
+            self.update_api_key(api_key)
+        elif base_changed and self._client is not None:
+            current_key = getattr(self._client, "api_key", "") or ""
+            self.update_api_key(current_key)
+        if model is not None:
+            self.set_model(model)
+
     def polish(self, raw_text: str, extra_instructions: str = "") -> tuple[bool, str]:
         """Returns (api_ok, text). api_ok is False only when the request raised."""
         if not raw_text.strip():
