@@ -24,6 +24,7 @@ from core.engine import VoiceEngine
 from ui import icons
 from ui.config_dialog import ConfigFaultHandler, load_config_at_startup
 from ui.mini_window import MiniRecordingWindow
+from ui.save_shortcut import install_ctrl_s_save_shortcut
 from ui.tray import VoiceTray
 from ui.fault_coordinator import FaultCoordinator
 from ui.notifier import Notifier
@@ -135,6 +136,7 @@ def main():
 
     # Config must be validated before any application icon or tray UI appears.
     config = load_config_at_startup()
+    install_ctrl_s_save_shortcut(app, lambda: config.hotkey)
 
     app.setApplicationName("VoiceInput")
     app.setWindowIcon(icons.app_icon())

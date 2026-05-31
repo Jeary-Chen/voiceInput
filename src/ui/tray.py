@@ -627,6 +627,7 @@ class VoiceTray(QSystemTrayIcon):
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.finished.connect(self._on_prompt_dlg_finished)
         self._prompt_dlg = dlg
+        self._pause_hotkey_until_dialog_finished(dlg)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -659,24 +660,45 @@ class VoiceTray(QSystemTrayIcon):
         self._hotkey.released.connect(self._on_hotkey_release)
         self._hotkey.start()
 
-    @contextmanager
-    def hotkey_paused(self):
-        """嵌套安全：模态 UI 期间卸全局热键，退出最后一层时按当前 config.hotkey 恢复。"""
+    def _begin_hotkey_pause(self) -> None:
         self._hotkey_pause_depth += 1
         if self._hotkey_pause_depth == 1:
             self._stop_hotkey_listener()
+
+    def _end_hotkey_pause(self) -> None:
+        self._hotkey_pause_depth -= 1
+        if self._hotkey_pause_depth < 0:
+            logger.warning("[Tray] hotkey pause depth underflow")
+            self._hotkey_pause_depth = 0
+        if self._hotkey_pause_depth != 0:
+            return
+        if QCoreApplication.closingDown():
+            return
+        self._spawn_hotkey_thread()
+
+    def _pause_hotkey_until_dialog_finished(self, dlg: QDialog) -> None:
+        """Keep the global recorder hotkey inactive while a modeless edit dialog is open."""
+        self._begin_hotkey_pause()
+        resumed = False
+
+        def _resume(*_args):
+            nonlocal resumed
+            if resumed:
+                return
+            resumed = True
+            self._end_hotkey_pause()
+
+        dlg.finished.connect(_resume)
+        dlg.destroyed.connect(_resume)
+
+    @contextmanager
+    def hotkey_paused(self):
+        """嵌套安全：模态 UI 期间卸全局热键，退出最后一层时按当前 config.hotkey 恢复。"""
+        self._begin_hotkey_pause()
         try:
             yield
         finally:
-            self._hotkey_pause_depth -= 1
-            if self._hotkey_pause_depth < 0:
-                logger.warning("[Tray] hotkey pause depth underflow")
-                self._hotkey_pause_depth = 0
-            if self._hotkey_pause_depth != 0:
-                return
-            if QCoreApplication.closingDown():
-                return
-            self._spawn_hotkey_thread()
+            self._end_hotkey_pause()
 
     def run_modal_with_hotkey_paused(self, fn: Callable[[], _T_modal]) -> _T_modal:
         """供提示词等对话框在 QMessageBox.exec 等模态调用外包裹，与 hotkey_paused 同一套 refcount。"""
@@ -706,20 +728,20 @@ class VoiceTray(QSystemTrayIcon):
         logger.info(f"[Tray] Polish model → {model_id}")
 
     def _configure_hotkey(self):
-        self._stop_hotkey_listener()
-        dlg = _HotkeyDialog(self._config.hotkey)
-        accepted = (
-            dlg.exec() == QDialog.DialogCode.Accepted and bool(dlg.hotkey))
-        if accepted:
-            combo = dlg.hotkey
-            self._config.hotkey = combo
-            self._config.save()
-            display = _hotkey_display(combo)
-            self._act_hotkey.setText(f"快捷键: {display}")
-            logger.info(f"[Tray] Hotkey → {display}")
-        else:
-            combo = self._config.hotkey
-        self._spawn_hotkey_thread(combo)
+        self._begin_hotkey_pause()
+        try:
+            dlg = _HotkeyDialog(self._config.hotkey)
+            accepted = (
+                dlg.exec() == QDialog.DialogCode.Accepted and bool(dlg.hotkey))
+            if accepted:
+                combo = dlg.hotkey
+                self._config.hotkey = combo
+                self._config.save()
+                display = _hotkey_display(combo)
+                self._act_hotkey.setText(f"快捷键: {display}")
+                logger.info(f"[Tray] Hotkey → {display}")
+        finally:
+            self._end_hotkey_pause()
 
     def _configure_apikey(self):
         if self._apikey_dlg is not None:
@@ -731,6 +753,7 @@ class VoiceTray(QSystemTrayIcon):
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.finished.connect(self._on_apikey_dlg_finished)
         self._apikey_dlg = dlg
+        self._pause_hotkey_until_dialog_finished(dlg)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -1055,7 +1078,7 @@ class VoiceTray(QSystemTrayIcon):
             path, _ = QFileDialog.getOpenFileName(
                 None,
                 "选择音频文件",
-                "",
+                str(Config.history_dir()),
                 "音频文件 (*.wav *.mp3 *.flac *.m4a *.ogg *.aac *.opus);;"
                 "WAV (*.wav);;所有文件 (*)",
             )
