@@ -9,7 +9,7 @@ from core.network import direct_business_network
 
 _TAG = "[Polisher]"
 
-DEFAULT_INSTRUCTIONS = "优化表达，去除语气词和口头禅。尽量保留用户原有表达习惯，只在表述混乱时做整合和顺序上的调整。"
+DEFAULT_INSTRUCTIONS = "去除语气词和口头禅。尽量保留原有表达，只在表述混乱时做整合和顺序上的调整。"
 
 _TASK_PREAMBLE="将给你的语音识别原始文本按照要求润色。"
 
