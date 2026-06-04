@@ -29,10 +29,44 @@ LATEST_ASR_MODEL = "qwen3-asr-flash-2026-02-10"
 def default_polish_models() -> list[dict]:
     """Tray 润色模型菜单的出厂列表；用户可在 config.json 的 polish_models 中覆盖。"""
     return [
+        # Qwen3.6：flash → plus → max；同档无日期快照在前
         {"id": "qwen3.6-flash", "label": "Qwen3.6 Flash"},
+        {"id": "qwen3.6-flash-2026-04-16", "label": "Qwen3.6 Flash 2026-04-16"},
         {"id": "qwen3.6-plus", "label": "Qwen3.6 Plus"},
-        {"id": "qwen3-max", "label": "Qwen3 Max"},
+        {"id": "qwen3.6-plus-2026-04-02", "label": "Qwen3.6 Plus 2026-04-02"},
+        {"id": "qwen3.6-max-preview", "label": "Qwen3.6 Max Preview"},
+        # Qwen3.7
+        {"id": "qwen3.7-max", "label": "Qwen3.7 Max"},
+        {"id": "qwen3.7-max-2026-05-20", "label": "Qwen3.7 Max 2026-05-20"},
+        {"id": "qwen3.7-plus", "label": "Qwen3.7 Plus"},
+        {"id": "qwen3.7-plus-2026-05-26", "label": "Qwen3.7 Plus 2026-05-26"},
+        # 其他厂商
+        {"id": "glm-5.1", "label": "GLM 5.1"},
+        {"id": "deepseek-v4-flash", "label": "DeepSeek V4 Flash"},
     ]
+
+
+def _official_polish_model_ids() -> list[str]:
+    return [entry["id"] for entry in default_polish_models()]
+
+
+def default_enabled_polish_models() -> list[str]:
+    """默认启用全部出厂润色模型。"""
+    return _official_polish_model_ids()
+
+
+def _order_polish_models_catalog(items: list[tuple[str, str]]) -> list[dict]:
+    """官方模型按出厂顺序排列，用户自定义项保留在末尾。"""
+    by_id = {mid: {"id": mid, "label": label} for mid, label in items}
+    official_ids = set(_official_polish_model_ids())
+    ordered: list[dict] = []
+    for model_id in _official_polish_model_ids():
+        if model_id in by_id:
+            ordered.append(by_id[model_id])
+    for mid, label in items:
+        if mid not in official_ids:
+            ordered.append({"id": mid, "label": label})
+    return ordered
 
 
 def polish_model_menu_items(models: list | None) -> list[tuple[str, str]]:
@@ -57,7 +91,51 @@ def polish_model_menu_items(models: list | None) -> list[tuple[str, str]]:
     return items
 
 
-def _normalize_polish_models(cfg: "Config") -> frozenset[str]:
+def enabled_polish_model_menu_items(
+    models: list | None,
+    enabled_model_ids: list | None,
+) -> list[tuple[str, str]]:
+    """返回当前启用的润色模型菜单项。"""
+    items = polish_model_menu_items(models)
+    enabled = _normalize_enabled_polish_model_ids(
+        enabled_model_ids,
+        items,
+        allow_missing=True,
+    )
+    enabled_set = set(enabled)
+    return [(mid, label) for mid, label in items if mid in enabled_set]
+
+
+def _normalize_enabled_polish_model_ids(
+    enabled_model_ids: list | None,
+    items: list[tuple[str, str]],
+    *,
+    allow_missing: bool = False,
+) -> list[str]:
+    valid_ids = {mid for mid, _ in items}
+    enabled: list[str] = []
+    seen: set[str] = set()
+    if enabled_model_ids is None and allow_missing:
+        return [mid for mid, _ in items]
+    if not isinstance(enabled_model_ids, list):
+        raise ValueError("enabled_polish_models must be a list")
+    raw_ids = enabled_model_ids
+    for raw_id in raw_ids:
+        model_id = str(raw_id).strip()
+        if not model_id or model_id not in valid_ids or model_id in seen:
+            continue
+        seen.add(model_id)
+        enabled.append(model_id)
+    if enabled:
+        return enabled
+    raise ValueError("enabled_polish_models has no valid model id")
+
+
+def _normalize_polish_models(
+    cfg: "Config",
+    *,
+    enabled_field_missing: bool = False,
+) -> frozenset[str]:
     """校验 polish_models 与 polish_model 一致；非法项丢弃或回退出厂列表。"""
     changed: set[str] = set()
     items = polish_model_menu_items(cfg.polish_models)
@@ -66,19 +144,31 @@ def _normalize_polish_models(cfg: "Config") -> frozenset[str]:
         changed.add("polish_models")
         items = polish_model_menu_items(cfg.polish_models)
     else:
-        canonical = [{"id": mid, "label": label} for mid, label in items]
+        canonical = _order_polish_models_catalog(items)
         if canonical != cfg.polish_models:
             cfg.polish_models = canonical
             changed.add("polish_models")
-    valid_ids = {mid for mid, _ in items}
-    if cfg.polish_model not in valid_ids:
-        cfg.polish_model = items[0][0]
+    enabled_source = None if enabled_field_missing else cfg.enabled_polish_models
+    enabled_ids = _normalize_enabled_polish_model_ids(
+        enabled_source,
+        items,
+        allow_missing=enabled_field_missing,
+    )
+    if cfg.enabled_polish_models != enabled_ids:
+        cfg.enabled_polish_models = enabled_ids
+        changed.add("enabled_polish_models")
+    if cfg.polish_model not in set(enabled_ids):
+        cfg.polish_model = enabled_ids[0]
         changed.add("polish_model")
     return frozenset(changed)
 
 # 版本升级专用：跨版本时按声明式规则修改已有字段。
 # 完整性校验 / 迁移 / 修复不走此列表，见 _default() 与 Config.load()。
 _CONFIG_UPGRADE_RULES: list[tuple[str, list[dict]]] = [
+    ("1.4.6", [
+        {"op": "set", "field": "polish_models", "value_from": "default"},
+        {"op": "set", "field": "enabled_polish_models", "value_from": "default"},
+    ]),
 ]
 
 # 旧版兼容：整字段覆盖会在启动时转换为 set op。新规则请写 _CONFIG_UPGRADE_RULES。
@@ -253,7 +343,12 @@ def _normalize_loaded_config(
             cfg.hotkey = default_hotkey
             changed.add("hotkey")
 
-    changed |= set(_normalize_polish_models(cfg))
+    changed |= set(
+        _normalize_polish_models(
+            cfg,
+            enabled_field_missing="enabled_polish_models" not in raw_data,
+        )
+    )
 
     return frozenset(changed)
 
@@ -290,6 +385,7 @@ class Config:
     api_base_url: str = "https://dashscope.aliyuncs.com/api/v1"
     asr_model: str = LATEST_ASR_MODEL
     polish_models: list = field(default_factory=default_polish_models)
+    enabled_polish_models: list = field(default_factory=default_enabled_polish_models)
     polish_model: str = "qwen3.6-flash"
 
     mic_index: int | None = None
@@ -345,9 +441,13 @@ class Config:
 
         if raw is None:
             cfg = cls()
-            migration = _normalize_loaded_config(
-                cfg, {}, fill_env_api_key=fill_env_api_key,
-            )
+            try:
+                migration = _normalize_loaded_config(
+                    cfg, {}, fill_env_api_key=fill_env_api_key,
+                )
+            except Exception as exc:
+                logger.error(f"[Config] Failed to normalize defaults: {exc}")
+                return LoadOutcome(cls(), {}, LoadStatus.CORRUPT, frozenset())
             return LoadOutcome(cfg, {}, LoadStatus.MISSING, migration)
 
         known = {fld.name for fld in cls.__dataclass_fields__.values()}
@@ -361,9 +461,16 @@ class Config:
             )
             return LoadOutcome(cls(), raw, LoadStatus.CORRUPT, frozenset())
 
-        migration = _normalize_loaded_config(
-            cfg, raw, fill_env_api_key=fill_env_api_key,
-        )
+        try:
+            migration = _normalize_loaded_config(
+                cfg, raw, fill_env_api_key=fill_env_api_key,
+            )
+        except Exception as exc:
+            logger.error(
+                f"[Config] Invalid config values in {path}: {exc}; "
+                "using in-memory defaults (disk left unchanged)"
+            )
+            return LoadOutcome(cls(), raw, LoadStatus.CORRUPT, frozenset())
         return LoadOutcome(cfg, raw, LoadStatus.OK, migration)
 
     @classmethod

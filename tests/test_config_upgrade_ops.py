@@ -16,6 +16,7 @@ from config import (  # noqa: E402
     _CONFIG_UPGRADE_RULES,
     _config_path,
     _default,
+    default_enabled_polish_models,
     default_polish_models,
 )
 from config_upgrade_ops import apply_config_upgrade_rules  # noqa: E402
@@ -40,8 +41,46 @@ def _apply(
 
 
 class ConfigUpgradeOpsTests(unittest.TestCase):
-    def test_builtin_upgrade_rules_are_empty_after_manual_test_cleanup(self):
-        self.assertEqual(_CONFIG_UPGRADE_RULES, [])
+    def test_builtin_upgrade_rules_refresh_polish_model_catalog(self):
+        cfg = Config(
+            config_version="1.4.5",
+            polish_model="qwen3-max",
+            polish_models=[
+                {"id": "qwen3.6-flash", "label": "Qwen3.6 Flash"},
+                {"id": "qwen3.6-plus", "label": "Qwen3.6 Plus"},
+                {"id": "my-private", "label": "My Private"},
+                {"id": "gui-plus-2026-02-26", "label": "GUI Plus"},
+                {"id": "qwen3-max", "label": "Qwen3 Max"},
+                {"id": "qwen3.7-max", "label": "Qwen3.7 Max"},
+                {"id": "qwen3.5-plus-2026-04-20", "label": "Qwen3.5 Plus"},
+                {"id": "deepseek-v4-flash", "label": "DeepSeek V4 Flash"},
+            ],
+        )
+
+        changed = _apply(
+            cfg,
+            from_version="1.4.5",
+            to_version="1.4.6",
+            rules=_CONFIG_UPGRADE_RULES,
+        )
+
+        self.assertEqual(cfg.polish_models, default_polish_models())
+        self.assertEqual(cfg.enabled_polish_models, default_enabled_polish_models())
+        self.assertEqual(cfg.polish_model, "qwen3-max")
+        self.assertIn("polish_models", changed)
+        self.assertEqual(
+            cfg.upgraded_backup["1.4.5"]["polish_models"],
+            [
+                {"id": "qwen3.6-flash", "label": "Qwen3.6 Flash"},
+                {"id": "qwen3.6-plus", "label": "Qwen3.6 Plus"},
+                {"id": "my-private", "label": "My Private"},
+                {"id": "gui-plus-2026-02-26", "label": "GUI Plus"},
+                {"id": "qwen3-max", "label": "Qwen3 Max"},
+                {"id": "qwen3.7-max", "label": "Qwen3.7 Max"},
+                {"id": "qwen3.5-plus-2026-04-20", "label": "Qwen3.5 Plus"},
+                {"id": "deepseek-v4-flash", "label": "DeepSeek V4 Flash"},
+            ],
+        )
 
     def test_catalog_remove_supports_startswith_match(self):
         cfg = Config(
@@ -248,6 +287,7 @@ class ConfigUpgradeOpsTests(unittest.TestCase):
                         {"id": "qwen3-max", "label": "Qwen3 Max"},
                     ],
                 )._as_dict()
+                data.pop("enabled_polish_models", None)
                 path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
                 with patch("config._CONFIG_UPGRADE_RULES", [
@@ -265,6 +305,37 @@ class ConfigUpgradeOpsTests(unittest.TestCase):
         self.assertEqual(disk["polish_models"], cfg.polish_models)
         self.assertEqual(disk["polish_model"], "qwen3-max")
         self.assertEqual(disk["config_version"], "1.5.0")
+        self.assertIn("upgraded_backup", disk)
+
+    def test_config_load_applies_builtin_polish_model_catalog_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"USERPROFILE": tmp}):
+                path = _config_path()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                data = Config(
+                    config_version="1.4.5",
+                    polish_model="qwen3-max",
+                    polish_models=[
+                        {"id": "qwen3.6-flash", "label": "Qwen3.6 Flash"},
+                        {"id": "qwen3.6-plus", "label": "Qwen3.6 Plus"},
+                        {"id": "qwen3-max", "label": "Qwen3 Max"},
+                    ],
+                )._as_dict()
+                data.pop("enabled_polish_models", None)
+                path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+                with patch("_version.VERSION", "1.4.6"):
+                    cfg = Config.load()
+
+                disk = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(cfg.polish_models, default_polish_models())
+        self.assertEqual(cfg.enabled_polish_models, default_enabled_polish_models())
+        self.assertEqual(cfg.polish_model, "qwen3.6-flash")
+        self.assertEqual(disk["polish_models"], default_polish_models())
+        self.assertEqual(disk["enabled_polish_models"], default_enabled_polish_models())
+        self.assertEqual(disk["polish_model"], "qwen3.6-flash")
+        self.assertEqual(disk["config_version"], "1.4.6")
         self.assertIn("upgraded_backup", disk)
 
     def test_config_load_clears_dev_version_without_applying_rules(self):

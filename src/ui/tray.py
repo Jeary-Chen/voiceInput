@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QDialog, QFileDialog,
 )
 
-from config import Config, polish_model_menu_items
+from config import Config, enabled_polish_model_menu_items
 from core.log import logger
 from core.engine import VoiceEngine
 from core.config_sync import ConfigSync
@@ -783,7 +783,10 @@ class VoiceTray(QSystemTrayIcon):
             return fn()
 
     def _polish_model_menu_entries(self) -> list[tuple[str, str]]:
-        items = polish_model_menu_items(self._config.polish_models)
+        items = enabled_polish_model_menu_items(
+            self._config.polish_models,
+            self._config.enabled_polish_models,
+        )
         current = self._config.polish_model
         if current and not any(mid == current for mid, _ in items):
             items.insert(0, (current, current))
@@ -1080,7 +1083,7 @@ class VoiceTray(QSystemTrayIcon):
         if "mode" in changed:
             self._sync_mode_menu()
 
-        if changed & {"polish_model", "polish_models"}:
+        if changed & {"polish_model", "polish_models", "enabled_polish_models"}:
             self._populate_polish_menu()
 
         if changed & {"custom_prompts", "active_prompt_id"}:

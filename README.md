@@ -79,6 +79,7 @@ python -u src\main.py
 | `api_base_url`         | API 基地址                                               | 官方默认                   |
 | `asr_model`            | ASR 模型 ID                                              | `qwen3-asr-flash-2026-02-10` |
 | `polish_models`        | 润色模型菜单（`[{ "id", "label" }, ...]`）               | 见 `config.py` 出厂列表  |
+| `enabled_polish_models` | 启用并显示在托盘菜单中的润色模型 ID 列表               | 见 `config.py` 出厂列表  |
 | `polish_model`         | 当前选中的润色模型 ID                                    | `qwen3.6-flash`          |
 | `mic_index`            | 麦克风设备索引（自动随名称解析，无需手动修改）           | `null`（默认设备）       |
 | `paste_result`         | 识别后粘贴到光标                                         | `true`                   |
