@@ -10,6 +10,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+from PyQt6.QtCore import Qt  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QTextEdit  # noqa: E402
+
 import ui.dialog_styles as dialog_styles  # noqa: E402
 
 
@@ -22,17 +25,39 @@ class _FakeWidget:
 
 
 class DialogStylesTests(unittest.TestCase):
-    def test_apply_dialog_chrome_updates_qt_and_native_window_chrome(self):
+    def test_apply_dialog_chrome_updates_qt_palette_and_native_frame(self):
         widget = _FakeWidget()
 
         with patch.object(
             dialog_styles,
-            "_apply_windows_dark_frame",
-        ) as apply_windows_dark_frame:
-            dialog_styles.apply_dialog_chrome(widget)
+            "_apply_dialog_window_palette",
+        ) as apply_palette:
+            with patch.object(
+                dialog_styles,
+                "_apply_windows_dark_frame",
+            ) as apply_windows_dark_frame:
+                dialog_styles.apply_dialog_chrome(widget)
 
         self.assertIn("QDialog", widget.stylesheet)
+        apply_palette.assert_called_once_with(widget)
         apply_windows_dark_frame.assert_called_once_with(widget)
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = QApplication.instance() or QApplication([])
+
+    def test_apply_dialog_scroll_area_hides_scrollbars(self):
+        edit = QTextEdit()
+        dialog_styles.apply_dialog_scroll_area(edit, "QTextEdit { color: white; }")
+        self.assertEqual(
+            edit.verticalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        self.assertEqual(
+            edit.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        self.assertIn("color: white", edit.styleSheet())
 
 
 if __name__ == "__main__":

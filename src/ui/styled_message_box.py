@@ -28,6 +28,7 @@ from ui.dialog_styles import (
     _DIALOG_SUBTITLE_QSS,
     _DIALOG_TITLE_QSS,
     apply_dialog_chrome,
+    create_dialog_root_layout,
 )
 
 _VARIANT_QSS = {
@@ -70,9 +71,7 @@ class _StyledAlertDialog(QDialog):
 
         self._chosen: str | None = None
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
+        root = create_dialog_root_layout(self, spacing=12)
 
         title = QLabel(heading)
         title.setStyleSheet(_DIALOG_TITLE_QSS)

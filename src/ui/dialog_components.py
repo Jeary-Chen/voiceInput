@@ -5,18 +5,6 @@ from __future__ import annotations
 from ui import dialog_tokens as t
 
 
-def dialog_scrollbar_qss(widget_prefix: str, track_bg: str) -> str:
-    """Scrollbar QSS for a widget subtree; track_bg matches panel background."""
-    return f"""
-    {widget_prefix} QScrollBar:vertical {{ background: {track_bg}; }}
-    {widget_prefix} QScrollBar::handle:vertical {{ background: {t._SCROLLBAR_HANDLE}; }}
-    {widget_prefix} QScrollBar::handle:vertical:hover {{ background: {t._SCROLLBAR_HANDLE_HOVER}; }}
-    {widget_prefix} QScrollBar:horizontal {{ background: {track_bg}; }}
-    {widget_prefix} QScrollBar::handle:horizontal {{ background: {t._SCROLLBAR_HANDLE}; }}
-    {widget_prefix} QScrollBar::handle:horizontal:hover {{ background: {t._SCROLLBAR_HANDLE_HOVER}; }}
-    """
-
-
 # ── chrome & typography ───────────────────────────────────────────────────────
 
 _DIALOG_CHROME_QSS = f"""
@@ -76,9 +64,7 @@ _DIALOG_TEXTEDIT_QSS = f"""
         font-size: {t._FONT_BODY};
         font-family: "Segoe UI", "Microsoft YaHei";
     }}
-""" + dialog_scrollbar_qss("QTextEdit", t._SURFACE_READONLY) + dialog_scrollbar_qss(
-    "QTextBrowser", t._SURFACE_READONLY
-)
+"""
 _DIALOG_INPUT_QSS = f"""
     QLineEdit {{
         background: {t._SURFACE_PANEL};
@@ -116,7 +102,7 @@ _DIALOG_TEXTEDIT_EDIT_QSS = f"""
         font-size: {t._FONT_BODY};
     }}
     QTextEdit:focus {{ border: 1px solid {t._ACCENT_FOCUS}; }}
-""" + dialog_scrollbar_qss("QTextEdit", t._SURFACE_PANEL)
+"""
 _DIALOG_TEXTEDIT_READONLY_QSS = f"""
     QTextEdit {{
         background: {t._SURFACE_READONLY};
@@ -126,7 +112,7 @@ _DIALOG_TEXTEDIT_READONLY_QSS = f"""
         padding: {t._SPACING_INPUT};
         font-size: {t._FONT_BODY};
     }}
-""" + dialog_scrollbar_qss("QTextEdit", t._SURFACE_READONLY)
+"""
 _DIALOG_LIST_QSS = f"""
     QListWidget {{
         background: {t._SURFACE_PANEL};
@@ -153,7 +139,7 @@ _DIALOG_LIST_QSS = f"""
         background: {t._SURFACE_LIST_ITEM_HOVER};
         color: {t._TEXT_PRIMARY};
     }}
-""" + dialog_scrollbar_qss("QListWidget", t._SURFACE_PANEL)
+"""
 
 # ── buttons ───────────────────────────────────────────────────────────────────
 

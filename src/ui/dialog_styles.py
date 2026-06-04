@@ -12,10 +12,13 @@ from __future__ import annotations
 import ctypes
 import sys
 
-from PyQt6.QtWidgets import QWidget
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtWidgets import QAbstractScrollArea, QVBoxLayout, QWidget
 
 from ui import dialog_components as _components
 from ui import dialog_tokens as _tokens
+from ui.dialog_tokens import _SURFACE_PAGE
 
 # Star-import skips underscore names; re-export the dialog API explicitly.
 for _mod in (_tokens, _components):
@@ -68,7 +71,38 @@ def _apply_windows_dark_frame(widget: QWidget) -> None:
         return
 
 
+def _apply_dialog_window_palette(widget: QWidget) -> None:
+    """Native client area uses page surface — avoids white layout gutters on Windows."""
+    page = QColor(_SURFACE_PAGE)
+    pal = widget.palette()
+    pal.setColor(QPalette.ColorRole.Window, page)
+    pal.setColor(QPalette.ColorRole.Base, page)
+    widget.setPalette(pal)
+    widget.setAutoFillBackground(True)
+
+
+def apply_dialog_scroll_area(scroll_area: QAbstractScrollArea, qss: str) -> None:
+    """Style a list/text browser and hide scrollbars (wheel/trackpad still scroll)."""
+    scroll_area.setStyleSheet(qss)
+    scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+
+def create_dialog_root_layout(
+    host: QWidget,
+    *,
+    margins: int = 16,
+    spacing: int = 8,
+) -> QVBoxLayout:
+    """Standard dialog root layout (shared margins across all modal shells)."""
+    layout = QVBoxLayout(host)
+    layout.setContentsMargins(margins, margins, margins, margins)
+    layout.setSpacing(spacing)
+    return layout
+
+
 def apply_dialog_chrome(widget: QWidget) -> None:
-    """Apply shared dialog shell (background, labels, tooltips)."""
+    """Apply shared dialog shell (background, labels, tooltips, native frame)."""
     widget.setStyleSheet(_DIALOG_CHROME_QSS)
+    _apply_dialog_window_palette(widget)
     _apply_windows_dark_frame(widget)

@@ -59,10 +59,8 @@ _ACCENT_ACTIVATE_BG = "#0a5c2a"
 _ACCENT_ACTIVATE_TEXT = "#4cdf90"
 _ACCENT_ACTIVATE_BORDER = "#1a8040"
 
-# ── scrollbar / splitter ─────────────────────────────────────────────────────
+# ── splitter ─────────────────────────────────────────────────────────────────
 
-_SCROLLBAR_HANDLE = _BORDER_SUBTLE
-_SCROLLBAR_HANDLE_HOVER = _BORDER_BTN_SECONDARY_HOVER
 _SPLITTER_HANDLE = _BORDER_READONLY
 
 # ── spacing / radius / typography ────────────────────────────────────────────

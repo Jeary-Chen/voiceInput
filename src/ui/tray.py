@@ -8,7 +8,7 @@ import time
 from typing import TYPE_CHECKING, TypeVar
 
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QCoreApplication,
+    Qt, QThread, pyqtSignal, QTimer, QCoreApplication, QObject, QEvent,
 )
 from PyQt6.QtGui import QAction, QCursor
 from PyQt6.QtWidgets import (
@@ -27,6 +27,7 @@ from ui.mini_window import MiniRecordingWindow
 from ui.sounds import AudioCues
 from ui import icons
 from ui.hotkey import ComboHotkeyThread, _HotkeyDialog, _hotkey_display
+from ui.window_focus import widget_is_foreground
 from ui.apikey_dialog import _ApiKeyDialog
 from ui.update_ui import (
     _UpdateNotesDialog, _UpdateReadyDialog, _UpdateMenuHelper,
@@ -46,6 +47,25 @@ _AUTOSTART_VALUE_NAME = "VoiceInput"
 
 
 _TRAY_MENU_DEFAULT_PROMPT = "__tray_default_prompt__"
+
+
+class _ForegroundHotkeyGateFilter(QObject):
+    """When a gated modeless dialog activates/deactivates, resync recorder hotkey pause."""
+
+    def __init__(self, tray: "VoiceTray"):
+        super().__init__(tray)
+        self._tray = tray
+
+    def eventFilter(self, watched, event):  # noqa: N802
+        if event.type() in (
+            QEvent.Type.WindowActivate,
+            QEvent.Type.WindowDeactivate,
+            QEvent.Type.ActivationChange,
+            QEvent.Type.Hide,
+            QEvent.Type.Show,
+        ):
+            self._tray._schedule_foreground_hotkey_sync()
+        return False
 
 
 class _DeviceRefreshWorker(QThread):
@@ -114,6 +134,17 @@ class VoiceTray(QSystemTrayIcon):
         self._update_ready_dlg: _UpdateReadyDialog | None = None
         self._update_status = "idle"  # idle | downloading | ready
         self._hotkey_pause_depth = 0
+        self._foreground_hotkey_pause_active = False
+        self._hotkey_listener_suppressed = False
+        self._fg_gated_dialogs: list[QDialog] = []
+        self._fg_hotkey_filter = _ForegroundHotkeyGateFilter(self)
+        self._fg_hotkey_sync_timer = QTimer(self)
+        self._fg_hotkey_sync_timer.setSingleShot(True)
+        self._fg_hotkey_sync_timer.setInterval(0)
+        self._fg_hotkey_sync_timer.timeout.connect(self._sync_foreground_hotkey_gate)
+        self._fg_hotkey_poll = QTimer(self)
+        self._fg_hotkey_poll.setInterval(150)
+        self._fg_hotkey_poll.timeout.connect(self._sync_foreground_hotkey_gate)
 
         self._audio = AudioCues()
         self._audio.set_enabled(config.play_sounds)
@@ -627,7 +658,7 @@ class VoiceTray(QSystemTrayIcon):
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.finished.connect(self._on_prompt_dlg_finished)
         self._prompt_dlg = dlg
-        self._pause_hotkey_until_dialog_finished(dlg)
+        self._register_foreground_hotkey_gate(dlg)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -647,8 +678,16 @@ class VoiceTray(QSystemTrayIcon):
         except Exception:
             return None
 
+    def _clear_hotkey_hold_state(self) -> None:
+        """卸全局钩子时无法收到 keyup，避免按住态残留影响后续快捷键逻辑。"""
+        if not self._hotkey_hold_active:
+            return
+        self._hotkey_hold_active = False
+        self._mini.stop_hotkey_hold()
+
     def _stop_hotkey_listener(self) -> None:
         """停止全局 ComboHotkeyThread 并等待 pynput 钩子退出。"""
+        self._clear_hotkey_hold_state()
         self._hotkey.stop_hotkey()
         self._hotkey.wait(2000)
 
@@ -660,36 +699,75 @@ class VoiceTray(QSystemTrayIcon):
         self._hotkey.released.connect(self._on_hotkey_release)
         self._hotkey.start()
 
+    def _should_suppress_hotkey_listener(self) -> bool:
+        return self._hotkey_pause_depth > 0 or self._foreground_hotkey_pause_active
+
+    def _update_hotkey_listener_suppression(self) -> None:
+        suppress = self._should_suppress_hotkey_listener()
+        if suppress and not self._hotkey_listener_suppressed:
+            self._stop_hotkey_listener()
+            self._hotkey_listener_suppressed = True
+        elif not suppress and self._hotkey_listener_suppressed:
+            if QCoreApplication.closingDown():
+                return
+            self._spawn_hotkey_thread()
+            self._hotkey_listener_suppressed = False
+
     def _begin_hotkey_pause(self) -> None:
         self._hotkey_pause_depth += 1
-        if self._hotkey_pause_depth == 1:
-            self._stop_hotkey_listener()
+        self._update_hotkey_listener_suppression()
 
     def _end_hotkey_pause(self) -> None:
         self._hotkey_pause_depth -= 1
         if self._hotkey_pause_depth < 0:
             logger.warning("[Tray] hotkey pause depth underflow")
             self._hotkey_pause_depth = 0
-        if self._hotkey_pause_depth != 0:
+        self._update_hotkey_listener_suppression()
+
+    def _set_foreground_hotkey_pause(self, active: bool) -> None:
+        if self._foreground_hotkey_pause_active == active:
             return
-        if QCoreApplication.closingDown():
+        self._foreground_hotkey_pause_active = active
+        self._update_hotkey_listener_suppression()
+
+    def _schedule_foreground_hotkey_sync(self) -> None:
+        self._fg_hotkey_sync_timer.start()
+
+    def _prune_fg_gated_dialogs(self) -> list[QDialog]:
+        self._fg_gated_dialogs = [
+            d for d in self._fg_gated_dialogs
+            if d is not None and d.isVisible()
+        ]
+        return self._fg_gated_dialogs
+
+    def _sync_foreground_hotkey_gate(self) -> None:
+        dialogs = self._prune_fg_gated_dialogs()
+        if not dialogs:
+            self._fg_hotkey_poll.stop()
+            self._set_foreground_hotkey_pause(False)
             return
-        self._spawn_hotkey_thread()
+        active = any(widget_is_foreground(d) for d in dialogs)
+        self._set_foreground_hotkey_pause(active)
 
-    def _pause_hotkey_until_dialog_finished(self, dlg: QDialog) -> None:
-        """Keep the global recorder hotkey inactive while a modeless edit dialog is open."""
-        self._begin_hotkey_pause()
-        resumed = False
+    def _register_foreground_hotkey_gate(self, dlg: QDialog) -> None:
+        """Pause recorder hotkey only while *dlg* is the system foreground window."""
+        if dlg not in self._fg_gated_dialogs:
+            self._fg_gated_dialogs.append(dlg)
+        dlg.installEventFilter(self._fg_hotkey_filter)
+        dlg.finished.connect(lambda: self._unregister_foreground_hotkey_gate(dlg))
+        dlg.destroyed.connect(lambda: self._unregister_foreground_hotkey_gate(dlg))
+        if not self._fg_hotkey_poll.isActive():
+            self._fg_hotkey_poll.start()
+        self._schedule_foreground_hotkey_sync()
 
-        def _resume(*_args):
-            nonlocal resumed
-            if resumed:
-                return
-            resumed = True
-            self._end_hotkey_pause()
-
-        dlg.finished.connect(_resume)
-        dlg.destroyed.connect(_resume)
+    def _unregister_foreground_hotkey_gate(self, dlg: QDialog) -> None:
+        if dlg in self._fg_gated_dialogs:
+            self._fg_gated_dialogs.remove(dlg)
+        try:
+            dlg.removeEventFilter(self._fg_hotkey_filter)
+        except RuntimeError:
+            pass
+        self._schedule_foreground_hotkey_sync()
 
     @contextmanager
     def hotkey_paused(self):
@@ -753,7 +831,7 @@ class VoiceTray(QSystemTrayIcon):
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.finished.connect(self._on_apikey_dlg_finished)
         self._apikey_dlg = dlg
-        self._pause_hotkey_until_dialog_finished(dlg)
+        self._register_foreground_hotkey_gate(dlg)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()

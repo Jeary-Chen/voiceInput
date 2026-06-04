@@ -9,7 +9,7 @@ from core.network import direct_business_network
 
 _TAG = "[Polisher]"
 
-DEFAULT_INSTRUCTIONS = "去除语气词和口头禅。尽量保留原有表达，只在表述混乱时做整合和顺序上的调整。"
+DEFAULT_INSTRUCTIONS = "优化表达，不增删内容，保持原有语序。"
 
 _TASK_PREAMBLE="将给你的语音识别原始文本按照要求润色。"
 
@@ -19,6 +19,12 @@ _OUTPUT_FORMAT = (
     "如果代码块内容为空，则什么都不输出。"
     "任何时候不得违反【输出格式】要求。"
 )
+
+# DashScope 非流式：须显式 enable_thinking=false；temperature=0 降低润色随机性。
+_POLISH_CHAT_KWARGS = {
+    "temperature": 0,
+    "extra_body": {"enable_thinking": False},
+}
 
 
 def _build_system_prompt(custom_instructions: str) -> str:
@@ -126,8 +132,8 @@ class TextPolisher:
                         {"role": "system", "content": system_content},
                         {"role": "user", "content": user_content},
                     ],
-                    extra_body={"enable_thinking": False},
                     timeout=15,
+                    **_POLISH_CHAT_KWARGS,
                 )
             content = resp.choices[0].message.content
             raw_result = content.strip() if isinstance(content, str) else str(content).strip()

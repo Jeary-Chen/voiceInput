@@ -16,6 +16,8 @@ from ui.dialog_styles import (
     _DIALOG_SUBTITLE_QSS,
     _DIALOG_META_QSS,
     apply_dialog_chrome,
+    apply_dialog_scroll_area,
+    create_dialog_root_layout,
 )
 
 
@@ -53,9 +55,7 @@ class _UpdateNotesDialog(QDialog):
         self.setFixedSize(560, 520)
         apply_dialog_chrome(self)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
+        root = create_dialog_root_layout(self, spacing=12)
 
         title = QLabel(f"VoiceInput v{info.version} 可用")
         title.setStyleSheet(_DIALOG_TITLE_QSS)
@@ -78,7 +78,7 @@ class _UpdateNotesDialog(QDialog):
         self._notes = QTextBrowser()
         self._notes.setReadOnly(True)
         self._notes.setOpenExternalLinks(True)
-        self._notes.setStyleSheet(_DIALOG_TEXTEDIT_QSS)
+        apply_dialog_scroll_area(self._notes, _DIALOG_TEXTEDIT_QSS)
         self._notes.setMarkdown(body)
         root.addWidget(self._notes, 1)
 
@@ -122,9 +122,7 @@ class _UpdateReadyDialog(QDialog):
         self.setFixedSize(420, 180)
         apply_dialog_chrome(self)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
+        root = create_dialog_root_layout(self, spacing=12)
 
         title = QLabel(f"v{version} 已下载完成")
         title.setStyleSheet(_DIALOG_TITLE_QSS)

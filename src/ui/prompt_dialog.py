@@ -36,6 +36,8 @@ from ui.dialog_styles import (
     _DIALOG_TEXTEDIT_EDIT_QSS,
     _DIALOG_TEXTEDIT_READONLY_QSS,
     apply_dialog_chrome,
+    apply_dialog_scroll_area,
+    create_dialog_root_layout,
 )
 from ui.styled_message_box import apply_message_box_style
 
@@ -144,8 +146,7 @@ class _PolishPromptDialog(QDialog):
         self._last_row: int = -1
         self._editing_prompt_id: str = ""
 
-        root = QVBoxLayout(self)
-        root.setSpacing(8)
+        root = create_dialog_root_layout(self)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setHandleWidth(1)
@@ -158,7 +159,7 @@ class _PolishPromptDialog(QDialog):
         left_lay.setSpacing(6)
 
         self._list = _DragReorderListWidget()
-        self._list.setStyleSheet(_DIALOG_LIST_QSS)
+        apply_dialog_scroll_area(self._list, _DIALOG_LIST_QSS)
         self._list.setItemDelegate(_KeepWhiteTextDelegate(self._list))
         self._list.orderChanged.connect(self._on_list_order_swapped)
         left_lay.addWidget(self._list)
@@ -245,7 +246,7 @@ class _PolishPromptDialog(QDialog):
 
         self._content_edit = QTextEdit()
         self._content_edit.setPlaceholderText("输入润色提示词内容…")
-        self._content_edit.setStyleSheet(_DIALOG_TEXTEDIT_EDIT_QSS)
+        apply_dialog_scroll_area(self._content_edit, _DIALOG_TEXTEDIT_EDIT_QSS)
         right_lay.addWidget(self._content_edit)
 
         right_btns = QHBoxLayout()
@@ -560,7 +561,7 @@ class _PolishPromptDialog(QDialog):
             self._name_input.setReadOnly(True)
             self._content_edit.setReadOnly(True)
             self._name_input.setStyleSheet(_DIALOG_INPUT_READONLY_QSS)
-            self._content_edit.setStyleSheet(_DIALOG_TEXTEDIT_READONLY_QSS)
+            apply_dialog_scroll_area(self._content_edit, _DIALOG_TEXTEDIT_READONLY_QSS)
         else:
             pid = self._selected_prompt_id(row)
             self._editing_prompt_id = pid or ""
@@ -571,7 +572,7 @@ class _PolishPromptDialog(QDialog):
             self._name_input.setReadOnly(False)
             self._content_edit.setReadOnly(False)
             self._name_input.setStyleSheet(_DIALOG_INPUT_EDIT_QSS)
-            self._content_edit.setStyleSheet(_DIALOG_TEXTEDIT_EDIT_QSS)
+            apply_dialog_scroll_area(self._content_edit, _DIALOG_TEXTEDIT_EDIT_QSS)
         self._btn_delete.setEnabled(not is_default)
         self._btn_duplicate.setEnabled(not is_default)
         self._update_activate_button(row)

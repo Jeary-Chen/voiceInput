@@ -13,6 +13,7 @@ from ui.dialog_styles import (
     _DIALOG_BTN_TEXT,
     _DIALOG_INPUT_MONO_QSS,
     apply_dialog_chrome,
+    create_dialog_root_layout,
 )
 
 
@@ -27,8 +28,7 @@ class _ApiKeyDialog(QDialog):
         apply_dialog_chrome(self)
         self._result: str | None = None
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout = create_dialog_root_layout(self, spacing=10)
 
         hint_row = QHBoxLayout()
         hint_row.setSpacing(6)

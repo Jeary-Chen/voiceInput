@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 
 from core.log import logger
 from ui import icons
+from ui.window_focus import widget_is_foreground
 from ui.dialog_styles import (
     _DIALOG_BTN_GHOST,
     _DIALOG_BTN_PRIMARY,
@@ -25,6 +26,7 @@ from ui.dialog_styles import (
     _DIALOG_STATUS_ERROR_STRONG,
     _DIALOG_STATUS_SUCCESS,
     apply_dialog_chrome,
+    create_dialog_root_layout,
 )
 
 
@@ -436,8 +438,7 @@ class _HotkeyDialog(QDialog):
         self._settle.setInterval(150)
         self._settle.timeout.connect(self._finalize)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout = create_dialog_root_layout(self, spacing=10)
 
         hint = QLabel("按下新的快捷键或快捷键组合：")
         layout.addWidget(hint)
@@ -486,25 +487,6 @@ class _HotkeyDialog(QDialog):
         self._sync_grab_debounce.setInterval(0)
         self._sync_grab_debounce.timeout.connect(self.sync_hotkey_grab_with_activation)
 
-    def _hotkey_dialog_is_foreground(self) -> bool:
-        """本对话框是否为 Win32 前台窗口（比 isActiveWindow 可靠）。"""
-        if sys.platform != "win32":
-            return self.isActiveWindow()
-        try:
-            hwnd = int(self.winId())
-        except Exception:
-            return False
-        if not hwnd:
-            return False
-        user32 = ctypes.windll.user32
-        fg = user32.GetForegroundWindow()
-        if not fg:
-            return False
-        if fg == hwnd:
-            return True
-        GA_ROOT = 2
-        return bool(user32.GetAncestor(fg, GA_ROOT) == hwnd)
-
     def showEvent(self, event):
         super().showEvent(event)
         self._fg_poll.start()
@@ -531,7 +513,7 @@ class _HotkeyDialog(QDialog):
         """仅当本对话框为系统前台时挂全局钩子；否则撤钩并复位 chord。"""
         if self._hotkey_grab_disposed:
             return
-        if self._hotkey_dialog_is_foreground():
+        if widget_is_foreground(self):
             self._start_hotkey_grab_if_needed()
         else:
             self._release_hotkey_grab_on_deactivate()
@@ -551,7 +533,7 @@ class _HotkeyDialog(QDialog):
             return
         if self._grab_worker is not None or sys.platform != "win32":
             return
-        if not self._hotkey_dialog_is_foreground():
+        if not widget_is_foreground(self):
             return
         try:
             from pynput.keyboard import Listener as _KBL  # noqa: F401
