@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QDialog, QFileDialog,
 )
 
-from config import Config, POLISH_MODELS
+from config import Config, polish_model_menu_items
 from core.log import logger
 from core.engine import VoiceEngine
 from core.config_sync import ConfigSync
@@ -274,7 +274,6 @@ class VoiceTray(QSystemTrayIcon):
         self._polish_model_menu = QMenu("润色模型", menu)
         apply_tray_menu_style(self._polish_model_menu)
         install_left_cascade_submenu(self._polish_model_menu, menu)
-        self._polish_models = list(POLISH_MODELS)
         self._populate_polish_menu()
         menu.addMenu(self._polish_model_menu)
 
@@ -783,13 +782,17 @@ class VoiceTray(QSystemTrayIcon):
         with self.hotkey_paused():
             return fn()
 
+    def _polish_model_menu_entries(self) -> list[tuple[str, str]]:
+        items = polish_model_menu_items(self._config.polish_models)
+        current = self._config.polish_model
+        if current and not any(mid == current for mid, _ in items):
+            items.insert(0, (current, current))
+        return items
+
     def _populate_polish_menu(self):
         self._polish_model_menu.clear()
         current = self._config.polish_model
-        found_current = any(mid == current for mid, _ in self._polish_models)
-        if not found_current:
-            self._polish_models.insert(0, (current, current))
-        for model_id, display_name in self._polish_models:
+        for model_id, display_name in self._polish_model_menu_entries():
             act = QAction(display_name, self._polish_model_menu)
             act.setCheckable(True)
             act.setChecked(model_id == current)
@@ -801,7 +804,10 @@ class VoiceTray(QSystemTrayIcon):
         self._config.save()
         self._engine.polisher.set_model(model_id)
         for act in self._polish_model_menu.actions():
-            mid = next((m for m, d in self._polish_models if d == act.text()), "")
+            mid = next(
+                (m for m, d in self._polish_model_menu_entries() if d == act.text()),
+                "",
+            )
             act.setChecked(mid == model_id)
         logger.info(f"[Tray] Polish model → {model_id}")
 
@@ -1074,7 +1080,7 @@ class VoiceTray(QSystemTrayIcon):
         if "mode" in changed:
             self._sync_mode_menu()
 
-        if "polish_model" in changed:
+        if changed & {"polish_model", "polish_models"}:
             self._populate_polish_menu()
 
         if changed & {"custom_prompts", "active_prompt_id"}:

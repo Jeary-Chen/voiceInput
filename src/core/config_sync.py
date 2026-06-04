@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtCore import QFileSystemWatcher
 
-from config import Config, LoadStatus, ReloadResult, _config_path
+from config import Config, LoadStatus, ReloadResult, _config_path, _ordered_root_config
 from core.log import logger
 
 if TYPE_CHECKING:
@@ -301,7 +301,7 @@ class ConfigSync(QObject):
             if name in self._config.__dataclass_fields__:
                 on_disk[name] = copy.deepcopy(getattr(self._config, name))
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(on_disk, f, indent=2, ensure_ascii=False)
+            json.dump(_ordered_root_config(on_disk), f, indent=2, ensure_ascii=False)
 
     def _reload_memory(self, *, source: str) -> set[str]:
         result = self._read_disk_into_memory(source=source)

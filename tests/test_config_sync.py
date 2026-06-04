@@ -308,6 +308,24 @@ class ConfigSyncTests(unittest.TestCase):
         self.assertFalse(sync._debounce.isActive(),
                          "watcher event during suppress window should be ignored")
 
+    def test_busy_touched_write_orders_root_fields_with_backup_last(self):
+        cfg, sync, path = self._setup(idle=False)
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        disk = {
+            "upgraded_backup": {"1.0.0": {"mode": "old"}},
+            "z_unknown": 1,
+            **disk,
+        }
+        _write_json(path, disk)
+
+        cfg.paste_result = False
+        cfg.save(touched=frozenset({"paste_result"}))
+
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        keys = list(on_disk)
+        self.assertLess(keys.index("paste_result"), keys.index("z_unknown"))
+        self.assertEqual(keys[-2:], ["z_unknown", "upgraded_backup"])
+
 
 if __name__ == "__main__":
     unittest.main()

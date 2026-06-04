@@ -77,8 +77,9 @@ python -u src\main.py
 | `language`             | 语言                                                     | `auto`                   |
 | `api_key`              | DashScope API Key                                        | 空（可用环境变量）         |
 | `api_base_url`         | API 基地址                                               | 官方默认                   |
-| `asr_model`            | ASR 模型                                                 | `qwen3-asr-flash`        |
-| `polish_model`         | 润色 LLM 模型                                            | `qwen3.5-flash`          |
+| `asr_model`            | ASR 模型 ID                                              | `qwen3-asr-flash-2026-02-10` |
+| `polish_models`        | 润色模型菜单（`[{ "id", "label" }, ...]`）               | 见 `config.py` 出厂列表  |
+| `polish_model`         | 当前选中的润色模型 ID                                    | `qwen3.6-flash`          |
 | `mic_index`            | 麦克风设备索引（自动随名称解析，无需手动修改）           | `null`（默认设备）       |
 | `paste_result`         | 识别后粘贴到光标                                         | `true`                   |
 | `restore_clipboard`    | 粘贴后还原剪贴板                                         | `false`                  |
@@ -90,6 +91,8 @@ python -u src\main.py
 | `mini_window_x`        | 指示器水平锚点（像素，可清空以重置）                     | `null`                   |
 
 环境变量 `DASHSCOPE_API_KEY` 可与配置文件同时使用（配置中为空时会尝试读取）。
+
+开发者向说明见 [`_docs/开发者文档/配置文件开发参考.md`](_docs/开发者文档/配置文件开发参考.md)；发版迁移见 [`_docs/config-versioning.md`](_docs/config-versioning.md)。
 
 日志目录：`%USERPROFILE%\.voiceinput\logs\`（每次启动一个新文件，包含从启动到退出的完整记录，含 WARNING / ERROR 等）。
 

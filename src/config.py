@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from config_upgrade_ops import apply_config_upgrade_rules, _parse_ver as _parse_upgrade_ver
 from core.log import logger
 from core.prompt_templates import default_prompt_templates
 
@@ -24,14 +25,63 @@ def _config_backup_path() -> Path:
 
 LATEST_ASR_MODEL = "qwen3-asr-flash-2026-02-10"
 
-POLISH_MODELS: list[tuple[str, str]] = [
-    ("qwen3.6-flash", "Qwen3.6 Flash"),
-    ("qwen3.6-plus",  "Qwen3.6 Plus"),
-    ("qwen3-max",     "Qwen3 Max"),
+
+def default_polish_models() -> list[dict]:
+    """Tray 润色模型菜单的出厂列表；用户可在 config.json 的 polish_models 中覆盖。"""
+    return [
+        {"id": "qwen3.6-flash", "label": "Qwen3.6 Flash"},
+        {"id": "qwen3.6-plus", "label": "Qwen3.6 Plus"},
+        {"id": "qwen3-max", "label": "Qwen3 Max"},
+    ]
+
+
+def polish_model_menu_items(models: list | None) -> list[tuple[str, str]]:
+    """将 config 中的 polish_models 规范为 (id, label) 列表，供托盘菜单使用。"""
+    items: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for entry in models or []:
+        if isinstance(entry, (list, tuple)) and entry:
+            model_id = str(entry[0]).strip()
+            label = str(entry[1]).strip() if len(entry) > 1 else model_id
+        elif isinstance(entry, dict):
+            model_id = str(entry.get("id") or "").strip()
+            label = str(
+                entry.get("label") or entry.get("name") or model_id,
+            ).strip()
+        else:
+            continue
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        items.append((model_id, label or model_id))
+    return items
+
+
+def _normalize_polish_models(cfg: "Config") -> frozenset[str]:
+    """校验 polish_models 与 polish_model 一致；非法项丢弃或回退出厂列表。"""
+    changed: set[str] = set()
+    items = polish_model_menu_items(cfg.polish_models)
+    if not items:
+        cfg.polish_models = _default("polish_models")
+        changed.add("polish_models")
+        items = polish_model_menu_items(cfg.polish_models)
+    else:
+        canonical = [{"id": mid, "label": label} for mid, label in items]
+        if canonical != cfg.polish_models:
+            cfg.polish_models = canonical
+            changed.add("polish_models")
+    valid_ids = {mid for mid, _ in items}
+    if cfg.polish_model not in valid_ids:
+        cfg.polish_model = items[0][0]
+        changed.add("polish_model")
+    return frozenset(changed)
+
+# 版本升级专用：跨版本时按声明式规则修改已有字段。
+# 完整性校验 / 迁移 / 修复不走此列表，见 _default() 与 Config.load()。
+_CONFIG_UPGRADE_RULES: list[tuple[str, list[dict]]] = [
 ]
 
-# 版本升级专用：跨版本时按此列表强制覆盖已有字段（值从 Config 默认读取，此处只写字段名）。
-# 完整性校验 / 迁移 / 修复不走此列表，见 _default() 与 Config.load()。
+# 旧版兼容：整字段覆盖会在启动时转换为 set op。新规则请写 _CONFIG_UPGRADE_RULES。
 _CONFIG_UPGRADES: list[tuple[str, tuple[str, ...]]] = [
     # ("1.4.0", ("asr_model",)),
 ]
@@ -64,18 +114,13 @@ class LoadOutcome:
     migration_fields: frozenset[str]
 
 
-def _parse_ver(v: str) -> tuple[int, ...]:
-    parts = []
-    for p in (v or "0").split("."):
-        try:
-            parts.append(int(p))
-        except ValueError:
-            break
-    return tuple(parts) or (0,)
-
-
 def _is_dev_version(v: str) -> bool:
     return (v or "").strip().lower() == "dev"
+
+
+def _parse_ver(v: str) -> tuple[int, ...]:
+    """Compatibility wrapper for internal callers; implementation lives with upgrade ops."""
+    return _parse_upgrade_ver(v)
 
 
 _META_FIELDS = frozenset({"config_version", "upgraded_backup"})
@@ -100,11 +145,6 @@ def _valid_hotkey_keys() -> set[str]:
 def _default(name: str):
     """Config 字段默认值。用于完整性校验、迁移、修复（非版本升级）。"""
     return copy.deepcopy(getattr(Config(), name))
-
-
-def _defaults_for(*names: str) -> dict:
-    """批量取默认值，仅供 _CONFIG_UPGRADES 版本升级时读取目标值。"""
-    return {name: _default(name) for name in names}
 
 
 def _read_json_object(path: Path) -> dict | None:
@@ -132,10 +172,26 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
+        json.dumps(_ordered_root_config(data), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     tmp.replace(path)
+
+
+def _ordered_root_config(data: dict) -> dict:
+    """Order root config keys: known fields first, unknown fields, backup last."""
+    ordered: dict = {}
+    field_names = list(Config.__dataclass_fields__)
+    backup_key = "upgraded_backup"
+    for name in field_names:
+        if name != backup_key and name in data:
+            ordered[name] = data[name]
+    known = set(field_names)
+    for name in sorted(key for key in data if key not in known):
+        ordered[name] = data[name]
+    if backup_key in data:
+        ordered[backup_key] = data[backup_key]
+    return ordered
 
 
 def _merge_missing_defaults(cfg: "Config", raw_data: dict) -> frozenset[str]:
@@ -188,14 +244,7 @@ def _normalize_loaded_config(
             cfg.config_version = ""
             changed.add("config_version")
     elif cfg.config_version != VERSION:
-        before = {
-            name: copy.deepcopy(getattr(cfg, name))
-            for name in cfg.__dataclass_fields__
-        }
-        if _apply_config_upgrades(cfg, cfg.config_version, VERSION):
-            for name in cfg.__dataclass_fields__:
-                if getattr(cfg, name) != before[name]:
-                    changed.add(name)
+        changed.update(_apply_config_upgrades(cfg, cfg.config_version, VERSION))
 
     parts = [p.strip().lower() for p in cfg.hotkey.split("+")]
     default_hotkey = _default("hotkey")
@@ -204,43 +253,27 @@ def _normalize_loaded_config(
             cfg.hotkey = default_hotkey
             changed.add("hotkey")
 
+    changed |= set(_normalize_polish_models(cfg))
+
     return frozenset(changed)
 
 
-def _apply_config_upgrades(cfg: "Config", from_version: str, to_version: str) -> bool:
-    """版本升级：按规则覆盖字段；被覆盖的旧值写入 upgraded_backup[from_version]。"""
-    if _is_dev_version(to_version):
-        return False
-    cur = (
-        (0,)
-        if _is_dev_version(from_version) or not from_version
-        else _parse_ver(from_version)
+def _apply_config_upgrades(
+    cfg: "Config",
+    from_version: str,
+    to_version: str,
+) -> frozenset[str]:
+    """版本升级：按声明式规则修改字段；旧值写入 upgraded_backup[from_version]。"""
+    return apply_config_upgrade_rules(
+        cfg,
+        from_version=from_version,
+        to_version=to_version,
+        rules=_CONFIG_UPGRADE_RULES,
+        legacy_rules=_CONFIG_UPGRADES,
+        is_known_field=lambda name: name in cfg.__dataclass_fields__,
+        get_default=_default,
+        entry_sources={"default_polish_models": default_polish_models},
     )
-    changed = False
-    backup: dict = {}
-    for ver, field_names in _CONFIG_UPGRADES:
-        if _parse_ver(ver) <= cur:
-            continue
-        for field_name, new_val in _defaults_for(*field_names).items():
-            if field_name not in cfg.__dataclass_fields__:
-                continue
-            old_val = getattr(cfg, field_name)
-            new_val_copy = copy.deepcopy(new_val)
-            if old_val != new_val_copy:
-                backup[field_name] = copy.deepcopy(old_val)
-                setattr(cfg, field_name, new_val_copy)
-                changed = True
-    if backup:
-        backup_key = from_version
-        prev = cfg.upgraded_backup.get(backup_key, {})
-        merged = copy.deepcopy(prev) if isinstance(prev, dict) else {}
-        merged.update(backup)
-        cfg.upgraded_backup[backup_key] = merged
-        changed = True
-    if cfg.config_version != to_version:
-        cfg.config_version = to_version
-        changed = True
-    return changed
 
 
 @dataclass
@@ -256,6 +289,7 @@ class Config:
     api_key: str = ""
     api_base_url: str = "https://dashscope.aliyuncs.com/api/v1"
     asr_model: str = LATEST_ASR_MODEL
+    polish_models: list = field(default_factory=default_polish_models)
     polish_model: str = "qwen3.6-flash"
 
     mic_index: int | None = None
