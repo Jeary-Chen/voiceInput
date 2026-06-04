@@ -67,11 +67,11 @@ class ConfigSyncTests(unittest.TestCase):
     def test_external_reload_updates_memory_when_idle(self):
         cfg, sync, path = self._setup()
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
         sync._request_external_reload("test")
-        self.assertEqual(cfg.polish_model, "qwen3.7-max-2026-05-20")
+        self.assertEqual(cfg.polish_model, "qwen3.7-max")
         self.assertFalse(sync.has_pending_reload)
 
     def test_runtime_reload_persists_missing_fields(self):
@@ -90,7 +90,7 @@ class ConfigSyncTests(unittest.TestCase):
     def test_external_reload_queued_when_busy(self):
         cfg, sync, path = self._setup(idle=False)
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
         sync._request_external_reload("test")
@@ -100,12 +100,12 @@ class ConfigSyncTests(unittest.TestCase):
     def test_flush_pending_reload_when_idle(self):
         cfg, sync, path = self._setup(idle=False)
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
         sync._request_external_reload("test")
         sync.bind_idle_checker(lambda: True)
         sync.flush_pending_reload()
-        self.assertEqual(cfg.polish_model, "qwen3.7-max-2026-05-20")
+        self.assertEqual(cfg.polish_model, "qwen3.7-max")
         self.assertFalse(sync.has_pending_reload)
 
     def test_ui_save_merges_external_disk_preserves_touched(self):
@@ -113,7 +113,7 @@ class ConfigSyncTests(unittest.TestCase):
 
         disk = json.loads(path.read_text(encoding="utf-8"))
         disk["paste_result"] = False
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
         cfg.polish_model = "qwen3.6-plus"
@@ -133,7 +133,7 @@ class ConfigSyncTests(unittest.TestCase):
         sync._writing = True
         try:
             disk = json.loads(path.read_text(encoding="utf-8"))
-            disk["polish_model"] = "qwen3.7-max-2026-05-20"
+            disk["polish_model"] = "qwen3.7-max"
             _write_json(path, disk)
             sync._on_file_changed(str(path))
             self.assertFalse(sync._debounce.isActive())
@@ -142,13 +142,13 @@ class ConfigSyncTests(unittest.TestCase):
             sync._suppress_until = 0.0
 
         sync._check_external_change_after_write()
-        self.assertEqual(cfg.polish_model, "qwen3.7-max-2026-05-20")
+        self.assertEqual(cfg.polish_model, "qwen3.7-max")
 
     def test_save_while_busy_writes_touched_only_and_queues_reload(self):
         cfg, sync, path = self._setup(idle=False)
         disk = json.loads(path.read_text(encoding="utf-8"))
         disk["paste_result"] = False
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
         cfg.paste_result = True
@@ -156,7 +156,7 @@ class ConfigSyncTests(unittest.TestCase):
 
         on_disk = json.loads(path.read_text(encoding="utf-8"))
         self.assertTrue(on_disk["paste_result"])
-        self.assertEqual(on_disk["polish_model"], "qwen3.7-max-2026-05-20")
+        self.assertEqual(on_disk["polish_model"], "qwen3.7-max")
         self.assertTrue(sync.has_pending_reload)
 
     def test_apply_external_reload_sets_updating_flag(self):
@@ -166,7 +166,7 @@ class ConfigSyncTests(unittest.TestCase):
         sync.apply_finished.connect(lambda: states.append("end"))
 
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
         sync._request_external_reload("test")
 
@@ -174,7 +174,7 @@ class ConfigSyncTests(unittest.TestCase):
         self.assertFalse(sync.is_updating)
 
     def test_save_while_busy_without_disk_conflict_writes_immediately(self):
-        """App→disk is NOT deferred when disk has no pending external edits."""
+        """App -> disk is NOT deferred when disk has no pending external edits."""
         cfg, sync, path = self._setup(idle=False)
         cfg.paste_result = False
         cfg.save(touched=frozenset({"paste_result"}))
@@ -187,7 +187,7 @@ class ConfigSyncTests(unittest.TestCase):
         """Touched field syncs to disk immediately; other external edits stay queued in memory."""
         cfg, sync, path = self._setup(idle=False)
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
         cfg.paste_result = False
@@ -198,13 +198,13 @@ class ConfigSyncTests(unittest.TestCase):
 
         sync.bind_idle_checker(lambda: True)
         sync.flush_pending_reload()
-        self.assertEqual(cfg.polish_model, "qwen3.7-max-2026-05-20")
+        self.assertEqual(cfg.polish_model, "qwen3.7-max")
         self.assertFalse(cfg.paste_result)
 
     def test_blocks_recording_while_pending_or_debouncing(self):
         cfg, sync, path = self._setup(idle=False)
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
         sync._request_external_reload("test")
         self.assertTrue(sync.blocks_recording)
@@ -218,23 +218,23 @@ class ConfigSyncTests(unittest.TestCase):
         """External edit while busy: app does not write back stale memory to disk."""
         cfg, sync, path = self._setup(idle=False)
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
         sync._request_external_reload("test")
         self.assertEqual(cfg.polish_model, "qwen3.6-flash")
         on_disk = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(on_disk["polish_model"], "qwen3.7-max-2026-05-20")
+        self.assertEqual(on_disk["polish_model"], "qwen3.7-max")
 
     def test_debounce_after_write_touched_only_preserves_pending(self):
         """Watcher debounce after _write_touched_only must not clear _pending_reload.
 
-        Sequence: busy + external edit → UI save (touched only) → debounce fires
-        → pending must survive so flush can resolve it later.
+        Sequence: busy + external edit -> UI save (touched only) -> debounce fires
+        -> pending must survive so flush can resolve it later.
         """
         cfg, sync, path = self._setup(idle=False)
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
         cfg.paste_result = False
@@ -270,34 +270,34 @@ class ConfigSyncTests(unittest.TestCase):
 
         recovered: list[bool] = []
         sync.config_disk_recovered.connect(lambda: recovered.append(True))
-        disk = _base_config(polish_model="qwen3.7-max-2026-05-20")
+        disk = _base_config(polish_model="qwen3.7-max")
         _write_json(path, disk)
         sync._request_external_reload("test")
 
         self.assertEqual(recovered, [True])
         self.assertFalse(sync.disk_fault_active)
-        self.assertEqual(cfg.polish_model, "qwen3.7-max-2026-05-20")
+        self.assertEqual(cfg.polish_model, "qwen3.7-max")
 
     def test_debounce_after_idle_merge_clears_pending(self):
         """After an idle merge already synced memory, a stale debounce should clear pending."""
         cfg, sync, path = self._setup()
 
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
         sync._pending_reload = True
         sync._suppress_until = 0.0
         sync._request_external_reload("watch")
 
-        self.assertEqual(cfg.polish_model, "qwen3.7-max-2026-05-20")
+        self.assertEqual(cfg.polish_model, "qwen3.7-max")
         self.assertFalse(sync.has_pending_reload)
 
     def test_write_touched_only_suppresses_watcher(self):
         """_write_touched_only sets _writing and _suppress_until so watcher ignores own write."""
         cfg, sync, path = self._setup(idle=False)
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["polish_model"] = "qwen3.7-max-2026-05-20"
+        disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
         cfg.paste_result = False

@@ -29,20 +29,30 @@ LATEST_ASR_MODEL = "qwen3-asr-flash-2026-02-10"
 def default_polish_models() -> list[dict]:
     """Tray 润色模型菜单的出厂列表；用户可在 config.json 的 polish_models 中覆盖。"""
     return [
-        # Qwen3.6：flash → plus → max；同档无日期快照在前
+        # Qwen
+        {"id": "qwen3.5-plus-2026-04-20", "label": "Qwen3.5 Plus 2026-04-20"},
         {"id": "qwen3.6-flash", "label": "Qwen3.6 Flash"},
         {"id": "qwen3.6-flash-2026-04-16", "label": "Qwen3.6 Flash 2026-04-16"},
         {"id": "qwen3.6-plus", "label": "Qwen3.6 Plus"},
         {"id": "qwen3.6-plus-2026-04-02", "label": "Qwen3.6 Plus 2026-04-02"},
         {"id": "qwen3.6-max-preview", "label": "Qwen3.6 Max Preview"},
-        # Qwen3.7
-        {"id": "qwen3.7-max", "label": "Qwen3.7 Max"},
-        {"id": "qwen3.7-max-2026-05-20", "label": "Qwen3.7 Max 2026-05-20"},
+        {"id": "qwen3.6-27b", "label": "Qwen3.6 27B"},
+        {"id": "qwen3.6-35b-a3b", "label": "Qwen3.6 35B A3B"},
         {"id": "qwen3.7-plus", "label": "Qwen3.7 Plus"},
         {"id": "qwen3.7-plus-2026-05-26", "label": "Qwen3.7 Plus 2026-05-26"},
-        # 其他厂商
+        {"id": "qwen3.7-max", "label": "Qwen3.7 Max"},
+        {"id": "qwen3.7-max-2026-05-17", "label": "Qwen3.7 Max 2026-05-17"},
+        {"id": "qwen3.7-max-2026-05-20", "label": "Qwen3.7 Max 2026-05-20"},
+        {"id": "qwen3.7-max-preview", "label": "Qwen3.7 Max Preview"},
+        # GLM
         {"id": "glm-5.1", "label": "GLM 5.1"},
+        # Kimi
+        {"id": "kimi-k2.6", "label": "Kimi K2.6"},
+        # DeepSeek
         {"id": "deepseek-v4-flash", "label": "DeepSeek V4 Flash"},
+        {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro"},
+        # GUI
+        {"id": "gui-plus-2026-02-26", "label": "GUI Plus 2026-02-26"},
     ]
 
 
@@ -51,8 +61,12 @@ def _official_polish_model_ids() -> list[str]:
 
 
 def default_enabled_polish_models() -> list[str]:
-    """默认启用全部出厂润色模型。"""
-    return _official_polish_model_ids()
+    """默认只启用托盘菜单中的常用润色模型。"""
+    return [
+        "qwen3.6-flash",
+        "qwen3.6-plus",
+        "qwen3.7-max",
+    ]
 
 
 def _order_polish_models_catalog(items: list[tuple[str, str]]) -> list[dict]:
@@ -102,8 +116,8 @@ def enabled_polish_model_menu_items(
         items,
         allow_missing=True,
     )
-    enabled_set = set(enabled)
-    return [(mid, label) for mid, label in items if mid in enabled_set]
+    by_id = {mid: (mid, label) for mid, label in items}
+    return [by_id[mid] for mid in enabled if mid in by_id]
 
 
 def _normalize_enabled_polish_model_ids(
@@ -131,11 +145,7 @@ def _normalize_enabled_polish_model_ids(
     raise ValueError("enabled_polish_models has no valid model id")
 
 
-def _normalize_polish_models(
-    cfg: "Config",
-    *,
-    enabled_field_missing: bool = False,
-) -> frozenset[str]:
+def _normalize_polish_models(cfg: "Config") -> frozenset[str]:
     """校验 polish_models 与 polish_model 一致；非法项丢弃或回退出厂列表。"""
     changed: set[str] = set()
     items = polish_model_menu_items(cfg.polish_models)
@@ -148,11 +158,9 @@ def _normalize_polish_models(
         if canonical != cfg.polish_models:
             cfg.polish_models = canonical
             changed.add("polish_models")
-    enabled_source = None if enabled_field_missing else cfg.enabled_polish_models
     enabled_ids = _normalize_enabled_polish_model_ids(
-        enabled_source,
+        cfg.enabled_polish_models,
         items,
-        allow_missing=enabled_field_missing,
     )
     if cfg.enabled_polish_models != enabled_ids:
         cfg.enabled_polish_models = enabled_ids
@@ -343,12 +351,7 @@ def _normalize_loaded_config(
             cfg.hotkey = default_hotkey
             changed.add("hotkey")
 
-    changed |= set(
-        _normalize_polish_models(
-            cfg,
-            enabled_field_missing="enabled_polish_models" not in raw_data,
-        )
-    )
+    changed |= set(_normalize_polish_models(cfg))
 
     return frozenset(changed)
 

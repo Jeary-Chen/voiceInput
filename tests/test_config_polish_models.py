@@ -21,6 +21,29 @@ from config import (  # noqa: E402
 )
 
 
+ORDERED_MODEL_IDS = [
+    "qwen3.5-plus-2026-04-20",
+    "qwen3.6-flash",
+    "qwen3.6-flash-2026-04-16",
+    "qwen3.6-plus",
+    "qwen3.6-plus-2026-04-02",
+    "qwen3.6-max-preview",
+    "qwen3.6-27b",
+    "qwen3.6-35b-a3b",
+    "qwen3.7-plus",
+    "qwen3.7-plus-2026-05-26",
+    "qwen3.7-max",
+    "qwen3.7-max-2026-05-17",
+    "qwen3.7-max-2026-05-20",
+    "qwen3.7-max-preview",
+    "glm-5.1",
+    "kimi-k2.6",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "gui-plus-2026-02-26",
+]
+
+
 class PolishModelCatalogTests(unittest.TestCase):
     def test_menu_items_from_dict_list(self):
         models = [
@@ -34,6 +57,11 @@ class PolishModelCatalogTests(unittest.TestCase):
             with patch.dict("os.environ", {"USERPROFILE": tmp}):
                 cfg = Config.load()
         self.assertEqual(cfg.polish_models, default_polish_models())
+        self.assertEqual([entry["id"] for entry in cfg.polish_models], ORDERED_MODEL_IDS)
+        self.assertEqual(
+            cfg.enabled_polish_models,
+            ["qwen3.6-flash", "qwen3.6-plus", "qwen3.7-max"],
+        )
         self.assertEqual(cfg.enabled_polish_models, default_enabled_polish_models())
 
     def test_invalid_polish_model_reset_to_first_catalog_entry(self):
@@ -67,8 +95,8 @@ class PolishModelCatalogTests(unittest.TestCase):
         ]
 
         self.assertEqual(
-            enabled_polish_model_menu_items(models, ["b", "missing", "b"]),
-            [("b", "B")],
+            enabled_polish_model_menu_items(models, ["b", "missing", "a", "b"]),
+            [("b", "B"), ("a", "A")],
         )
 
     def test_invalid_enabled_polish_model_ids_are_skipped(self):

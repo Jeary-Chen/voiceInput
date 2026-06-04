@@ -286,8 +286,8 @@ class ConfigUpgradeOpsTests(unittest.TestCase):
                         {"id": "qwen-legacy", "label": "Legacy"},
                         {"id": "qwen3-max", "label": "Qwen3 Max"},
                     ],
+                    enabled_polish_models=["qwen-legacy", "qwen3-max"],
                 )._as_dict()
-                data.pop("enabled_polish_models", None)
                 path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
                 with patch("config._CONFIG_UPGRADE_RULES", [
