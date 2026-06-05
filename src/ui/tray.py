@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import sys
@@ -114,6 +114,24 @@ class _DeviceRefreshWorker(QThread):
         self.finished.emit(default_name, devices)
 
 
+class _RecorderPrepareWorker(QThread):
+    """Warm the recorder off the UI thread after device changes settle."""
+    finished = pyqtSignal(int, str, bool)  # generation, action, ok
+
+    def __init__(self, generation: int, recorder):
+        super().__init__()
+        self._generation = generation
+        self._recorder = recorder
+
+    def run(self):
+        try:
+            action = self._recorder.ensure_prepared()
+            self.finished.emit(self._generation, action, True)
+        except Exception as e:
+            logger.warning(f"[Tray] Deferred recorder prepare failed: {e}")
+            self.finished.emit(self._generation, "failed", False)
+
+
 class VoiceTray(QSystemTrayIcon):
 
     def __init__(
@@ -154,6 +172,13 @@ class VoiceTray(QSystemTrayIcon):
         self._pending_device_apply = False
         self._device_change_times: list[float] = []
         self._device_storm_until = 0.0
+        self._recorder_prepare_worker: _RecorderPrepareWorker | None = None
+        self._recorder_prepare_pending = False
+        self._recorder_prepare_generation = 0
+        self._recorder_prepare_timer = QTimer()
+        self._recorder_prepare_timer.setSingleShot(True)
+        self._recorder_prepare_timer.setInterval(200)
+        self._recorder_prepare_timer.timeout.connect(self._deferred_recorder_prepare)
         self._sync_autostart_state(save_if_changed=True)
         self.refresh_idle_icon()
 
@@ -503,6 +528,7 @@ class VoiceTray(QSystemTrayIcon):
                     f"'{recorder_name}' -> '{current_default}', "
                     f"will reopen on next recording"
                 )
+                self._recorder_prepare_timer.start()
         else:
             self._pending_device_apply = True
             logger.info(f"[Tray] System default changed during recording, will apply: '{current_default}'")
@@ -549,6 +575,61 @@ class VoiceTray(QSystemTrayIcon):
             self._pending_device_apply = True
         logger.info(f"[Tray] Selected device '{saved_name}' (index={old}) gone, "
                     f"switched to system default")
+
+    def _deferred_recorder_prepare(self):
+        """Warm recorder after stream invalidation settles."""
+        if self._engine.state == "recording":
+            return
+        if self._device_change_in_storm():
+            self._recorder_prepare_timer.start()
+            return
+        self._start_recorder_prepare_worker()
+
+    def _start_recorder_prepare_worker(self):
+        if self._engine.state == "recording":
+            return
+        if self._recorder_prepare_worker is not None:
+            self._recorder_prepare_pending = True
+            return
+        self._recorder_prepare_pending = False
+        self._recorder_prepare_generation += 1
+        generation = self._recorder_prepare_generation
+        worker = _RecorderPrepareWorker(generation, self._engine.recorder)
+        worker.finished.connect(self._on_recorder_prepare_done)
+        worker.finished.connect(worker.deleteLater)
+        self._recorder_prepare_worker = worker
+        logger.info(f"[Tray] Deferred recorder prepare started (gen={generation})")
+        worker.start()
+
+    def _on_recorder_prepare_done(self, generation: int, action: str, ok: bool):
+        if self._recorder_prepare_worker is not None:
+            self._recorder_prepare_worker = None
+        logger.info(
+            f"[Tray] Deferred recorder prepare finished "
+            f"(gen={generation}, action={action}, ok={ok})"
+        )
+        if self._recorder_prepare_pending and self._engine.state != "recording":
+            self._recorder_prepare_pending = False
+            self._recorder_prepare_timer.start()
+
+    def _recorder_is_ready(self) -> bool:
+        return self._engine.recorder.is_ready
+
+    def _request_record_start(self, source: str):
+        if self._engine.state != "ready":
+            return
+        if not self._recorder_is_ready():
+            logger.info(
+                "[Tray] Recorder not pre-warmed; starting through recorder "
+                f"quick-open path (source={source})"
+            )
+        self._begin_recording(source)
+
+    def _begin_recording(self, source: str):
+        if self._engine.state != "ready":
+            return
+        self._audio.play_start(source=source)
+        self._engine.toggle_record()
 
     def _recover_recorder_if_devices_returned(self):
         if self._engine.state == "recording" or not self._engine.recorder.no_device:
@@ -1179,7 +1260,8 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "ready":
             if self._faults and self._faults.guard_recording_start():
                 return
-            self._audio.play_start(source="tray_or_mini")
+            self._request_record_start("tray_or_mini")
+            return
         elif self._engine.state == "recording":
             self._audio.play_stop()
         self._engine.toggle_record()
@@ -1356,8 +1438,7 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "ready":
             if self._faults and self._faults.guard_recording_start():
                 return
-            self._audio.play_start(source="hotkey")
-            self._engine.toggle_record()
+            self._request_record_start("hotkey")
         elif self._engine.state == "recording":
             self._hotkey_hold_active = True
             self._mini.start_hotkey_hold()

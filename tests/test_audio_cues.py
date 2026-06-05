@@ -1,7 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +19,11 @@ class AudioCuesTests(unittest.TestCase):
         cues._enabled = True
         cues._sounds = {"start": b"start"}
         cues._last_start_monotonic = 0.0
+        cues._last_enqueue_monotonic = 0.0
+        cues._warmup_silence = b"warmup"
+        cues._buf = []
+        cues._stream_ready = True
+        cues._lock = MagicMock()
         return cues
 
     def test_start_sound_suppresses_immediate_duplicate(self):
@@ -41,8 +46,17 @@ class AudioCuesTests(unittest.TestCase):
 
         self.assertEqual(play.call_count, 2)
 
-    def test_play_uses_background_winsound_thread(self):
+    def test_play_enqueues_into_pyaudio_buffer(self):
         cues = self._cues()
+
+        with patch("ui.sounds.time.monotonic", return_value=10.0):
+            cues._play("start", b"wav", source="test")
+
+        self.assertEqual(cues._buf, [b"warmup", b"wav"])
+
+    def test_play_falls_back_to_winsound_thread_when_pyaudio_unavailable(self):
+        cues = self._cues()
+        cues._stream_ready = False
         started = []
 
         class FakeThread:

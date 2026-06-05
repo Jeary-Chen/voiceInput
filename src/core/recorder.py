@@ -17,6 +17,8 @@ _TAG = "[Recorder]"
 #   22050 — non-integer ratio
 #    8000 — low quality, data loss
 _PREFERRED_RATES = (16000, 32000, 48000, 44100, 22050, 8000)
+_CALLBACK_BUFFER_SEC = 0.20
+_MIN_FRAMES_PER_BUFFER = 2400
 
 
 def _fix_name(name: str) -> str:
@@ -86,6 +88,11 @@ class VoiceRecorder:
     @property
     def no_device(self) -> bool:
         return self._no_device
+
+    @property
+    def is_ready(self) -> bool:
+        with self._lifecycle_lock:
+            return self._prepared and self._stream is not None and not self._no_device
 
     @property
     def peak_amplitude(self) -> int:
@@ -163,20 +170,36 @@ class VoiceRecorder:
             self._prepared = False
 
     def invalidate_stream(self, reason: str = "") -> bool:
-        """Drop any pre-opened stream; start() will prepare against current devices."""
+        """Drop pre-opened stream so start() will reopen against current devices.
+
+        Keeps PyAudio alive — only the stream is closed.  This makes
+        the next start() much cheaper: it skips Pa_Initialize and only
+        re-negotiates + re-opens the stream (~100 ms vs ~1-3 s).
+        """
         with self._lifecycle_lock:
-            had_resources = (
-                self._stream is not None
-                or self._pa is not None
-            )
-            if not had_resources:
-                self._prepared = False
+            if self._stream is None and self._prepared:
                 return False
-            self._release_pa()
+            self._close_stream()
             self._prepared = False
             suffix = f": {reason}" if reason else ""
             logger.info(f"{_TAG} Prepared stream invalidated{suffix}")
             return True
+
+    def ensure_prepared(self) -> str:
+        """Make the recorder ready without needlessly recreating PyAudio.
+
+        This is the safe background-prewarm entry point after device changes.
+        If PyAudio is still alive, only the stream is reopened.  A full
+        prepare() is reserved for cold startup or hard recovery.
+        """
+        with self._lifecycle_lock:
+            if self._prepared and self._stream is not None:
+                return "already_ready"
+            if self._pa is None:
+                self.prepare()
+                return "prepared"
+            self._quick_reopen()
+            return "quick_reopen"
 
     def set_device(self, index: int | None, preferred_name: str = ""):
         with self._lifecycle_lock:
@@ -207,8 +230,10 @@ class VoiceRecorder:
             self._consecutive_errors = 0
             self._last_callback_time = time.monotonic()
 
-            if not self._prepared or self._pa is None:
+            if self._pa is None:
                 self.prepare()
+            elif not self._prepared:
+                self._quick_reopen()
 
             if self._no_device:
                 raise OSError("未找到输入设备")
@@ -270,6 +295,45 @@ class VoiceRecorder:
             self._total_bytes = 0
             logger.info(f"{_TAG} Recording cancelled, chunks discarded")
 
+    def _quick_reopen(self):
+        """Re-query device info and reopen stream without recreating PyAudio.
+
+        Falls back to full prepare() if the lightweight path fails.
+        ~100 ms vs ~1-3 s for full prepare on Bluetooth devices.
+        """
+        t0 = time.perf_counter()
+        self._close_stream()
+        info = self._device_info()
+
+        if info is None:
+            self._no_device = True
+            self._device_name = "Unknown"
+            self._prepared = True
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info(f"{_TAG} Quick reopen: no device ({elapsed_ms:.0f}ms)")
+            return
+
+        self._no_device = False
+        self._device_name = _fix_name(info.get("name", "Unknown"))
+        self._native_rate = int(info.get("defaultSampleRate", 0))
+        self._max_channels = int(info.get("maxInputChannels", self.CHANNELS))
+        self._stream_rate, self._stream_channels = self._negotiate_params()
+
+        stream_ok = self._try_open_at(self._stream_rate, self._stream_channels)
+        if not stream_ok:
+            stream_ok = self._try_open_stream()
+
+        if stream_ok:
+            self._prepared = True
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info(
+                f"{_TAG} Quick reopen '{self._device_name}' | "
+                f"{self._stream_rate} Hz ch={self._stream_channels} | "
+                f"({elapsed_ms:.0f}ms)")
+        else:
+            logger.warning(f"{_TAG} Quick reopen failed, falling back to full prepare")
+            self.prepare()
+
     # ── stream management ──
 
     def _try_open_stream(self) -> bool:
@@ -297,7 +361,7 @@ class VoiceRecorder:
             logger.warning(f"{_TAG} open() skipped @ {rate} Hz ch={channels}: PyAudio not initialized")
             return False
         try:
-            block = max(int(rate * 0.2), 1600)
+            block = max(int(rate * _CALLBACK_BUFFER_SEC), _MIN_FRAMES_PER_BUFFER)
             kwargs = dict(
                 format=pyaudio.paInt16,
                 channels=channels,
