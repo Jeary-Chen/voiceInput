@@ -201,9 +201,9 @@ class VoiceEngine(QObject):
                 base_url=cfg.api_base_url,
             )
         if changed & {"mic_name", "mic_index"} and self.state != "recording":
-            self._apply_mic_device()
+            self.apply_mic_device()
 
-    def _apply_mic_device(self) -> None:
+    def apply_mic_device(self) -> None:
         cfg = self.config
         resolved = None
         if cfg.mic_name:

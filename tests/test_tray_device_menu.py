@@ -4,7 +4,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PyQt6.QtCore import QPoint
 from PyQt6.QtWidgets import QApplication, QMenu
 
 
@@ -19,10 +18,11 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
     def setUpClass(cls):
         cls._app = QApplication.instance() or QApplication([])
 
-    def test_rebuild_reopens_visible_submenu_after_refresh(self):
+    def test_rebuild_updates_visible_submenu_in_place(self):
         from ui.tray import VoiceTray
 
         menu = QMenu()
+        parent_menu = QMenu()
         tray = SimpleNamespace(
             _config=SimpleNamespace(mic_name=""),
             _cached_default_name="Built-in Mic",
@@ -31,28 +31,92 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             ],
             _dev_menu_dirty=True,
             _device_menu=menu,
+            contextMenu=lambda: parent_menu,
         )
-
-        popup_calls = []
-        timer_calls = []
-
-        def fake_single_shot(_delay, callback):
-            timer_calls.append(_delay)
-            callback()
 
         with patch.object(menu, "isVisible", return_value=True):
             with patch.object(menu, "close") as close:
-                with patch("ui.tray.popup_tray_submenu", side_effect=lambda m, pos: popup_calls.append(pos)):
-                    with patch("ui.tray.QCursor.pos", return_value=QPoint(100, 200)):
-                        with patch("ui.tray.QTimer.singleShot", side_effect=fake_single_shot):
-                            VoiceTray._rebuild_device_menu(tray)
+                with patch.object(menu, "setActiveAction") as set_active:
+                    with patch("ui.tray.anchor_left_cascade_submenu") as anchor:
+                        with patch.object(menu, "updateGeometry") as update_geometry:
+                            with patch.object(menu, "update") as update:
+                                VoiceTray._rebuild_device_menu(tray)
 
-        close.assert_called_once()
+        close.assert_not_called()
+        set_active.assert_called_once_with(None)
+        anchor.assert_called_once_with(menu, parent_menu)
+        update_geometry.assert_called_once()
+        update.assert_called_once()
         labels = [action.text() for action in menu.actions() if not action.isSeparator()]
         self.assertIn("Headphones", labels)
-        self.assertEqual(popup_calls, [QPoint(100, 200)])
-        self.assertEqual(timer_calls, [0])
         self.assertFalse(tray._dev_menu_dirty)
+
+    def test_system_default_change_invalidates_stream_without_reprepare(self):
+        from ui.tray import VoiceTray
+
+        calls = []
+        recorder = SimpleNamespace(
+            device_name="Old Default",
+            invalidate_stream=lambda reason="": calls.append(reason) or True,
+        )
+        tray = SimpleNamespace(
+            _config=SimpleNamespace(mic_name=""),
+            _cached_default_name="New Default",
+            _engine=SimpleNamespace(state="ready", recorder=recorder),
+            _pending_device_apply=False,
+        )
+
+        VoiceTray._sync_system_default_device(tray)
+
+        self.assertEqual(calls, ["system default device changed"])
+        self.assertFalse(tray._pending_device_apply)
+
+    def test_device_storm_delays_audio_apply(self):
+        from ui.tray import VoiceTray
+
+        starts = []
+        tray = SimpleNamespace(
+            _device_change_times=[0.0, 1.0, 2.0],
+            _device_storm_until=0.0,
+            _device_change_timer=SimpleNamespace(start=lambda delay: starts.append(delay)),
+        )
+
+        with patch("ui.tray.time.monotonic", return_value=3.0):
+            VoiceTray._on_audio_device_changed(tray)
+
+        self.assertEqual(starts, [2000])
+        self.assertAlmostEqual(tray._device_storm_until, 5.0)
+
+    def test_refresh_during_storm_only_updates_menu_cache(self):
+        from ui.tray import VoiceTray
+
+        calls = []
+        tray = SimpleNamespace(
+            _dev_refresh_ready=True,
+            _cached_default_name="Old Mic",
+            _cached_devices=[],
+            _last_menu_refresh_time=0.0,
+            _device_storm_until=999.0,
+            _dev_refresh_running=True,
+            _dev_refresh_repeat=False,
+            _device_change_in_storm=lambda: True,
+            _sync_system_default_device=lambda: calls.append("sync"),
+            _auto_fallback_if_device_gone=lambda: calls.append("fallback"),
+            _recover_recorder_if_devices_returned=lambda: calls.append("recover"),
+            _rebuild_device_menu=lambda: calls.append("rebuild"),
+            _sync_tray_icon_with_engine=lambda: calls.append("icon"),
+        )
+
+        with patch("ui.tray.time.monotonic", return_value=10.0):
+            VoiceTray._on_refresh_result(
+                tray,
+                "New Mic",
+                [{"name": "New Mic", "display_name": "New Mic", "index": 1}],
+            )
+
+        self.assertEqual(calls, ["rebuild", "icon"])
+        self.assertEqual(tray._cached_default_name, "New Mic")
+        self.assertFalse(tray._dev_refresh_running)
 
 
 if __name__ == "__main__":

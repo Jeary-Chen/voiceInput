@@ -1,4 +1,5 @@
 import time
+import threading
 from typing import Callable
 
 import numpy as np
@@ -76,6 +77,7 @@ class VoiceRecorder:
         self._native_rate: int = 0
         self._prepared = False
         self._no_device = False
+        self._lifecycle_lock = threading.RLock()
 
     @property
     def is_recording(self) -> bool:
@@ -109,138 +111,164 @@ class VoiceRecorder:
 
         If the pre-open fails (rare), start() will retry on demand.
         """
-        self._close_stream()
-        self._release_pa()
-        t0 = time.perf_counter()
-        self._pa = pyaudio.PyAudio()
-        info = self._device_info()
+        with self._lifecycle_lock:
+            self._prepared = False
+            self._close_stream()
+            self._release_pa()
+            t0 = time.perf_counter()
+            self._pa = pyaudio.PyAudio()
+            info = self._device_info()
 
-        if info is None:
+            if info is None:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                self._no_device = True
+                self._device_name = "Unknown"
+                self._native_rate = 0
+                self._max_channels = 0
+                self._stream_rate = self.TARGET_RATE
+                self._stream_channels = self.CHANNELS
+                logger.info(f"{_TAG} No input device | NO STREAM ({elapsed_ms:.0f}ms)")
+                self._prepared = True
+                return
+
+            self._no_device = False
+            self._device_name = _fix_name(info.get("name", "Unknown"))
+            self._native_rate = int(info.get("defaultSampleRate", 0))
+            self._max_channels = int(info.get("maxInputChannels", self.CHANNELS))
+
+            self._stream_rate, self._stream_channels = self._negotiate_params()
+
+            stream_ok = self._try_open_at(self._stream_rate, self._stream_channels)
+            if not stream_ok:
+                logger.warning(f"{_TAG} Negotiated params failed, trying alternatives")
+                stream_ok = self._try_open_stream()
+
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            self._no_device = True
-            self._device_name = "Unknown"
-            self._native_rate = 0
-            self._max_channels = 0
-            self._stream_rate = self.TARGET_RATE
-            self._stream_channels = self.CHANNELS
-            logger.info(f"{_TAG} No input device | NO STREAM ({elapsed_ms:.0f}ms)")
+            ch_note = f" ch={self._stream_channels}→mono" \
+                if self._stream_channels > 1 else ""
+            rate_note = f" resample→{self.TARGET_RATE}" \
+                if self._stream_rate != self.TARGET_RATE else ""
+            status = "ready" if stream_ok else "NO STREAM"
+            logger.info(
+                f"{_TAG} Prepared '{self._device_name}' | "
+                f"native={self._native_rate} Hz ch={self._max_channels} | "
+                f"stream={self._stream_rate} Hz{ch_note}{rate_note} | "
+                f"{status} ({elapsed_ms:.0f}ms)")
             self._prepared = True
-            return
-
-        self._no_device = False
-        self._device_name = _fix_name(info.get("name", "Unknown"))
-        self._native_rate = int(info.get("defaultSampleRate", 0))
-        self._max_channels = int(info.get("maxInputChannels", self.CHANNELS))
-
-        self._stream_rate, self._stream_channels = self._negotiate_params()
-
-        stream_ok = self._try_open_at(self._stream_rate, self._stream_channels)
-        if not stream_ok:
-            logger.warning(f"{_TAG} Negotiated params failed, trying alternatives")
-            stream_ok = self._try_open_stream()
-
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        ch_note = f" ch={self._stream_channels}→mono" \
-            if self._stream_channels > 1 else ""
-        rate_note = f" resample→{self.TARGET_RATE}" \
-            if self._stream_rate != self.TARGET_RATE else ""
-        status = "ready" if stream_ok else "NO STREAM"
-        logger.info(
-            f"{_TAG} Prepared '{self._device_name}' | "
-            f"native={self._native_rate} Hz ch={self._max_channels} | "
-            f"stream={self._stream_rate} Hz{ch_note}{rate_note} | "
-            f"{status} ({elapsed_ms:.0f}ms)")
-        self._prepared = True
 
     def release(self):
         """Full shutdown — terminate PyAudio. Call on app exit."""
-        self._release_pa()
-        self._prepared = False
+        with self._lifecycle_lock:
+            self._release_pa()
+            self._prepared = False
+
+    def invalidate_stream(self, reason: str = "") -> bool:
+        """Drop any pre-opened stream; start() will prepare against current devices."""
+        with self._lifecycle_lock:
+            had_resources = (
+                self._stream is not None
+                or self._pa is not None
+            )
+            if not had_resources:
+                self._prepared = False
+                return False
+            self._release_pa()
+            self._prepared = False
+            suffix = f": {reason}" if reason else ""
+            logger.info(f"{_TAG} Prepared stream invalidated{suffix}")
+            return True
 
     def set_device(self, index: int | None, preferred_name: str = ""):
-        old = self._device_index
-        old_name = self._preferred_name
-        self._device_index = index
-        self._preferred_name = preferred_name
-        logger.info(
-            f"{_TAG} Device changed: index {old} → {index}, "
-            f"name '{old_name or 'system default'}' → '{preferred_name or 'system default'}'"
-        )
-        self.prepare()
+        with self._lifecycle_lock:
+            old = self._device_index
+            old_name = self._preferred_name
+            self._device_index = index
+            self._preferred_name = preferred_name
+            logger.info(
+                f"{_TAG} Device changed: index {old} → {index}, "
+                f"name '{old_name or 'system default'}' → '{preferred_name or 'system default'}'"
+            )
+            self.prepare()
 
     # ── recording lifecycle ──
 
     def start(self, on_audio_data: Callable[[bytes], None] | None = None,
               on_max_reached: Callable[[], None] | None = None,
               on_mic_error: Callable[[], None] | None = None):
-        self._audio_chunks = []
-        self._total_bytes = 0
-        self._on_audio_data = on_audio_data
-        self._on_max_reached = on_max_reached
-        self._on_mic_error = on_mic_error
-        self._chunk_count = 0
-        self._peak_amplitude = 0
-        self._status_errors = 0
-        self._consecutive_errors = 0
-        self._last_callback_time = time.monotonic()
+        with self._lifecycle_lock:
+            self._audio_chunks = []
+            self._total_bytes = 0
+            self._on_audio_data = on_audio_data
+            self._on_max_reached = on_max_reached
+            self._on_mic_error = on_mic_error
+            self._chunk_count = 0
+            self._peak_amplitude = 0
+            self._status_errors = 0
+            self._consecutive_errors = 0
+            self._last_callback_time = time.monotonic()
 
-        if not self._prepared:
-            self.prepare()
+            if not self._prepared or self._pa is None:
+                self.prepare()
 
-        if not self._stream:
-            if not self._try_open_at(self._stream_rate, self._stream_channels):
-                logger.warning(f"{_TAG} Negotiated params failed, trying alternatives")
-                if not self._try_open_stream():
-                    raise OSError(f"无法打开设备 '{self._device_name}'")
+            if self._no_device:
+                raise OSError("未找到输入设备")
 
-        t0 = time.perf_counter()
-        self._recording = True
-        try:
-            self._stream.start_stream()
-        except OSError:
-            self._recording = False
-            logger.warning(f"{_TAG} start_stream() failed, re-opening")
-            self._close_stream()
-            if not self._try_open_at(self._stream_rate, self._stream_channels):
-                if not self._try_open_stream():
-                    raise OSError(f"无法打开设备 '{self._device_name}'")
+            if not self._stream:
+                if not self._try_open_at(self._stream_rate, self._stream_channels):
+                    logger.warning(f"{_TAG} Negotiated params failed, trying alternatives")
+                    if not self._try_open_stream():
+                        raise OSError(f"无法打开设备 '{self._device_name}'")
+
+            t0 = time.perf_counter()
             self._recording = True
-            self._stream.start_stream()
-        start_ms = (time.perf_counter() - t0) * 1000
+            try:
+                self._stream.start_stream()
+            except OSError:
+                self._recording = False
+                logger.warning(f"{_TAG} start_stream() failed, re-opening")
+                self._close_stream()
+                if not self._try_open_at(self._stream_rate, self._stream_channels):
+                    if not self._try_open_stream():
+                        raise OSError(f"无法打开设备 '{self._device_name}'")
+                self._recording = True
+                self._stream.start_stream()
+            start_ms = (time.perf_counter() - t0) * 1000
 
-        dev_label = f"device {self._device_index}" \
-            if self._device_index is not None else "default"
-        logger.info(f"{_TAG} Recording started: {dev_label} "
-                    f"'{self._device_name}' @ {self._stream_rate} Hz "
-                    f"ch={self._stream_channels} (start_stream {start_ms:.0f}ms)")
+            dev_label = f"device {self._device_index}" \
+                if self._device_index is not None else "default"
+            logger.info(f"{_TAG} Recording started: {dev_label} "
+                        f"'{self._device_name}' @ {self._stream_rate} Hz "
+                        f"ch={self._stream_channels} (start_stream {start_ms:.0f}ms)")
 
     def stop(self) -> bytes:
-        self._recording = False
-        self._stop_stream()
+        with self._lifecycle_lock:
+            self._recording = False
+            self._stop_stream()
 
-        if not self._audio_chunks:
-            logger.warning(f"{_TAG} Stop: no audio chunks collected")
-            return b""
+            if not self._audio_chunks:
+                logger.warning(f"{_TAG} Stop: no audio chunks collected")
+                return b""
 
-        pcm = b"".join(self._audio_chunks)
-        raw_duration = len(pcm) / (self._stream_rate * 2)
+            pcm = b"".join(self._audio_chunks)
+            raw_duration = len(pcm) / (self._stream_rate * 2)
 
-        if self._stream_rate != self.TARGET_RATE:
-            pcm = _resample(pcm, self._stream_rate, self.TARGET_RATE)
-            logger.debug(f"{_TAG} Resampled {self._stream_rate} → {self.TARGET_RATE} Hz")
+            if self._stream_rate != self.TARGET_RATE:
+                pcm = _resample(pcm, self._stream_rate, self.TARGET_RATE)
+                logger.debug(f"{_TAG} Resampled {self._stream_rate} → {self.TARGET_RATE} Hz")
 
-        duration = len(pcm) / (self.TARGET_RATE * 2)
-        logger.info(f"{_TAG} Stop: {self._chunk_count} chunks, "
-                    f"{raw_duration:.1f}s captured, {duration:.1f}s output, "
-                    f"peak={self._peak_amplitude}, errors={self._status_errors}")
-        return pcm
+            duration = len(pcm) / (self.TARGET_RATE * 2)
+            logger.info(f"{_TAG} Stop: {self._chunk_count} chunks, "
+                        f"{raw_duration:.1f}s captured, {duration:.1f}s output, "
+                        f"peak={self._peak_amplitude}, errors={self._status_errors}")
+            return pcm
 
     def cancel(self):
-        self._recording = False
-        self._stop_stream()
-        self._audio_chunks = []
-        self._total_bytes = 0
-        logger.info(f"{_TAG} Recording cancelled, chunks discarded")
+        with self._lifecycle_lock:
+            self._recording = False
+            self._stop_stream()
+            self._audio_chunks = []
+            self._total_bytes = 0
+            logger.info(f"{_TAG} Recording cancelled, chunks discarded")
 
     # ── stream management ──
 
@@ -265,6 +293,9 @@ class VoiceRecorder:
         return False
 
     def _try_open_at(self, rate: int, channels: int) -> bool:
+        if self._pa is None:
+            logger.warning(f"{_TAG} open() skipped @ {rate} Hz ch={channels}: PyAudio not initialized")
+            return False
         try:
             block = max(int(rate * 0.2), 1600)
             kwargs = dict(

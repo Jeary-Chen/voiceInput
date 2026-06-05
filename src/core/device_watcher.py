@@ -220,6 +220,9 @@ class _NotificationClient(COMObject):
         return 0
 
     def OnDefaultDeviceChanged(self, flow, role, pwstrDefaultDeviceId):
+        if flow != _eCapture:
+            logger.debug(f"{_TAG} Ignored render default change flow={flow} role={role}")
+            return 0
         logger.info(f"{_TAG} OnDefaultDeviceChanged flow={flow} role={role}")
         self._emitter.changed.emit()
         return 0

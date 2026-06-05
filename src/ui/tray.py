@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, TypeVar
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QCoreApplication, QObject, QEvent,
 )
-from PyQt6.QtGui import QAction, QCursor
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication,
     QDialog, QFileDialog,
@@ -31,7 +31,7 @@ from ui.window_focus import widget_is_foreground
 from ui.apikey_dialog import _ApiKeyDialog
 from ui.update_ui import (
     _UpdateNotesDialog, _UpdateReadyDialog, _UpdateMenuHelper,
-    apply_tray_menu_style, install_left_cascade_submenu, popup_tray_submenu,
+    anchor_left_cascade_submenu, apply_tray_menu_style, install_left_cascade_submenu,
 )
 from ui.prompt_dialog import _PolishPromptDialog
 
@@ -47,6 +47,10 @@ _AUTOSTART_VALUE_NAME = "VoiceInput"
 
 
 _TRAY_MENU_DEFAULT_PROMPT = "__tray_default_prompt__"
+_DEVICE_CHANGE_DEBOUNCE_MS = 500
+_DEVICE_STORM_WINDOW_SEC = 4.0
+_DEVICE_STORM_EVENT_LIMIT = 4
+_DEVICE_STORM_QUIET_SEC = 2.0
 
 
 class _ForegroundHotkeyGateFilter(QObject):
@@ -72,10 +76,8 @@ class _DeviceRefreshWorker(QThread):
     """Enumerate audio devices off the main thread."""
     finished = pyqtSignal(str, list)  # (default_name, devices)
 
-    def __init__(self, release_recorder, release_audio):
+    def __init__(self):
         super().__init__()
-        self._release_recorder = release_recorder
-        self._release_audio = release_audio
 
     def run(self):
         from core.recorder import VoiceRecorder
@@ -84,8 +86,6 @@ class _DeviceRefreshWorker(QThread):
             get_full_device_names,
         )
         try:
-            self._release_recorder()
-            self._release_audio()
             full_names = get_full_device_names()
             default_name = (
                 get_default_capture_device_name()
@@ -152,6 +152,8 @@ class VoiceTray(QSystemTrayIcon):
         self._faults: FaultCoordinator | None = None
         self._notifier: Notifier | None = None
         self._pending_device_apply = False
+        self._device_change_times: list[float] = []
+        self._device_storm_until = 0.0
         self._sync_autostart_state(save_if_changed=True)
         self.refresh_idle_icon()
 
@@ -181,9 +183,9 @@ class VoiceTray(QSystemTrayIcon):
         self._device_watcher = AudioDeviceWatcher()
         self._device_change_timer = QTimer()
         self._device_change_timer.setSingleShot(True)
-        self._device_change_timer.setInterval(500)
+        self._device_change_timer.setInterval(_DEVICE_CHANGE_DEBOUNCE_MS)
         self._device_change_timer.timeout.connect(self._start_async_refresh)
-        self._device_watcher.signals.changed.connect(self._device_change_timer.start)
+        self._device_watcher.signals.changed.connect(self._on_audio_device_changed)
         self._device_watcher.start()
 
         self._can_update = can_self_update()
@@ -399,10 +401,34 @@ class VoiceTray(QSystemTrayIcon):
         self.setContextMenu(menu)
 
         self._rebuild_prompt_menu()
-        self._skip_pa_release = True
         self._start_async_refresh()
 
     # ── device refresh (background thread) ──
+
+    def _on_audio_device_changed(self):
+        now = time.monotonic()
+        self._device_change_times = [
+            t for t in self._device_change_times
+            if now - t <= _DEVICE_STORM_WINDOW_SEC
+        ]
+        self._device_change_times.append(now)
+
+        delay_ms = _DEVICE_CHANGE_DEBOUNCE_MS
+        if len(self._device_change_times) >= _DEVICE_STORM_EVENT_LIMIT:
+            self._device_storm_until = max(
+                self._device_storm_until,
+                now + _DEVICE_STORM_QUIET_SEC,
+            )
+            delay_ms = int(_DEVICE_STORM_QUIET_SEC * 1000)
+            logger.info(
+                f"[Tray] Audio device storm detected "
+                f"({len(self._device_change_times)} events/"
+                f"{_DEVICE_STORM_WINDOW_SEC:.0f}s), delaying audio apply"
+            )
+        self._device_change_timer.start(delay_ms)
+
+    def _device_change_in_storm(self) -> bool:
+        return time.monotonic() < self._device_storm_until
 
     def _on_menu_about_to_show(self):
         now = time.monotonic()
@@ -411,28 +437,12 @@ class VoiceTray(QSystemTrayIcon):
         self._last_menu_refresh_time = now
         self._start_async_refresh()
 
-    def _release_recorder_pa(self):
-        if (self._engine.state != "recording"
-                and self._engine.recorder._pa is not None):
-            self._engine.recorder._release_pa()
-
-    def _restore_all_pa(self):
-        if not self._audio._stream_ready:
-            self._audio._init_stream()
-        if self._engine.recorder._pa is None and self._engine.state != "recording":
-            self._engine.recorder.prepare()
-
     def _start_async_refresh(self):
         if self._dev_refresh_running:
             self._dev_refresh_repeat = True
             return
         self._dev_refresh_running = True
-        skip = getattr(self, '_skip_pa_release', False)
-        self._skip_pa_release = False
-        self._skip_pa_restore = skip
-        release_rec = (lambda: None) if skip else self._release_recorder_pa
-        release_audio = (lambda: None) if skip else self._audio.release
-        worker = _DeviceRefreshWorker(release_rec, release_audio)
+        worker = _DeviceRefreshWorker()
         worker.finished.connect(self._on_refresh_result)
         worker.finished.connect(worker.deleteLater)
         self._dev_refresh_worker = worker
@@ -450,11 +460,13 @@ class VoiceTray(QSystemTrayIcon):
         self._last_menu_refresh_time = time.monotonic()
         logger.info(f"[Tray] Device refresh done: "
                     f"default='{default_name}', {len(devices)} device(s)")
-        if not self._skip_pa_restore:
-            self._restore_all_pa()
-        self._skip_pa_restore = False
-        self._sync_system_default_device()
-        self._auto_fallback_if_device_gone()
+        defer_audio_apply = self._device_change_in_storm()
+        if defer_audio_apply:
+            logger.info("[Tray] Device list refreshed during storm; audio apply deferred")
+        else:
+            self._sync_system_default_device()
+            self._auto_fallback_if_device_gone()
+            self._recover_recorder_if_devices_returned()
         if not unchanged:
             self._rebuild_device_menu()
         self._sync_tray_icon_with_engine()
@@ -482,8 +494,15 @@ class VoiceTray(QSystemTrayIcon):
         if not current_default or recorder_name == current_default:
             return
         if self._engine.state != "recording":
-            self._engine.recorder.set_device(None, "")
-            logger.info(f"[Tray] System default device changed: '{recorder_name}' -> '{current_default}'")
+            invalidated = self._engine.recorder.invalidate_stream(
+                "system default device changed"
+            )
+            if invalidated:
+                logger.info(
+                    f"[Tray] System default device changed: "
+                    f"'{recorder_name}' -> '{current_default}', "
+                    f"will reopen on next recording"
+                )
         else:
             self._pending_device_apply = True
             logger.info(f"[Tray] System default changed during recording, will apply: '{current_default}'")
@@ -531,13 +550,16 @@ class VoiceTray(QSystemTrayIcon):
         logger.info(f"[Tray] Selected device '{saved_name}' (index={old}) gone, "
                     f"switched to system default")
 
-    def _rebuild_device_menu(self):
-        # Qt does not repaint an open QMenu popup after clear()+rebuild; close and
-        # reopen so hot-plugged devices appear while the submenu stays under the cursor.
-        reopen_pos = QCursor.pos() if self._device_menu.isVisible() else None
-        if reopen_pos is not None:
-            self._device_menu.close()
+    def _recover_recorder_if_devices_returned(self):
+        if self._engine.state == "recording" or not self._engine.recorder.no_device:
+            return
+        if not self._cached_default_name and not self._cached_devices:
+            return
+        logger.info("[Tray] Input device available again, re-preparing recorder")
+        self._engine.apply_mic_device()
 
+    def _rebuild_device_menu(self):
+        menu_visible = self._device_menu.isVisible()
         self._device_menu.clear()
         self._dev_menu_dirty = False
 
@@ -563,11 +585,17 @@ class VoiceTray(QSystemTrayIcon):
                     lambda checked, idx=dev.get("index"), name=dev["name"]: self._set_device(name, idx))
                 self._device_menu.addAction(act)
 
-        if reopen_pos is not None:
-            QTimer.singleShot(
-                0,
-                lambda p=reopen_pos: popup_tray_submenu(self._device_menu, p),
-            )
+        if menu_visible:
+            # Keep the popup and its parent-hover relationship intact; only the action
+            # list changes, so cursor-leave behavior remains owned by Qt's menu logic.
+            self._device_menu.setActiveAction(None)
+            parent_menu = self.contextMenu()
+            if parent_menu is not None:
+                anchor_left_cascade_submenu(self._device_menu, parent_menu)
+            else:
+                self._device_menu.adjustSize()
+            self._device_menu.updateGeometry()
+            self._device_menu.update()
 
     def _set_mode(self, mode_id: str):
         self._config.mode = mode_id
