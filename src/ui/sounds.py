@@ -115,18 +115,30 @@ class AudioCues:
         self._pa: pyaudio.PyAudio | None = None
         self._stream: pyaudio.Stream | None = None
         self._lock = threading.Lock()
+        self._init_lock = threading.Lock()
         self._buf: collections.deque[bytes] = collections.deque()
         self._stream_ready = False
+        self._init_started = False
+        self._released = False
         self._last_start_monotonic = 0.0
         self._last_enqueue_monotonic = 0.0
         self._warmup_silence = b"\x00" * int(_SAMPLE_RATE * _WARMUP_SILENCE_SEC) * 2
-        self._init_stream()
+        self._init_stream_async()
+
+    def _init_stream_async(self):
+        with self._init_lock:
+            if self._init_started or self._stream_ready or self._released:
+                return
+            self._init_started = True
+        threading.Thread(target=self._init_stream, name="AudioCueInit", daemon=True).start()
 
     def _init_stream(self):
+        pa = None
+        stream = None
         try:
             t0 = time.perf_counter()
-            self._pa = pyaudio.PyAudio()
-            self._stream = self._pa.open(
+            pa = pyaudio.PyAudio()
+            stream = pa.open(
                 format=pyaudio.paInt16,
                 channels=1,
                 rate=_SAMPLE_RATE,
@@ -134,12 +146,35 @@ class AudioCues:
                 frames_per_buffer=_FRAMES_PER_BUFFER,
                 stream_callback=self._audio_callback,
             )
-            self._stream_ready = True
             ms = (time.perf_counter() - t0) * 1000
             logger.info(f"{_TAG} Callback stream ready ({ms:.0f}ms)")
+            with self._lock:
+                if self._released:
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    finally:
+                        pa.terminate()
+                    return
+                self._pa = pa
+                self._stream = stream
+                self._stream_ready = True
         except Exception as e:
             logger.warning(f"{_TAG} Stream init failed: {e}")
-            self._stream_ready = False
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+            try:
+                if pa is not None:
+                    pa.terminate()
+            except Exception:
+                pass
+            with self._lock:
+                self._stream_ready = False
+            with self._init_lock:
+                self._init_started = False
 
     def _audio_callback(self, in_data, frame_count, time_info, status):
         needed = frame_count * 2  # 16-bit mono
@@ -158,6 +193,8 @@ class AudioCues:
 
     def release(self):
         """Terminate PyAudio. Call on app exit."""
+        with self._init_lock:
+            self._released = True
         with self._lock:
             if self._stream is not None:
                 try:
@@ -184,6 +221,7 @@ class AudioCues:
         cold = (now - self._last_enqueue_monotonic) > _COLD_THRESHOLD_SEC
         with self._lock:
             if not self._stream_ready:
+                self._init_stream_async()
                 raise RuntimeError("PyAudio stream not available")
             if cold:
                 self._buf.append(self._warmup_silence)

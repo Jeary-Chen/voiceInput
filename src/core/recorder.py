@@ -418,8 +418,11 @@ class VoiceRecorder:
     # ── capability negotiation ──
 
     def _device_info(self) -> dict | None:
-        if self._preferred_name and self._device_index is None:
-            self._device_index = self.resolve_device(self._preferred_name, None)
+        if self._preferred_name:
+            self._device_index = self.resolve_device(
+                self._preferred_name,
+                self._device_index,
+            )
         if self._device_index is not None:
             try:
                 return self._pa.get_device_info_by_index(self._device_index)

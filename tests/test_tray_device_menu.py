@@ -51,11 +51,10 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         self.assertIn("Headphones", labels)
         self.assertFalse(tray._dev_menu_dirty)
 
-    def test_system_default_change_invalidates_stream_and_schedules_prepare(self):
+    def test_system_default_change_schedules_async_reopen(self):
         from ui.tray import VoiceTray
 
         calls = []
-        prepare_scheduled = []
         recorder = SimpleNamespace(
             device_name="Old Default",
             invalidate_stream=lambda reason="": calls.append(reason) or True,
@@ -65,16 +64,13 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _cached_default_name="New Default",
             _engine=SimpleNamespace(state="ready", recorder=recorder),
             _pending_device_apply=False,
-            _recorder_prepare_timer=SimpleNamespace(
-                start=lambda: prepare_scheduled.append(True),
-            ),
+            _start_recorder_prepare_worker=lambda **kwargs: calls.append(kwargs),
         )
 
         VoiceTray._sync_system_default_device(tray)
 
-        self.assertEqual(calls, ["system default device changed"])
+        self.assertEqual(calls, [{"invalidate_reason": "system default device changed"}])
         self.assertFalse(tray._pending_device_apply)
-        self.assertTrue(prepare_scheduled, "deferred prepare should be scheduled")
 
     def test_device_storm_delays_audio_apply(self):
         from ui.tray import VoiceTray
@@ -104,6 +100,11 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _device_storm_until=999.0,
             _dev_refresh_running=True,
             _dev_refresh_repeat=False,
+            _engine=SimpleNamespace(
+                state="ready",
+                recorder=SimpleNamespace(is_ready=True),
+            ),
+            _recorder_prepare_worker=None,
             _device_change_in_storm=lambda: True,
             _sync_system_default_device=lambda: calls.append("sync"),
             _auto_fallback_if_device_gone=lambda: calls.append("fallback"),
@@ -130,6 +131,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         tray = SimpleNamespace(
             _engine=SimpleNamespace(state="ready"),
             _device_change_in_storm=lambda: False,
+            _recorder_prepare_pending_job=None,
             _start_recorder_prepare_worker=lambda: calls.append("worker"),
         )
 
@@ -167,6 +169,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _audio=SimpleNamespace(
                 play_start=lambda source="": calls.append(f"sound:{source}"),
             ),
+            _recorder_prepare_worker=None,
         )
         tray._recorder_is_ready = lambda: True
         tray._begin_recording = lambda source: VoiceTray._begin_recording(tray, source)
@@ -175,7 +178,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
 
         self.assertEqual(calls, ["sound:hotkey", "toggle"])
 
-    def test_request_record_start_begins_immediately_when_not_ready(self):
+    def test_request_record_start_prepares_first_when_not_ready(self):
         from ui.tray import VoiceTray
 
         calls = []
@@ -188,13 +191,17 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _audio=SimpleNamespace(
                 play_start=lambda source="": calls.append(f"sound:{source}"),
             ),
+            _recorder_prepare_worker=None,
+            _pending_record_start_source=None,
+            _start_recorder_prepare_worker=lambda: calls.append("prepare"),
         )
         tray._recorder_is_ready = lambda: False
         tray._begin_recording = lambda source: VoiceTray._begin_recording(tray, source)
 
         VoiceTray._request_record_start(tray, "tray_or_mini")
 
-        self.assertEqual(calls, ["sound:tray_or_mini", "toggle"])
+        self.assertEqual(calls, ["prepare"])
+        self.assertEqual(tray._pending_record_start_source, "tray_or_mini")
 
     def test_prepare_done_reschedules_pending_prepare(self):
         from ui.tray import VoiceTray
@@ -205,6 +212,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _recorder_prepare_worker=object(),
             _recorder_prepare_pending=True,
             _recorder_prepare_timer=SimpleNamespace(start=lambda: calls.append("timer")),
+            _pending_record_start_source=None,
         )
 
         VoiceTray._on_recorder_prepare_done(tray, 1, "quick_reopen", True)
@@ -212,6 +220,24 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         self.assertIsNone(tray._recorder_prepare_worker)
         self.assertFalse(tray._recorder_prepare_pending)
         self.assertEqual(calls, ["timer"])
+
+    def test_prepare_done_starts_pending_recording_when_idle(self):
+        from ui.tray import VoiceTray
+
+        calls = []
+        tray = SimpleNamespace(
+            _engine=SimpleNamespace(state="ready"),
+            _recorder_prepare_worker=object(),
+            _recorder_prepare_pending=False,
+            _pending_record_start_source="hotkey",
+            _begin_recording=lambda source: calls.append(source),
+        )
+
+        VoiceTray._on_recorder_prepare_done(tray, 1, "quick_reopen", True)
+
+        self.assertIsNone(tray._recorder_prepare_worker)
+        self.assertIsNone(tray._pending_record_start_source)
+        self.assertEqual(calls, ["hotkey"])
 
 
 if __name__ == "__main__":
