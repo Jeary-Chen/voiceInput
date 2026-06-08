@@ -451,6 +451,7 @@ class VoiceTray(QSystemTrayIcon):
     # ── device refresh (background thread) ──
 
     def _on_audio_device_changed(self):
+        self._audio.refresh_output_device_async()
         now = time.monotonic()
         self._device_change_times = [
             t for t in self._device_change_times
@@ -1684,6 +1685,7 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "recording":
             self._engine.cancel()
         self._device_watcher.stop()
+        self._audio.release()
         self._engine.recorder.release()
         self._stop_hotkey_listener()
         QApplication.quit()

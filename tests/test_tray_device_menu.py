@@ -76,7 +76,11 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         from ui.tray import VoiceTray
 
         starts = []
+        audio_refreshes = []
         tray = SimpleNamespace(
+            _audio=SimpleNamespace(
+                refresh_output_device_async=lambda: audio_refreshes.append(True),
+            ),
             _device_change_times=[0.0, 1.0, 2.0],
             _device_storm_until=0.0,
             _device_change_timer=SimpleNamespace(start=lambda delay: starts.append(delay)),
@@ -85,6 +89,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         with patch("ui.tray.time.monotonic", return_value=3.0):
             VoiceTray._on_audio_device_changed(tray)
 
+        self.assertEqual(audio_refreshes, [True])
         self.assertEqual(starts, [2000])
         self.assertAlmostEqual(tray._device_storm_until, 5.0)
 

@@ -5,24 +5,22 @@ Generates short beep/chirp sounds for audio feedback:
   - stop:  short falling chirp (recording stops)
   - done:  gentle confirmation tone (transcription complete)
 
-Uses a pyaudio callback-mode output stream opened once at init and
-kept alive for the app lifetime. Sound data is queued into a buffer
-and consumed by the audio callback without blocking the caller.
+Uses a pyaudio callback-mode output stream bound to Windows' current
+default playback device. Sound data is queued into a buffer and
+consumed by the audio callback without blocking the caller.
 When the audio path has been idle long enough for the DAC / amplifier
 to enter low-power standby, a short silence prefix is injected before
 the actual sound to let the hardware wake up first.
-Falls back to winsound if pyaudio output fails.
 """
 import math
 import struct
-import io
 import collections
 import threading
 import time
-import winsound
 
 import pyaudio
 
+from core.device_watcher import get_default_render_device_name
 from core.log import logger
 
 _SAMPLE_RATE = 22050
@@ -32,21 +30,18 @@ _FRAMES_PER_BUFFER = 1024
 _START_DEBOUNCE_SEC = 0.25
 _COLD_THRESHOLD_SEC = 2.0
 _WARMUP_SILENCE_SEC = 0.1
+_OUTPUT_REOPEN_DEBOUNCE_SEC = 0.35
 
 
-def _make_wav(pcm: bytes) -> bytes:
-    """Wrap raw int16 mono PCM into a WAV container for winsound fallback."""
-    buf = io.BytesIO()
-    data_size = len(pcm)
-    buf.write(b"RIFF")
-    buf.write(struct.pack("<I", 36 + data_size))
-    buf.write(b"WAVE")
-    buf.write(b"fmt ")
-    buf.write(struct.pack("<IHHIIHH", 16, 1, 1, _SAMPLE_RATE, _SAMPLE_RATE * 2, 2, 16))
-    buf.write(b"data")
-    buf.write(struct.pack("<I", data_size))
-    buf.write(pcm)
-    return buf.getvalue()
+def _fix_name(name: str) -> str:
+    try:
+        return name.encode("gbk").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return name
+
+
+def _normalized_device_name(name: str) -> str:
+    return " ".join(_fix_name(name).casefold().split())
 
 
 def _gen_pcm(samples: list[float]) -> bytes:
@@ -96,6 +91,43 @@ def _gen_tick(volume: float = 0.25) -> bytes:
     return _gen_pcm(samples)
 
 
+def _resolve_default_output_device(pa: pyaudio.PyAudio) -> tuple[int | None, str | None]:
+    """Resolve Windows' current default render endpoint to a PyAudio device index."""
+    default_name = get_default_render_device_name()
+    if not default_name:
+        return None, None
+
+    default_norm = _normalized_device_name(default_name)
+    fallback: tuple[int, str] | None = None
+    try:
+        wasapi_hosts = {
+            idx
+            for idx in range(pa.get_host_api_count())
+            if "wasapi" in str(pa.get_host_api_info_by_index(idx).get("name", "")).casefold()
+        }
+        for idx in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(idx)
+            if int(info.get("maxOutputChannels", 0) or 0) <= 0:
+                continue
+            name = _fix_name(str(info.get("name", "")))
+            name_norm = _normalized_device_name(name)
+            if not name_norm:
+                continue
+            matches = name_norm == default_norm or name_norm in default_norm or default_norm in name_norm
+            if not matches:
+                continue
+            if info.get("hostApi") in wasapi_hosts:
+                return idx, name
+            if fallback is None:
+                fallback = (idx, name)
+    except Exception:
+        logger.opt(exception=True).warning(f"{_TAG} Failed to resolve default output device")
+
+    if fallback is not None:
+        return fallback
+    return None, default_name
+
+
 class AudioCues:
     """Manages playback of UI sound effects.
 
@@ -120,6 +152,8 @@ class AudioCues:
         self._stream_ready = False
         self._init_started = False
         self._released = False
+        self._output_device_name: str | None = None
+        self._reopen_timer: threading.Timer | None = None
         self._last_start_monotonic = 0.0
         self._last_enqueue_monotonic = 0.0
         self._warmup_silence = b"\x00" * int(_SAMPLE_RATE * _WARMUP_SILENCE_SEC) * 2
@@ -138,7 +172,8 @@ class AudioCues:
         try:
             t0 = time.perf_counter()
             pa = pyaudio.PyAudio()
-            stream = pa.open(
+            device_index, device_name = _resolve_default_output_device(pa)
+            open_kwargs = dict(
                 format=pyaudio.paInt16,
                 channels=1,
                 rate=_SAMPLE_RATE,
@@ -146,8 +181,12 @@ class AudioCues:
                 frames_per_buffer=_FRAMES_PER_BUFFER,
                 stream_callback=self._audio_callback,
             )
+            if device_index is not None:
+                open_kwargs["output_device_index"] = device_index
+            stream = pa.open(**open_kwargs)
             ms = (time.perf_counter() - t0) * 1000
-            logger.info(f"{_TAG} Callback stream ready ({ms:.0f}ms)")
+            route = device_name or "system default"
+            logger.info(f"{_TAG} Callback stream ready ({ms:.0f}ms, output={route})")
             with self._lock:
                 if self._released:
                     try:
@@ -159,6 +198,7 @@ class AudioCues:
                 self._pa = pa
                 self._stream = stream
                 self._stream_ready = True
+                self._output_device_name = device_name
         except Exception as e:
             logger.warning(f"{_TAG} Stream init failed: {e}")
             try:
@@ -173,8 +213,49 @@ class AudioCues:
                 pass
             with self._lock:
                 self._stream_ready = False
+                self._output_device_name = None
+        finally:
             with self._init_lock:
                 self._init_started = False
+
+    def refresh_output_device_async(self):
+        with self._init_lock:
+            if self._released:
+                return
+            if self._reopen_timer is not None:
+                self._reopen_timer.cancel()
+            timer = threading.Timer(_OUTPUT_REOPEN_DEBOUNCE_SEC, self._reopen_stream)
+            timer.daemon = True
+            self._reopen_timer = timer
+            timer.start()
+
+    def _reopen_stream(self):
+        with self._init_lock:
+            self._reopen_timer = None
+            self._init_started = False
+        old_stream = None
+        old_pa = None
+        with self._lock:
+            old_stream = self._stream
+            old_pa = self._pa
+            self._stream = None
+            self._pa = None
+            self._stream_ready = False
+            self._output_device_name = None
+            self._buf.clear()
+        if old_stream is not None:
+            try:
+                old_stream.stop_stream()
+                old_stream.close()
+            except Exception:
+                pass
+        if old_pa is not None:
+            try:
+                old_pa.terminate()
+            except Exception:
+                pass
+        logger.info(f"{_TAG} Reopening callback stream for current default output")
+        self._init_stream()
 
     def _audio_callback(self, in_data, frame_count, time_info, status):
         needed = frame_count * 2  # 16-bit mono
@@ -195,6 +276,9 @@ class AudioCues:
         """Terminate PyAudio. Call on app exit."""
         with self._init_lock:
             self._released = True
+            if self._reopen_timer is not None:
+                self._reopen_timer.cancel()
+                self._reopen_timer = None
         with self._lock:
             if self._stream is not None:
                 try:
@@ -210,6 +294,7 @@ class AudioCues:
                     pass
                 self._pa = None
             self._stream_ready = False
+            self._output_device_name = None
             self._buf.clear()
 
     def set_enabled(self, enabled: bool):
@@ -219,23 +304,23 @@ class AudioCues:
         t0 = time.perf_counter()
         now = time.monotonic()
         cold = (now - self._last_enqueue_monotonic) > _COLD_THRESHOLD_SEC
+        needs_init = False
         with self._lock:
-            if not self._stream_ready:
-                self._init_stream_async()
-                raise RuntimeError("PyAudio stream not available")
             if cold:
                 self._buf.append(self._warmup_silence)
             self._buf.append(pcm)
+            if not self._stream_ready:
+                needs_init = True
         self._last_enqueue_monotonic = now
+        if needs_init:
+            self._init_stream_async()
         ms = (time.perf_counter() - t0) * 1000
-        if cold:
+        if needs_init:
+            logger.info(f"{_TAG} '{name}' queued while stream initializes ({ms:.0f}ms)")
+        elif cold:
             logger.info(f"{_TAG} '{name}' enqueued with warmup prefix ({ms:.0f}ms)")
         else:
             logger.info(f"{_TAG} '{name}' enqueued ({ms:.0f}ms)")
-
-    def _play_via_winsound(self, name: str, pcm: bytes):
-        wav = _make_wav(pcm)
-        winsound.PlaySound(wav, winsound.SND_MEMORY)
 
     def _play(self, name: str, pcm: bytes, *, source: str = "unknown"):
         queue_chunks = len(self._buf)
@@ -243,16 +328,7 @@ class AudioCues:
             f"{_TAG} Playing '{name}' ({len(pcm)} B, source={source}, "
             f"queue_chunks={queue_chunks})"
         )
-        try:
-            self._enqueue(name, pcm)
-        except Exception as e:
-            logger.warning(f"{_TAG} pyaudio failed for '{name}': {e}, trying winsound")
-            try:
-                threading.Thread(
-                    target=self._play_via_winsound, args=(name, pcm), daemon=True
-                ).start()
-            except Exception as e2:
-                logger.warning(f"{_TAG} '{name}' winsound also failed: {e2}")
+        self._enqueue(name, pcm)
 
     def play_start(self, *, source: str = "unknown"):
         if self._enabled:

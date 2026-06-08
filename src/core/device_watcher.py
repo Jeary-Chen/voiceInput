@@ -51,6 +51,7 @@ _CLSID_MMDeviceEnumerator = GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
 
 _STGM_READ = 0x00000000
 _DEVICE_STATE_ACTIVE = 0x00000001
+_eRender = 0   # EDataFlow.eRender
 _eCapture = 1  # EDataFlow.eCapture
 
 # ── COM interfaces for property store ──────────────────────────────────
@@ -186,6 +187,30 @@ def get_default_capture_device_name() -> str | None:
         return None
 
 
+def get_default_render_device_name() -> str | None:
+    """Get the active default playback device friendly name via Windows COM."""
+    try:
+        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+    except OSError:
+        pass
+    try:
+        enum = comtypes.CoCreateInstance(_CLSID_MMDeviceEnumerator, IMMDeviceEnumerator)
+        device = enum.GetDefaultAudioEndpoint(_eRender, 0)
+        store = device.OpenPropertyStore(_STGM_READ)
+        pv = store.GetValue(_PKEY_Device_FriendlyName)
+        return pv.pwszVal if pv.pwszVal else None
+    except COMError as e:
+        hr = e.args[0] if e.args else 0
+        if hr == _HRESULT_NOTFOUND or (hr & 0xFFFFFFFF) == 0x80070490:
+            logger.debug(f"{_TAG} No default render endpoint (transient or none configured)")
+            return None
+        logger.opt(exception=True).warning(f"{_TAG} COM error getting default render device")
+        return None
+    except Exception:
+        logger.opt(exception=True).warning(f"{_TAG} Failed to get default render device name")
+        return None
+
+
 # ── Qt signal carrier ─────────────────────────────────────────────────
 
 class DeviceChangeSignal(QObject):
@@ -220,10 +245,11 @@ class _NotificationClient(COMObject):
         return 0
 
     def OnDefaultDeviceChanged(self, flow, role, pwstrDefaultDeviceId):
-        if flow != _eCapture:
-            logger.debug(f"{_TAG} Ignored render default change flow={flow} role={role}")
+        if flow not in (_eRender, _eCapture):
+            logger.debug(f"{_TAG} Ignored default change flow={flow} role={role}")
             return 0
-        logger.info(f"{_TAG} OnDefaultDeviceChanged flow={flow} role={role}")
+        kind = "render" if flow == _eRender else "capture"
+        logger.info(f"{_TAG} OnDefaultDeviceChanged kind={kind} role={role}")
         self._emitter.changed.emit()
         return 0
 
