@@ -226,6 +226,54 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         self.assertFalse(tray._recorder_prepare_pending)
         self.assertEqual(calls, ["timer"])
 
+    def test_set_default_device_skips_when_already_default(self):
+        from ui.tray import VoiceTray
+
+        config = SimpleNamespace(mic_name="", mic_index=None, save=lambda: (_ for _ in ()).throw(RuntimeError("save")))
+        tray = SimpleNamespace(
+            _config=config,
+            _engine=SimpleNamespace(state="recording"),
+            _pending_device_apply=False,
+            _rebuild_device_menu=lambda: (_ for _ in ()).throw(RuntimeError("rebuild")),
+            _clear_device_fault=lambda: (_ for _ in ()).throw(RuntimeError("clear")),
+            _sync_tray_icon_with_engine=lambda: (_ for _ in ()).throw(RuntimeError("icon")),
+            show_tray_message=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("message")),
+        )
+
+        VoiceTray._set_default_device(tray)
+
+    def test_set_device_skips_when_already_selected(self):
+        from ui.tray import VoiceTray
+
+        config = SimpleNamespace(
+            mic_name="Headphones",
+            mic_index=1,
+            save=lambda: (_ for _ in ()).throw(RuntimeError("save")),
+        )
+        tray = SimpleNamespace(
+            _config=config,
+            _engine=SimpleNamespace(state="recording"),
+            _pending_device_apply=False,
+            _rebuild_device_menu=lambda: (_ for _ in ()).throw(RuntimeError("rebuild")),
+            _clear_device_fault=lambda: (_ for _ in ()).throw(RuntimeError("clear")),
+            _sync_tray_icon_with_engine=lambda: (_ for _ in ()).throw(RuntimeError("icon")),
+            show_tray_message=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("message")),
+        )
+
+        VoiceTray._set_device(tray, "Headphones", 1)
+
+    def test_set_mode_skips_when_unchanged(self):
+        from ui.tray import VoiceTray
+
+        config = SimpleNamespace(mode="polish", save=lambda: (_ for _ in ()).throw(RuntimeError("save")))
+        tray = SimpleNamespace(
+            _config=config,
+            _sync_mode_menu=lambda: (_ for _ in ()).throw(RuntimeError("sync")),
+            _mini=SimpleNamespace(sync_mode=lambda: (_ for _ in ()).throw(RuntimeError("mini"))),
+        )
+
+        VoiceTray._set_mode(tray, "polish")
+
     def test_prepare_done_starts_pending_recording_when_idle(self):
         from ui.tray import VoiceTray
 

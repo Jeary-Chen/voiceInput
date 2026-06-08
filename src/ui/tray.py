@@ -750,6 +750,8 @@ class VoiceTray(QSystemTrayIcon):
             self._device_menu.update()
 
     def _set_mode(self, mode_id: str):
+        if self._config.mode == mode_id:
+            return
         self._config.mode = mode_id
         self._config.save()
         self._sync_mode_menu()
@@ -806,6 +808,8 @@ class VoiceTray(QSystemTrayIcon):
                 act.setChecked(cur == d)
 
     def _set_active_prompt(self, prompt_id: str):
+        if (self._config.active_prompt_id or "") == prompt_id:
+            return
         self._config.active_prompt_id = prompt_id
         self._config.save()
         name = ""
@@ -983,6 +987,8 @@ class VoiceTray(QSystemTrayIcon):
             self._polish_model_menu.addAction(act)
 
     def _set_polish_model(self, model_id: str):
+        if self._config.polish_model == model_id:
+            return
         self._config.polish_model = model_id
         self._config.save()
         self._engine.polisher.set_model(model_id)
@@ -1069,6 +1075,8 @@ class VoiceTray(QSystemTrayIcon):
         logger.info(f"[Tray] Mini bar show timer → {'on' if checked else 'off'}")
 
     def _set_max_duration(self, seconds: int):
+        if self._config.smart_chunk_max_duration_sec == seconds:
+            return
         self._config.smart_chunk_max_duration_sec = seconds
         self._config.save()
         for i, (dur_sec, _) in enumerate(self._duration_presets):
@@ -1170,6 +1178,8 @@ class VoiceTray(QSystemTrayIcon):
         logger.info(f"[Tray] Autostart → {'on' if checked else 'off'}")
 
     def _set_default_device(self):
+        if not self._config.mic_name:
+            return
         self._config.mic_index = None
         self._config.mic_name = ""
         self._config.save()
@@ -1189,22 +1199,23 @@ class VoiceTray(QSystemTrayIcon):
         self._sync_tray_icon_with_engine()
 
     def _set_device(self, name: str, idx: int | None = None):
-        resolved = idx if idx is not None else None
+        if self._config.mic_name == name:
+            return
         self._config.mic_name = name
-        self._config.mic_index = resolved
+        self._config.mic_index = idx
         self._config.save()
         if self._engine.state == "recording":
             self._pending_device_apply = True
             logger.info(f"[Tray] Input device saved for next session "
-                        f"→ {name} (index={resolved})")
+                        f"→ {name} (index={idx})")
             self.show_tray_message(
                 "VoiceInput", "输入设备已切换，下次录音生效",
                 QSystemTrayIcon.MessageIcon.Information, 2000,
             )
         else:
             self._pending_device_apply = False
-            self._schedule_recorder_device_apply(resolved, name)
-            logger.info(f"[Tray] Input device → {name} (index={resolved})")
+            self._schedule_recorder_device_apply(idx, name)
+            logger.info(f"[Tray] Input device → {name} (index={idx})")
         self._rebuild_device_menu()
         self._clear_device_fault()
         self._sync_tray_icon_with_engine()
