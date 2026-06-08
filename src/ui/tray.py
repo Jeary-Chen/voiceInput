@@ -1465,7 +1465,7 @@ class VoiceTray(QSystemTrayIcon):
         if (dlg is not None
                 and result == QDialog.DialogCode.Accepted
                 and dlg.restart_now):
-            self._updater.install()
+            self._updater.install(quit_fn=self._quit)
 
     def _on_update_available(self, info: UpdateInfo):
         logger.debug(f"[DEBUG] _on_update_available | remote={info.version}")

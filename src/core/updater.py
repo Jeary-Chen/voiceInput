@@ -35,6 +35,13 @@ def _update_install_log_path() -> Path:
     return log_dir / "update_install.log"
 
 
+_WAIT_PROCESS_TIMEOUT_SEC = 15
+_MANAGED_DELETE_RETRIES = 8
+_MANAGED_DELETE_DELAY_MS = 400
+_START_HEALTH_POLL_MS = 800
+_START_HEALTH_POLL_MAX = 3
+
+
 def _build_install_script(
     *,
     source: Path,
@@ -42,36 +49,112 @@ def _build_install_script(
     exe_path: Path,
     staged: Path,
     log_path: Path,
+    old_pid: int,
+    target_version: str,
 ) -> str:
+    python_dir = app_dir / "python"
+    src_dir = app_dir / "src"
+    version_file = src_dir / "_version.py"
     return (
         f'$ErrorActionPreference = "Continue"\n'
         f'$LogPath = "{log_path}"\n'
+        f'$OldPid = {old_pid}\n'
+        f'$TargetVersion = "{target_version}"\n'
         f'function Write-DebugLog([string]$Message) {{\n'
         f'  $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"\n'
         f'  Add-Content -Path $LogPath -Encoding UTF8 -Value "$ts | [DEBUG] update_install.ps1 | $Message"\n'
         f'}}\n'
-        f'$TotalStart = Get-Date\n'
-        f'Write-DebugLog "start source={source} app_dir={app_dir} exe={exe_path} staged={staged}"\n'
-        f'$StepStart = Get-Date\n'
-        f'Start-Sleep -Seconds 1\n'
-        f'Write-DebugLog "sleep_before_copy elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
-        f'$StepStart = Get-Date\n'
-        f'foreach ($ManagedPath in @("{app_dir}\\python", "{app_dir}\\src")) {{\n'
-        f'  Remove-Item $ManagedPath -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'function Abort-Install([string]$Reason) {{\n'
+        f'  Write-DebugLog "abort reason=$Reason"\n'
+        f'  Write-DebugLog "staging_preserved path={staged}"\n'
+        f'  Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\n'
+        f'  exit 1\n'
         f'}}\n'
+        f'function Wait-ForOldInstance {{\n'
+        f'  $OldProcess = Get-Process -Id $OldPid -ErrorAction SilentlyContinue\n'
+        f'  if (-not $OldProcess) {{\n'
+        f'    Write-DebugLog "wait_process already_exited pid=$OldPid"\n'
+        f'    return\n'
+        f'  }}\n'
+        f'  try {{\n'
+        f'    $OldProcess | Wait-Process -Timeout {_WAIT_PROCESS_TIMEOUT_SEC} -ErrorAction Stop\n'
+        f'    Write-DebugLog "wait_process exited pid=$OldPid"\n'
+        f'  }} catch {{\n'
+        f'    Abort-Install "wait_process_timeout pid=$OldPid timeout_sec={_WAIT_PROCESS_TIMEOUT_SEC}"\n'
+        f'  }}\n'
+        f'}}\n'
+        f'function Remove-ManagedPaths {{\n'
+        f'  foreach ($ManagedPath in @("{python_dir}", "{src_dir}")) {{\n'
+        f'    for ($attempt = 1; $attempt -le {_MANAGED_DELETE_RETRIES}; $attempt++) {{\n'
+        f'      if (-not (Test-Path $ManagedPath)) {{ break }}\n'
+        f'      Remove-Item $ManagedPath -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'      Start-Sleep -Milliseconds {_MANAGED_DELETE_DELAY_MS}\n'
+        f'    }}\n'
+        f'    if (Test-Path $ManagedPath) {{\n'
+        f'      Abort-Install "managed_path_still_exists path=$ManagedPath"\n'
+        f'    }}\n'
+        f'  }}\n'
+        f'  Write-DebugLog "managed_paths_removed"\n'
+        f'}}\n'
+        f'function Test-InstalledVersion {{\n'
+        f'  $VersionFile = "{version_file}"\n'
+        f'  if (-not (Test-Path $VersionFile)) {{\n'
+        f'    Abort-Install "version_file_missing path=$VersionFile"\n'
+        f'  }}\n'
+        f'  $content = Get-Content $VersionFile -Raw -ErrorAction Stop\n'
+        f'  if ($content -notmatch \'VERSION\\s*=\\s*"([^"]+)"\') {{\n'
+        f'    Abort-Install "version_parse_failed path=$VersionFile"\n'
+        f'  }}\n'
+        f'  $installedVersion = $Matches[1]\n'
+        f'  Write-DebugLog "verify_version installed=$installedVersion target=$TargetVersion"\n'
+        f'  if ($installedVersion -ne $TargetVersion) {{\n'
+        f'    Abort-Install "version_mismatch installed=$installedVersion target=$TargetVersion"\n'
+        f'  }}\n'
+        f'}}\n'
+        f'$TotalStart = Get-Date\n'
+        f'Write-DebugLog "start source={source} app_dir={app_dir} exe={exe_path} staged={staged} old_pid=$OldPid target=$TargetVersion"\n'
+        f'$StepStart = Get-Date\n'
+        f'Wait-ForOldInstance\n'
+        f'Write-DebugLog "wait_old_instance elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'$StepStart = Get-Date\n'
+        f'Remove-ManagedPaths\n'
         f'Write-DebugLog "cleanup_managed_paths elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'$StepStart = Get-Date\n'
         f'robocopy "{source}" "{app_dir}" /E /IS /IT /NFL /NDL /NJH /NJS /R:3 /W:1\n'
         f'$CopyExitCode = $LASTEXITCODE\n'
         f'Write-DebugLog "robocopy_copy exit_code=$CopyExitCode elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'if ($CopyExitCode -ge 8 -or $CopyExitCode -eq 0) {{\n'
+        f'  Abort-Install "robocopy_failed exit_code=$CopyExitCode"\n'
+        f'}}\n'
         f'$StepStart = Get-Date\n'
-        f'Start-Process "{exe_path}"\n'
-        f'Write-DebugLog "start_process elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'Test-InstalledVersion\n'
+        f'Write-DebugLog "verify_version elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'$StepStart = Get-Date\n'
+        f'try {{\n'
+        f'  $NewProc = Start-Process "{exe_path}" -PassThru -ErrorAction Stop\n'
+        f'}} catch {{\n'
+        f'  Abort-Install "start_process_failed error=$($_.Exception.Message)"\n'
+        f'}}\n'
+        f'$alive = $false\n'
+        f'for ($poll = 1; $poll -le {_START_HEALTH_POLL_MAX}; $poll++) {{\n'
+        f'  Start-Sleep -Milliseconds {_START_HEALTH_POLL_MS}\n'
+        f'  if (Get-Process -Id $NewProc.Id -ErrorAction SilentlyContinue) {{\n'
+        f'    $alive = $true\n'
+        f'  }} else {{\n'
+        f'    $alive = $false\n'
+        f'    break\n'
+        f'  }}\n'
+        f'}}\n'
+        f'Write-DebugLog "start_process pid=$($NewProc.Id) alive=$alive polls=$poll elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'if (-not $alive) {{\n'
+        f'  Abort-Install "new_process_not_running pid=$($NewProc.Id) polls=$poll"\n'
+        f'}}\n'
+        f'Write-DebugLog "install_success version=$TargetVersion new_pid=$($NewProc.Id)"\n'
         f'$StepStart = Get-Date\n'
         f'Remove-Item "{staged}" -Recurse -Force -ErrorAction SilentlyContinue\n'
         f'Write-DebugLog "cleanup_staging elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'Write-DebugLog "total elapsed_ms=$([int]((Get-Date) - $TotalStart).TotalMilliseconds)"\n'
-        f'Remove-Item $MyInvocation.MyCommand.Path -Force\n'
+        f'Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\n'
     )
 
 
@@ -480,11 +563,14 @@ class UpdateChecker:
         self._dl_worker.failed.connect(self._on_dl_failed)
         self._dl_worker.start()
 
-    def install(self):
+    def install(self, *, quit_fn=None):
         """Copy staged files over the app directory and restart."""
         started = time.perf_counter()
         if not self._staged_dir:
             logger.debug("[DEBUG] UpdateChecker.install | no staged_dir, returning")
+            return
+        if not self._latest:
+            logger.error("[Updater] Install aborted: no update metadata")
             return
         staged = Path(self._staged_dir)
         if not staged.exists():
@@ -496,13 +582,18 @@ class UpdateChecker:
         # The zip contains a top-level "VoiceInput/" directory
         inner = staged / "VoiceInput"
         source = inner if inner.is_dir() else staged
-        logger.info(f"[Updater] Installing from staged: {source} → {app_dir}")
+        old_pid = os.getpid()
+        target_version = self._latest.version
+        logger.info(
+            f"[Updater] Installing v{target_version} from staged: {source} → {app_dir} "
+            f"(old_pid={old_pid})"
+        )
         script = Path(tempfile.gettempdir()) / "voiceinput_update.ps1"
         install_log = _update_install_log_path()
         logger.debug(
             f"[DEBUG] UpdateChecker.install | source={source}, app_dir={app_dir}, "
             f"exe_path={exe_path}, staged={staged}, script={script}, "
-            f"install_log={install_log}"
+            f"install_log={install_log}, old_pid={old_pid}, target_version={target_version}"
         )
         build_started = time.perf_counter()
         ps_content = _build_install_script(
@@ -511,6 +602,8 @@ class UpdateChecker:
             exe_path=exe_path,
             staged=staged,
             log_path=install_log,
+            old_pid=old_pid,
+            target_version=target_version,
         )
         logger.debug(
             f"[DEBUG] UpdateChecker.install | build_script elapsed_ms={_elapsed_ms(build_started)}"
@@ -521,7 +614,6 @@ class UpdateChecker:
             f"[DEBUG] UpdateChecker.install | write_script elapsed_ms={_elapsed_ms(write_started)}, "
             f"bytes={len(ps_content.encode('utf-8'))}"
         )
-        logger.debug(f"[DEBUG] UpdateChecker.install | ps_content:\n{ps_content}")
         cmd = ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
                "-File", str(script)]
         try:
@@ -539,9 +631,13 @@ class UpdateChecker:
                 f"total_elapsed_ms={_elapsed_ms(started)}"
             )
             return
-        logger.debug("[DEBUG] UpdateChecker.install | calling QApplication.quit()")
-        from PyQt6.QtWidgets import QApplication
-        QApplication.quit()
+        if quit_fn is not None:
+            logger.debug("[DEBUG] UpdateChecker.install | calling quit_fn()")
+            quit_fn()
+        else:
+            logger.debug("[DEBUG] UpdateChecker.install | calling QApplication.quit()")
+            from PyQt6.QtWidgets import QApplication
+            QApplication.quit()
 
     # ── internal callbacks ──
 

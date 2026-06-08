@@ -47,25 +47,45 @@ class UpdateMetadataTests(unittest.TestCase):
 
         self.assertEqual(_select_latest_release(releases, "1.2.4")["tag_name"], "v1.2.5")
 
-    def test_install_script_logs_each_timed_phase(self):
+    def test_install_script_waits_validates_and_preserves_staging_on_failure(self):
         script = _build_install_script(
             source=Path("C:/tmp/VoiceInput"),
             app_dir=Path("C:/Program Files/VoiceInput"),
             exe_path=Path("C:/Program Files/VoiceInput/VoiceInput.exe"),
             staged=Path("C:/tmp/VoiceInput_update_staging"),
             log_path=Path("C:/Users/me/.voiceinput/logs/update_install.log"),
+            old_pid=12345,
+            target_version="1.4.11",
         )
 
         self.assertIn("[DEBUG] update_install.ps1", script)
-        self.assertIn("sleep_before_copy elapsed_ms=", script)
+        self.assertIn("$OldPid = 12345", script)
+        self.assertIn('$TargetVersion = "1.4.11"', script)
+        self.assertIn("wait_process already_exited", script)
+        self.assertIn("$OldProcess | Wait-Process", script)
+        self.assertIn("wait_process_timeout", script)
+        self.assertIn("wait_old_instance elapsed_ms=", script)
         self.assertIn("C:\\Program Files\\VoiceInput\\python", script)
         self.assertIn("C:\\Program Files\\VoiceInput\\src", script)
-        self.assertIn("Remove-Item $ManagedPath", script)
+        self.assertIn("managed_path_still_exists", script)
+        self.assertIn("managed_paths_removed", script)
         self.assertIn("cleanup_managed_paths elapsed_ms=", script)
         self.assertIn("robocopy_copy exit_code=", script)
-        self.assertIn("start_process elapsed_ms=", script)
+        self.assertIn("robocopy_failed exit_code=", script)
+        self.assertIn("verify_version installed=", script)
+        self.assertIn("version_mismatch", script)
+        self.assertIn("start_process_failed", script)
+        self.assertIn("start_process pid=", script)
+        self.assertIn("polls=$poll", script)
+        self.assertIn("new_process_not_running", script)
+        self.assertIn("staging_preserved path=", script)
+        self.assertIn("install_success version=", script)
         self.assertIn("cleanup_staging elapsed_ms=", script)
+        self.assertNotIn("Start-Job", script)
+        self.assertNotIn("VoiceInputWin32", script)
         self.assertIn("total elapsed_ms=", script)
+        self.assertNotIn("sleep_before_copy elapsed_ms=", script)
+        self.assertNotIn("Start-Sleep -Seconds 1", script)
 
 
 if __name__ == "__main__":
