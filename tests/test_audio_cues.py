@@ -10,7 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-from ui.sounds import AudioCues, _resolve_default_output_device  # noqa: E402
+from ui.sounds import AudioCues, _candidate_output_sample_rates, _resolve_default_output_device  # noqa: E402
 
 
 class _FakePyAudio:
@@ -29,6 +29,35 @@ class _FakePyAudio:
 
     def get_device_info_by_index(self, index):
         return self._devices[index]
+
+    def get_default_output_device_info(self):
+        return self._devices[0]
+
+
+class _FakeStream:
+    def stop_stream(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeOpeningPyAudio(_FakePyAudio):
+    def __init__(self, devices, rejected_rates=()):
+        super().__init__(devices)
+        self.rejected_rates = set(rejected_rates)
+        self.open_rates = []
+        self.terminated = False
+
+    def open(self, **kwargs):
+        rate = kwargs["rate"]
+        self.open_rates.append(rate)
+        if rate in self.rejected_rates:
+            raise OSError(f"unsupported rate {rate}")
+        return _FakeStream()
+
+    def terminate(self):
+        self.terminated = True
 
 
 class AudioCuesTests(unittest.TestCase):
@@ -155,6 +184,41 @@ class AudioCuesTests(unittest.TestCase):
 
         self.assertIsNone(index)
         self.assertEqual(name, "Headphones")
+
+    def test_candidate_rates_prefer_device_default_before_common_rates(self):
+        pa = _FakePyAudio([
+            {
+                "name": "Headphones",
+                "hostApi": 0,
+                "maxOutputChannels": 2,
+                "defaultSampleRate": 48000.0,
+            },
+        ])
+
+        rates = _candidate_output_sample_rates(pa, 0)
+
+        self.assertEqual(rates[:3], [48000, 44100, 22050])
+
+    def test_init_stream_falls_back_when_device_rejects_default_rate(self):
+        fake_pa = _FakeOpeningPyAudio([
+            {
+                "name": "Headphones",
+                "hostApi": 0,
+                "maxOutputChannels": 2,
+                "defaultSampleRate": 22050.0,
+            },
+        ], rejected_rates={22050})
+
+        with patch.object(AudioCues, "_init_stream_async"):
+            cues = AudioCues()
+
+        with patch("ui.sounds.pyaudio.PyAudio", return_value=fake_pa):
+            with patch("ui.sounds.get_default_render_device_name", return_value="Headphones"):
+                cues._init_stream()
+
+        self.assertEqual(fake_pa.open_rates[:2], [22050, 44100])
+        self.assertTrue(cues._stream_ready)
+        self.assertEqual(cues._sample_rate, 44100)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,8 @@ import pyaudio
 from core.device_watcher import get_default_render_device_name
 from core.log import logger
 
-_SAMPLE_RATE = 22050
+_DEFAULT_SAMPLE_RATE = 44100
+_COMMON_SAMPLE_RATES = (44100, 48000, 22050, 16000)
 _TAG = "[Sound]"
 
 _FRAMES_PER_BUFFER = 1024
@@ -49,11 +50,18 @@ def _gen_pcm(samples: list[float]) -> bytes:
     return b"".join(struct.pack("<h", int(max(-1.0, min(1.0, s)) * 32000)) for s in samples)
 
 
-def _gen_chirp(duration_ms: int, freq_start: int, freq_end: int, volume: float = 0.4) -> bytes:
-    n = int(_SAMPLE_RATE * duration_ms / 1000)
+def _gen_chirp(
+    duration_ms: int,
+    freq_start: int,
+    freq_end: int,
+    volume: float = 0.4,
+    *,
+    sample_rate: int = _DEFAULT_SAMPLE_RATE,
+) -> bytes:
+    n = int(sample_rate * duration_ms / 1000)
     samples = []
     for i in range(n):
-        t = i / _SAMPLE_RATE
+        t = i / sample_rate
         progress = i / n
         freq = freq_start + (freq_end - freq_start) * progress
         envelope = math.sin(math.pi * progress)
@@ -61,34 +69,43 @@ def _gen_chirp(duration_ms: int, freq_start: int, freq_end: int, volume: float =
     return _gen_pcm(samples)
 
 
-def _gen_confirm(volume: float = 0.3) -> bytes:
+def _gen_confirm(volume: float = 0.3, *, sample_rate: int = _DEFAULT_SAMPLE_RATE) -> bytes:
     """Two-tone confirmation: C5 then E5."""
-    n1 = int(_SAMPLE_RATE * 0.08)
-    n2 = int(_SAMPLE_RATE * 0.12)
-    gap = int(_SAMPLE_RATE * 0.03)
+    n1 = int(sample_rate * 0.08)
+    n2 = int(sample_rate * 0.12)
+    gap = int(sample_rate * 0.03)
     samples = []
     for i in range(n1):
-        t = i / _SAMPLE_RATE
+        t = i / sample_rate
         env = math.sin(math.pi * i / n1)
         samples.append(math.sin(2 * math.pi * 523 * t) * env * volume)
     samples.extend([0.0] * gap)
     for i in range(n2):
-        t = i / _SAMPLE_RATE
+        t = i / sample_rate
         env = math.sin(math.pi * i / n2)
         samples.append(math.sin(2 * math.pi * 659 * t) * env * volume)
     return _gen_pcm(samples)
 
 
-def _gen_tick(volume: float = 0.25) -> bytes:
+def _gen_tick(volume: float = 0.25, *, sample_rate: int = _DEFAULT_SAMPLE_RATE) -> bytes:
     """Short 40ms tick at 880 Hz (A5) with fast decay."""
-    n = int(_SAMPLE_RATE * 0.04)
+    n = int(sample_rate * 0.04)
     samples = []
     for i in range(n):
-        t = i / _SAMPLE_RATE
+        t = i / sample_rate
         progress = i / n
         envelope = (1.0 - progress) ** 3
         samples.append(math.sin(2 * math.pi * 880 * t) * envelope * volume)
     return _gen_pcm(samples)
+
+
+def _build_sounds(sample_rate: int) -> dict[str, bytes]:
+    return {
+        "start": _gen_chirp(80, 800, 1200, 0.35, sample_rate=sample_rate),
+        "stop": _gen_chirp(80, 1000, 600, 0.35, sample_rate=sample_rate),
+        "done": _gen_confirm(0.3, sample_rate=sample_rate),
+        "tick": _gen_tick(sample_rate=sample_rate),
+    }
 
 
 def _resolve_default_output_device(pa: pyaudio.PyAudio) -> tuple[int | None, str | None]:
@@ -128,6 +145,32 @@ def _resolve_default_output_device(pa: pyaudio.PyAudio) -> tuple[int | None, str
     return None, default_name
 
 
+def _candidate_output_sample_rates(pa: pyaudio.PyAudio, device_index: int | None) -> list[int]:
+    """Return likely-supported output rates, preferring the device-reported default."""
+    candidates: list[int] = []
+
+    def add(rate):
+        try:
+            value = int(round(float(rate)))
+        except (TypeError, ValueError):
+            return
+        if value > 0 and value not in candidates:
+            candidates.append(value)
+
+    try:
+        if device_index is not None:
+            info = pa.get_device_info_by_index(device_index)
+        else:
+            info = pa.get_default_output_device_info()
+        add(info.get("defaultSampleRate"))
+    except Exception:
+        pass
+
+    for rate in _COMMON_SAMPLE_RATES:
+        add(rate)
+    return candidates
+
+
 class AudioCues:
     """Manages playback of UI sound effects.
 
@@ -138,12 +181,8 @@ class AudioCues:
 
     def __init__(self):
         self._enabled = True
-        self._sounds = {
-            "start": _gen_chirp(80, 800, 1200, 0.35),
-            "stop": _gen_chirp(80, 1000, 600, 0.35),
-            "done": _gen_confirm(0.3),
-            "tick": _gen_tick(),
-        }
+        self._sample_rate = _DEFAULT_SAMPLE_RATE
+        self._sounds = _build_sounds(self._sample_rate)
         self._pa: pyaudio.PyAudio | None = None
         self._stream: pyaudio.Stream | None = None
         self._lock = threading.Lock()
@@ -156,8 +195,18 @@ class AudioCues:
         self._reopen_timer: threading.Timer | None = None
         self._last_start_monotonic = 0.0
         self._last_enqueue_monotonic = 0.0
-        self._warmup_silence = b"\x00" * int(_SAMPLE_RATE * _WARMUP_SILENCE_SEC) * 2
+        self._warmup_silence = self._build_warmup_silence(self._sample_rate)
         self._init_stream_async()
+
+    def _build_warmup_silence(self, sample_rate: int) -> bytes:
+        return b"\x00" * int(sample_rate * _WARMUP_SILENCE_SEC) * 2
+
+    def _set_sample_rate_locked(self, sample_rate: int):
+        if sample_rate == self._sample_rate:
+            return
+        self._sample_rate = sample_rate
+        self._sounds = _build_sounds(sample_rate)
+        self._warmup_silence = self._build_warmup_silence(sample_rate)
 
     def _init_stream_async(self):
         with self._init_lock:
@@ -173,20 +222,30 @@ class AudioCues:
             t0 = time.perf_counter()
             pa = pyaudio.PyAudio()
             device_index, device_name = _resolve_default_output_device(pa)
-            open_kwargs = dict(
+            base_open_kwargs = dict(
                 format=pyaudio.paInt16,
                 channels=1,
-                rate=_SAMPLE_RATE,
                 output=True,
                 frames_per_buffer=_FRAMES_PER_BUFFER,
                 stream_callback=self._audio_callback,
             )
             if device_index is not None:
-                open_kwargs["output_device_index"] = device_index
-            stream = pa.open(**open_kwargs)
+                base_open_kwargs["output_device_index"] = device_index
+            sample_rate = _DEFAULT_SAMPLE_RATE
+            last_error: Exception | None = None
+            for candidate_rate in _candidate_output_sample_rates(pa, device_index):
+                try:
+                    stream = pa.open(**base_open_kwargs, rate=candidate_rate)
+                    sample_rate = candidate_rate
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.debug(f"{_TAG} Output open failed at {candidate_rate} Hz: {e}")
+            if stream is None:
+                raise last_error or RuntimeError("No compatible output sample rate")
             ms = (time.perf_counter() - t0) * 1000
             route = device_name or "system default"
-            logger.info(f"{_TAG} Callback stream ready ({ms:.0f}ms, output={route})")
+            logger.info(f"{_TAG} Callback stream ready ({ms:.0f}ms, output={route}, rate={sample_rate}Hz)")
             with self._lock:
                 if self._released:
                     try:
@@ -199,6 +258,7 @@ class AudioCues:
                 self._stream = stream
                 self._stream_ready = True
                 self._output_device_name = device_name
+                self._set_sample_rate_locked(sample_rate)
         except Exception as e:
             logger.warning(f"{_TAG} Stream init failed: {e}")
             try:
@@ -214,6 +274,7 @@ class AudioCues:
             with self._lock:
                 self._stream_ready = False
                 self._output_device_name = None
+                self._buf.clear()
         finally:
             with self._init_lock:
                 self._init_started = False
