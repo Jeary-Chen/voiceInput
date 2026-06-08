@@ -32,9 +32,56 @@ REC_W, REC_H = 80, 36             # waveform only (with padding)
 REC_HOVER_W = 110                  # waveform + stop button on hover
 RESULT_W = 340                    # result popup width
 RADIUS = 19
-HOVER_COLLAPSE_DELAY_MS = 300
-HOVER_POLL_INTERVAL_MS = 120
-SCREEN_RELAYOUT_DELAY_MS = 120
+
+
+class MiniBarAnim:
+    """磁吸栏动画与节拍时长（毫秒）。只改此类即可全局生效。"""
+
+    # 悬停展开 / 收起
+    HOVER_EXPAND_MS = 150
+    HOVER_COLLAPSE_MS = 180
+    HOVER_COLLAPSE_DELAY_MS = 300
+
+    # 非 Native 路径：空闲几何收起
+    IDLE_GEOM_SHRINK_MS = 200
+
+    # 录音态切换
+    RECORD_ENTER_MS = 150
+    RECORD_HOVER_PANEL_MS = 150
+    PROCESSING_SHRINK_MS = 150
+
+    # 拖放后回顶
+    DRAG_SNAP_MS = 160
+
+    # 转写完成后的延迟收起（未开「空闲隐藏」时）
+    DONE_SHRINK_DELAY_MS = 800
+
+    # 录音停止钮（点击 / 长按作废）
+    REC_STOP_CLICK_MS = 300
+    REC_STOP_HOLD_MS = 500
+    REC_STOP_TICK_MS = 25
+
+    # 结果浮层
+    RESULT_POPUP_SHOW_MS = 3500
+    RESULT_POPUP_LEAVE_HIDE_MS = 1500
+
+    # 录音状态条刷新
+    REC_STATUS_REFRESH_MS = 1000
+
+    # 内部节拍
+    HOVER_POLL_MS = 120
+    SCREEN_RELAYOUT_DELAY_MS = 120
+    PREWARM_DELAY_MS = 450
+
+
+_REVEAL_ANIM_MODES = frozenset({"hover", "shrinking", "recording"})
+
+# 兼容旧测试/导入名
+HOVER_EXPAND_MS = MiniBarAnim.HOVER_EXPAND_MS
+HOVER_COLLAPSE_MS = MiniBarAnim.HOVER_COLLAPSE_MS
+HOVER_COLLAPSE_DELAY_MS = MiniBarAnim.HOVER_COLLAPSE_DELAY_MS
+HOVER_POLL_INTERVAL_MS = MiniBarAnim.HOVER_POLL_MS
+SCREEN_RELAYOUT_DELAY_MS = MiniBarAnim.SCREEN_RELAYOUT_DELAY_MS
 
 _BTN_STYLE = """
     QPushButton {{
@@ -52,9 +99,9 @@ class _RecStopButton(QWidget):
     clicked = pyqtSignal()
     cancelled = pyqtSignal()
 
-    CLICK_THRESHOLD_MS = 300
-    HOLD_MS = 500
-    _TICK = 25
+    CLICK_THRESHOLD_MS = MiniBarAnim.REC_STOP_CLICK_MS
+    HOLD_MS = MiniBarAnim.REC_STOP_HOLD_MS
+    _TICK = MiniBarAnim.REC_STOP_TICK_MS
     SIZE = 26
 
     def __init__(self, parent=None):
@@ -222,7 +269,12 @@ class _ResultPopup(QWidget):
         self._auto_hide.setSingleShot(True)
         self._auto_hide.timeout.connect(self.hide)
 
-    def show_text(self, text: str, anchor_widget: QWidget, duration_ms: int = 3500):
+    def show_text(
+        self,
+        text: str,
+        anchor_widget: QWidget,
+        duration_ms: int = MiniBarAnim.RESULT_POPUP_SHOW_MS,
+    ):
         self._label.setText(text)
         self._label.setFixedWidth(RESULT_W)
         self._label.adjustSize()
@@ -256,7 +308,7 @@ class _ResultPopup(QWidget):
         self._auto_hide.stop()
 
     def leaveEvent(self, event):
-        self._auto_hide.start(1500)
+        self._auto_hide.start(MiniBarAnim.RESULT_POPUP_LEAVE_HIDE_MS)
 
     def paintEvent(self, event):
         pass
@@ -388,14 +440,11 @@ class MiniRecordingWindow(QWidget):
         self._geom_anim = QPropertyAnimation(self, b"geometry")
         self._geom_anim.finished.connect(self._on_anim_finished)
         self._geom_anim.valueChanged.connect(self._on_geometry_anim_value_changed)
-        self._opacity_anim = QPropertyAnimation(self, b"windowOpacity")
-        self._opacity_anim.finished.connect(self._on_opacity_anim_finished)
         self._reveal_progress = 1.0
         self._reveal_anim = QPropertyAnimation(self, b"revealProgress")
         self._reveal_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._reveal_anim.finished.connect(self._on_reveal_anim_finished)
         self._native_returning_to_idle = False
-        self._fade_target: str | None = None
         self._shape_target: str | None = None
         self._target_size = (IDLE_W, IDLE_H)
         self._anim_interrupting = False
@@ -419,7 +468,7 @@ class MiniRecordingWindow(QWidget):
         self._deferred_shrink_timer.setSingleShot(True)
         self._deferred_shrink_timer.timeout.connect(self._shrink_to_idle)
         self._hover_poll_timer = QTimer(self)
-        self._hover_poll_timer.setInterval(HOVER_POLL_INTERVAL_MS)
+        self._hover_poll_timer.setInterval(MiniBarAnim.HOVER_POLL_MS)
         self._hover_poll_timer.timeout.connect(self._poll_hover_state)
         self._screen_relayout_timer = QTimer(self)
         self._screen_relayout_timer.setSingleShot(True)
@@ -442,7 +491,7 @@ class MiniRecordingWindow(QWidget):
             )
             self._install_foreground_hook()
         QTimer.singleShot(0, lambda: self._apply_windows_surface_tweaks("init"))
-        QTimer.singleShot(450, self._prewarm_hover_surface)
+        QTimer.singleShot(MiniBarAnim.PREWARM_DELAY_MS, self._prewarm_hover_surface)
 
     # ── Win32 topmost enforcement ──
 
@@ -521,7 +570,7 @@ class MiniRecordingWindow(QWidget):
             return
         progress = (
             self._reveal_progress
-            if self._mode in ("hover", "shrinking")
+            if self._mode in _REVEAL_ANIM_MODES
             else 1.0
         )
         mask_w = round(IDLE_W + (self.width() - IDLE_W) * progress)
@@ -608,7 +657,7 @@ class MiniRecordingWindow(QWidget):
             f"[DEBUG] _schedule_screen_relayout | source={source}, "
             f"mode={self._mode}, visible={self.isVisible()}"
         )
-        self._screen_relayout_timer.start(SCREEN_RELAYOUT_DELAY_MS)
+        self._screen_relayout_timer.start(MiniBarAnim.SCREEN_RELAYOUT_DELAY_MS)
 
     def closeEvent(self, event):
         self._hover_poll_timer.stop()
@@ -776,7 +825,7 @@ class MiniRecordingWindow(QWidget):
         self._btn_rec_stop.cancel_external_hold()
         if not self._hovered:
             self._btn_rec_stop.setVisible(False)
-            self._animate_to(REC_W, REC_H, 150)
+            self._animate_to(REC_W, REC_H, MiniBarAnim.RECORD_HOVER_PANEL_MS)
 
     def hotkey_click_threshold_ms(self) -> int:
         """Return the short-press threshold shared with the stop button."""
@@ -788,14 +837,14 @@ class MiniRecordingWindow(QWidget):
             return
         self._btn_rec_stop.setVisible(True)
         if not self._hovered:
-            self._animate_to(REC_HOVER_W, REC_H, 150)
+            self._animate_to(REC_HOVER_W, REC_H, MiniBarAnim.RECORD_HOVER_PANEL_MS)
         self._btn_rec_stop.start_external_hold(skip_click_threshold=True)
 
     def _show_recording_status(self):
         self._update_recording_status()
         if not self._rec_status_timer:
             self._rec_status_timer = QTimer(self)
-            self._rec_status_timer.setInterval(1000)
+            self._rec_status_timer.setInterval(MiniBarAnim.REC_STATUS_REFRESH_MS)
             self._rec_status_timer.timeout.connect(self._update_recording_status)
         self._rec_status_timer.start()
 
@@ -866,7 +915,7 @@ class MiniRecordingWindow(QWidget):
         if self._mode == "hover":
             self.request_record.emit()
 
-    def _set_widgets_for_mode(self, mode: str):
+    def _set_widgets_for_mode(self, mode: str, *, show_top_bar: bool | None = None):
         is_idle = mode == "idle"
         is_hover = mode == "hover"
         is_rec = mode == "recording"
@@ -877,7 +926,9 @@ class MiniRecordingWindow(QWidget):
         self._btn_polish.setVisible(is_hover)
         self._btn_show_result.setVisible(is_hover)
         self._dot_status.setVisible(mode in ("processing", "done"))
-        self._top_bar.setVisible(not is_idle)
+        if show_top_bar is None:
+            show_top_bar = not is_idle
+        self._top_bar.setVisible(show_top_bar)
 
     # ── animation helpers ──
 
@@ -894,7 +945,6 @@ class MiniRecordingWindow(QWidget):
             "reveal": round(self._reveal_progress, 3),
             "opacity": round(self.windowOpacity(), 3),
             "shape_target": self._shape_target,
-            "fade_target": self._fade_target,
             "returning": self._native_returning_to_idle,
             "native": self._using_native_idle(),
         }
@@ -947,15 +997,54 @@ class MiniRecordingWindow(QWidget):
     def _cursor_in_hover_region(self) -> bool:
         return self._hover_region().contains(QCursor.pos())
 
+    def _unlock_geometry(self):
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+
+    def _hover_expand_progress(self, width: int | None = None) -> float:
+        width = self.width() if width is None else width
+        span = HOVER_W - IDLE_W
+        if span <= 0:
+            return 1.0
+        return max(0.0, min(1.0, (width - IDLE_W) / span))
+
+    def _finish_hover_expand(self):
+        self._shape_target = None
+        self._reset_reveal_progress(1.0, "hover_expand_finished")
+        self._top_bar.setVisible(True)
+        self.setWindowOpacity(1.0)
+        self._sync_hover_tracking("hover_expand_finished")
+
+    def _is_hover_expanding(self) -> bool:
+        if self._shape_target == "hover":
+            return True
+        if (
+            self._mode == "hover"
+            and self._reveal_anim.state() == QPropertyAnimation.State.Running
+            and float(self._reveal_anim.endValue() or 0)
+            > float(self._reveal_anim.startValue() or 0)
+        ):
+            return True
+        if (
+            self._mode == "hover"
+            and self._geom_anim.state() == QPropertyAnimation.State.Running
+            and self._target_size == (HOVER_W, HOVER_H)
+        ):
+            return True
+        return False
+
     def _sync_hover_tracking(self, source: str):
         if self._mode != "hover":
+            return
+        if self._is_hover_expanding():
+            self._hover_timer.stop()
             return
         self._hovered = self._cursor_in_hover_region()
         self._log_anim("hover_track", source=source, in_region=self._hovered)
         if self._hovered:
             self._hover_timer.stop()
         elif not self._hover_timer.isActive():
-            self._hover_timer.start(HOVER_COLLAPSE_DELAY_MS)
+            self._hover_timer.start(MiniBarAnim.HOVER_COLLAPSE_DELAY_MS)
 
     def _start_hover_polling(self, source: str):
         if not self._hover_poll_timer.isActive():
@@ -983,10 +1072,13 @@ class MiniRecordingWindow(QWidget):
             f"geom={geom.getRect()}, inside={inside}"
         )
         if self._mode == "hover":
+            if self._is_hover_expanding():
+                self._hover_timer.stop()
+                return
             previous = self._hovered
             self._hovered = inside or self._cursor_in_hover_region()
             if previous and not self._hovered and not self._hover_timer.isActive():
-                self._hover_timer.start(HOVER_COLLAPSE_DELAY_MS)
+                self._hover_timer.start(MiniBarAnim.HOVER_COLLAPSE_DELAY_MS)
             if self._hovered:
                 self._hover_timer.stop()
             return
@@ -1079,12 +1171,10 @@ class MiniRecordingWindow(QWidget):
         self._anim_interrupting = True
         self._geom_anim.stop()
         self._reveal_anim.stop()
-        self._opacity_anim.stop()
         self._anim_interrupting = False
 
         self._mode = "hover"
         self._target_size = (HOVER_W, HOVER_H)
-        self._fade_target = None
         self._shape_target = None
         self._native_returning_to_idle = False
         self._hovered = False
@@ -1138,16 +1228,7 @@ class MiniRecordingWindow(QWidget):
                 self._apply_windows_surface_tweaks(source)
             return
         if self._mode == "shrinking":
-            self._animate_hover_to_top(120)
-
-    def _fade_to(self, opacity: float, duration: int, target: str | None = None):
-        self._fade_target = target
-        self._opacity_anim.stop()
-        self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._opacity_anim.setDuration(duration)
-        self._opacity_anim.setStartValue(self.windowOpacity())
-        self._opacity_anim.setEndValue(opacity)
-        self._opacity_anim.start()
+            self._animate_hover_to_top(MiniBarAnim.HOVER_COLLAPSE_MS)
 
     def _reveal_to(self, value: float, duration: int, target: str | None = None):
         self._shape_target = target
@@ -1158,7 +1239,7 @@ class MiniRecordingWindow(QWidget):
         self._reveal_anim.setEndValue(value)
         self._reveal_anim.start()
 
-    def _animate_hover_to_top(self, duration: int = 220):
+    def _animate_hover_to_top(self, duration: int = MiniBarAnim.HOVER_COLLAPSE_MS):
         screen = QApplication.primaryScreen()
         if not screen:
             return
@@ -1191,17 +1272,6 @@ class MiniRecordingWindow(QWidget):
             target.x(), target.y(), target.width(), target.height(),
         ), duration=duration)
 
-    def _on_opacity_anim_finished(self):
-        if self._fade_target != "idle":
-            self._fade_target = None
-            return
-        self._fade_target = None
-        if self._mode == "idle" and self._engine.state == "ready":
-            self._set_widgets_for_mode("idle")
-            self._reset_reveal_progress(1.0, "opacity_finished")
-            self.setWindowOpacity(1.0)
-            self._show_idle_surface()
-
     def _on_reveal_anim_finished(self):
         target = self._shape_target
         self._log_anim("reveal_finished", target=target)
@@ -1216,17 +1286,23 @@ class MiniRecordingWindow(QWidget):
             )
             self._set_widgets_for_mode("idle")
             self.setWindowOpacity(1.0)
-            # Keep the visible Qt surface clipped to the tiny pill until native takes over.
-            self._reset_reveal_progress(0.0, "reveal_finished_idle")
-            logger.debug(
-                f"[DEBUG] _on_reveal_anim_finished | idle handoff before surface | "
-                f"mode={self._mode}, reveal={self._reveal_progress}, "
-                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
-                f"mask={self.mask().boundingRect().getRect()}"
-            )
-            self._show_idle_surface()
-            self._mode = "idle"
-            self._reveal_progress = 1.0
+            if self._engine.config.hide_mini_window_when_idle:
+                self._mode = "idle"
+                self._reset_reveal_progress(1.0, "reveal_finished_hide_idle")
+                self._hide_native_idle()
+                self.hide()
+            else:
+                # Keep the visible Qt surface clipped to the tiny pill until native takes over.
+                self._reset_reveal_progress(0.0, "reveal_finished_idle")
+                logger.debug(
+                    f"[DEBUG] _on_reveal_anim_finished | idle handoff before surface | "
+                    f"mode={self._mode}, reveal={self._reveal_progress}, "
+                    f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
+                    f"mask={self.mask().boundingRect().getRect()}"
+                )
+                self._show_idle_surface()
+                self._mode = "idle"
+                self._reveal_progress = 1.0
             logger.debug(
                 f"[DEBUG] _on_reveal_anim_finished | idle handoff done | "
                 f"mode={self._mode}, reveal={self._reveal_progress}, "
@@ -1234,23 +1310,12 @@ class MiniRecordingWindow(QWidget):
                 f"{getattr(self._native_idle, '_visible', None)}"
             )
         elif target == "hover" and self._mode == "hover":
-            logger.debug(
-                f"[DEBUG] _on_reveal_anim_finished | hover handoff start | "
-                f"mode={self._mode}, reveal={self._reveal_progress}, "
-                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
-                f"mask={self.mask().boundingRect().getRect()}, "
-                f"native_visible={getattr(self._native_idle, '_visible', None)}"
-            )
-            self._reset_reveal_progress(1.0, "reveal_finished_hover")
-            self._top_bar.setVisible(True)
-            self.setWindowOpacity(1.0)
-            self._sync_hover_tracking("reveal_finished")
-            logger.debug(
-                f"[DEBUG] _on_reveal_anim_finished | hover handoff done | "
-                f"mode={self._mode}, reveal={self._reveal_progress}, "
-                f"qt_visible={self.isVisible()}, geom={self.geometry().getRect()}, "
-                f"mask={self.mask().boundingRect().getRect()}"
-            )
+            self._finish_hover_expand()
+        elif target == "recording" and self._mode == "recording":
+            self._reset_reveal_progress(1.0, "reveal_finished_recording")
+            if self._hovered:
+                self._btn_rec_stop.setVisible(True)
+                self._show_recording_status()
 
     def _on_native_idle_enter(self):
         if self._mode in ("idle", "shrinking") and self._engine.state == "ready":
@@ -1297,17 +1362,13 @@ class MiniRecordingWindow(QWidget):
             return x
         return geo.x() + (geo.width() - w) // 2
 
-    def _animate_to(self, w, h, duration=220,
+    def _animate_to(self, w, h, duration=MiniBarAnim.IDLE_GEOM_SHRINK_MS,
                     easing=QEasingCurve.Type.OutCubic):
         self._target_size = (w, h)
         screen = QApplication.primaryScreen()
         if not screen:
             return
         if not self.isVisible():
-            if self._using_native_idle() and self._mode == "hover":
-                self._position_at(w, h)
-                self.show()
-                return
             self._position_at(IDLE_W, IDLE_H)
             self.show()
 
@@ -1320,8 +1381,7 @@ class MiniRecordingWindow(QWidget):
         self._geom_anim.stop()
         self._anim_interrupting = False
 
-        self.setMinimumSize(0, 0)
-        self.setMaximumSize(16777215, 16777215)
+        self._unlock_geometry()
         self.setGeometry(start)
 
         geo = screen.availableGeometry()
@@ -1351,6 +1411,9 @@ class MiniRecordingWindow(QWidget):
             return
         w, h = self._target_size
         self.setFixedSize(w, h)
+        if self._mode == "hover" and self._shape_target == "hover":
+            self._finish_hover_expand()
+            return
         if self._mode == "shrinking":
             self._mode = "idle"
             self.update()
@@ -1359,15 +1422,19 @@ class MiniRecordingWindow(QWidget):
     def _on_geometry_anim_value_changed(self, value):
         if not isinstance(value, QRect):
             return
+        if self._mode == "hover" and self._shape_target == "hover":
+            progress = self._hover_expand_progress(value.width())
+            if abs(progress - self._reveal_progress) > 0.001:
+                self._set_reveal_progress(progress)
         self._apply_capsule_mask("geometry_anim")
-        if self._mode != "hover":
+        if self._mode != "hover" or self._is_hover_expanding():
             return
         cursor = QCursor.pos()
         self._hovered = value.contains(cursor)
         if self._hovered:
             self._hover_timer.stop()
         elif not self._hover_timer.isActive():
-            self._hover_timer.start(HOVER_COLLAPSE_DELAY_MS)
+            self._hover_timer.start(MiniBarAnim.HOVER_COLLAPSE_DELAY_MS)
         self._log_anim(
             "geometry_hover_track",
             cursor=(cursor.x(), cursor.y()),
@@ -1375,15 +1442,19 @@ class MiniRecordingWindow(QWidget):
             in_region=self._hovered,
         )
 
-    def _position_at(self, w, h, *, apply_mask: bool = True):
+    def _position_at(self, w, h, *, apply_mask: bool = True, fixed: bool = True):
         screen = QApplication.primaryScreen()
         if not screen:
             return
         geo = screen.availableGeometry()
         x = self._get_x_for_width(w)
         y = geo.y() + 4
-        self.setFixedSize(w, h)
-        self.move(x, y)
+        if fixed:
+            self.setFixedSize(w, h)
+            self.move(x, y)
+        else:
+            self._unlock_geometry()
+            self.setGeometry(x, y, w, h)
         if apply_mask:
             self._apply_capsule_mask(f"position_at:{w}x{h}")
         logger.debug(
@@ -1394,13 +1465,43 @@ class MiniRecordingWindow(QWidget):
 
     # ── state transitions ──
 
+    def _begin_hover_expand(self):
+        """Expand hover panel via geometry; mask/reveal follow width."""
+        duration = MiniBarAnim.HOVER_EXPAND_MS
+        self._target_size = (HOVER_W, HOVER_H)
+        self._shape_target = "hover"
+        self._reset_reveal_progress(0.0, "hover_expand_start")
+        self._top_bar.setVisible(False)
+        self.setWindowOpacity(1.0)
+        self._reveal_anim.stop()
+        self._log_anim("hover_expand_start", duration=duration)
+
+        at_hover_size = (
+            self.isVisible()
+            and (self.width(), self.height()) == (HOVER_W, HOVER_H)
+        )
+        if at_hover_size:
+            if not self.isVisible():
+                self.show()
+            if self._using_native_idle():
+                self._hide_native_idle()
+            self._reveal_to(1.0, duration, "hover")
+            return
+
+        if not self.isVisible():
+            self._position_at(IDLE_W, IDLE_H, fixed=False)
+            self.show()
+        else:
+            self._unlock_geometry()
+        if self._using_native_idle():
+            self._hide_native_idle()
+        self._animate_to(HOVER_W, HOVER_H, duration)
+
     def _apply_hover(self):
         was_returning = self._native_returning_to_idle or self._shape_target == "idle"
-        defer_native_hide = self._using_native_idle() and not self.isVisible()
         self._log_anim("hover_start", was_returning=was_returning)
         logger.debug(
             f"[DEBUG] _apply_hover | enter | was_returning={was_returning}, "
-            f"defer_native_hide={defer_native_hide}, "
             f"qt_visible={self.isVisible()}, native_visible="
             f"{getattr(self._native_idle, '_visible', None)}, "
             f"geom={self.geometry().getRect()}, reveal={self._reveal_progress}, "
@@ -1408,82 +1509,50 @@ class MiniRecordingWindow(QWidget):
         )
         self._start_hover_polling("apply_hover")
         self._mode = "hover"
-        self._fade_target = None
         self._shape_target = None
         self._native_returning_to_idle = False
-        self._opacity_anim.stop()
         self._reveal_anim.stop()
-        if not defer_native_hide:
-            self._hide_native_idle()
+        if was_returning and self._geom_anim.state() == QPropertyAnimation.State.Running:
+            current = self._geom_anim.currentValue()
+            if current is not None:
+                self._geom_anim.stop()
+                self.setGeometry(current)
         self._style_action_record()
         self._update_polish_style()
         self._update_show_result_style()
-        self._set_widgets_for_mode("hover")
-        if defer_native_hide:
-            logger.debug(
-                f"[DEBUG] _apply_hover | native hidden-qt branch before position | "
-                f"native_visible={getattr(self._native_idle, '_visible', None)}, "
-                f"geom={self.geometry().getRect()}, reveal={self._reveal_progress}"
-            )
-            self._target_size = (HOVER_W, HOVER_H)
-            self._reveal_progress = 0.0
-            self._position_at(HOVER_W, HOVER_H)
-            self._apply_capsule_mask("hover_native_start")
-            self.setWindowOpacity(1.0)
-            self._top_bar.setVisible(False)
-            logger.debug(
-                f"[DEBUG] _apply_hover | native hidden-qt branch before qt show | "
-                f"qt_visible={self.isVisible()}, native_visible="
-                f"{getattr(self._native_idle, '_visible', None)}, "
-                f"geom={self.geometry().getRect()}, mask={self.mask().boundingRect().getRect()}, "
-                f"reveal={self._reveal_progress}"
-            )
+        self._set_widgets_for_mode("hover", show_top_bar=False)
+        self.setWindowOpacity(1.0)
+        self._begin_hover_expand()
+        QTimer.singleShot(0, lambda: self._sync_hover_tracking("hover_apply"))
+
+    def _begin_recording_enter(self):
+        """Enter recording with reveal 0→1; optional width adjust from hover."""
+        target_w = REC_HOVER_W if self._hovered else REC_W
+        self._target_size = (target_w, REC_H)
+        self._reset_reveal_progress(0.0, "recording_start")
+        duration = MiniBarAnim.RECORD_ENTER_MS
+        self._log_anim("recording_enter_start", duration=duration)
+        if self.isVisible() and (self.width(), self.height()) != (target_w, REC_H):
+            self._reveal_to(1.0, duration, "recording")
+            self._animate_to(target_w, REC_H, duration)
+            return
+        if not self.isVisible():
+            self._position_at(IDLE_W, IDLE_H)
             self.show()
-            logger.debug(
-                f"[DEBUG] _apply_hover | native hidden-qt branch after qt show | "
-                f"qt_visible={self.isVisible()}, native_visible="
-                f"{getattr(self._native_idle, '_visible', None)}, "
-                f"geom={self.geometry().getRect()}, mask={self.mask().boundingRect().getRect()}"
-            )
-            self._hide_native_idle()
-            logger.debug(
-                f"[DEBUG] _apply_hover | native hidden-qt branch after native hide | "
-                f"qt_visible={self.isVisible()}, native_visible="
-                f"{getattr(self._native_idle, '_visible', None)}, "
-                f"geom={self.geometry().getRect()}, mask={self.mask().boundingRect().getRect()}"
-            )
-            self._reveal_to(1.0, 160, "hover")
-            QTimer.singleShot(0, lambda: self._sync_hover_tracking("hover_show"))
-        else:
-            if was_returning and self._geom_anim.state() == QPropertyAnimation.State.Running:
-                current = self._geom_anim.currentValue()
-                if current is not None:
-                    self._geom_anim.stop()
-                    self.setGeometry(current)
-            if self.windowOpacity() < 1.0:
-                self._fade_to(1.0, 90)
-            else:
-                self.setWindowOpacity(1.0)
-            if was_returning:
-                self._top_bar.setVisible(False)
-                self._reveal_to(1.0, 120, "hover")
-            else:
-                self._reset_reveal_progress(1.0, "hover_full")
-                self._animate_to(HOVER_W, HOVER_H, 220,
-                                 QEasingCurve.Type.InOutQuart)
-            QTimer.singleShot(0, lambda: self._sync_hover_tracking("hover_apply"))
+            self._reveal_to(1.0, duration, "recording")
+            self._animate_to(target_w, REC_H, duration)
+            return
+        self._position_at(target_w, REC_H)
+        self._reveal_to(1.0, duration, "recording")
 
     def _apply_recording(self):
         self._log_anim("recording_start")
         self._cancel_deferred_shrink()
         self._start_hover_polling("apply_recording")
-        self._fade_target = None
         self._shape_target = None
         self._native_returning_to_idle = False
-        self._opacity_anim.stop()
         self._reveal_anim.stop()
         self._hide_native_idle()
-        self._reset_reveal_progress(1.0, "recording_start")
         self.setWindowOpacity(1.0)
         self._mode = "recording"
         self._waveform.reset()
@@ -1495,13 +1564,9 @@ class MiniRecordingWindow(QWidget):
         self._btn_show_result.setVisible(False)
         self._dot_status.setVisible(False)
         self._top_bar.setVisible(True)
+        self._btn_rec_stop.setVisible(False)
 
-        if self._hovered:
-            self._btn_rec_stop.setVisible(True)
-            self._animate_to(REC_HOVER_W, REC_H, 280)
-        else:
-            self._btn_rec_stop.setVisible(False)
-            self._animate_to(REC_W, REC_H, 280)
+        self._begin_recording_enter()
 
     def _apply_processing(self):
         self._cancel_deferred_shrink()
@@ -1512,7 +1577,7 @@ class MiniRecordingWindow(QWidget):
         self._waveform.freeze()
         self._dot_status.setStyleSheet(f"color: {Theme.COLOR_PROCESSING.name()};")
         self._set_widgets_for_mode("processing")
-        self._animate_to(REC_W, REC_H, 150)
+        self._animate_to(REC_W, REC_H, MiniBarAnim.PROCESSING_SHRINK_MS)
 
     def _apply_done(self):
         self._mode = "done"
@@ -1533,8 +1598,8 @@ class MiniRecordingWindow(QWidget):
                 self._reset_reveal_progress(1.0, "shrink_start")
                 self.setWindowOpacity(1.0)
                 self._set_widgets_for_mode("idle")
-                self._animate_hover_to_top(180)
-                self._reveal_to(0.0, 180, "idle")
+                self._animate_hover_to_top(MiniBarAnim.HOVER_COLLAPSE_MS)
+                self._reveal_to(0.0, MiniBarAnim.HOVER_COLLAPSE_MS, "idle")
             else:
                 self._set_widgets_for_mode("idle")
                 self._reset_reveal_progress(1.0, "shrink_hidden")
@@ -1545,7 +1610,7 @@ class MiniRecordingWindow(QWidget):
         self._mode = "shrinking"
         self._hide_recording_status()
         self._set_widgets_for_mode("idle")
-        self._animate_to(IDLE_W, IDLE_H, 200,
+        self._animate_to(IDLE_W, IDLE_H, MiniBarAnim.IDLE_GEOM_SHRINK_MS,
                          QEasingCurve.Type.InOutQuart)
         self.show()
 
@@ -1579,11 +1644,16 @@ class MiniRecordingWindow(QWidget):
         self._apply_done()
         if self._show_result:
             self._result_popup.show_text(text, self)
-        delay = 0 if self._engine.config.hide_mini_window_when_idle else 800
+        delay = (
+            0 if self._engine.config.hide_mini_window_when_idle
+            else MiniBarAnim.DONE_SHRINK_DELAY_MS
+        )
         self._schedule_deferred_shrink(delay)
 
     def _on_hover_timeout(self):
         if not self._hovered and self._mode == "hover":
+            if self._is_hover_expanding():
+                return
             self._shrink_to_idle()
 
     def _collapse_recording_hover(self, source: str):
@@ -1592,7 +1662,7 @@ class MiniRecordingWindow(QWidget):
         self._hovered = False
         self._hide_recording_status()
         self._btn_rec_stop.setVisible(False)
-        self._animate_to(REC_W, REC_H, 150)
+        self._animate_to(REC_W, REC_H, MiniBarAnim.RECORD_HOVER_PANEL_MS)
         logger.debug(
             f"[DEBUG] _collapse_recording_hover | source={source}, "
             f"countdown_active={self._engine._countdown_active}, "
@@ -1616,7 +1686,11 @@ class MiniRecordingWindow(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
         w, h = float(self.width()), float(self.height())
-        progress = self._reveal_progress if self._mode in ("hover", "shrinking") else 1.0
+        progress = (
+            self._reveal_progress
+            if self._mode in _REVEAL_ANIM_MODES
+            else 1.0
+        )
         draw_w = IDLE_W + (w - IDLE_W) * progress
         draw_h = IDLE_H + (h - IDLE_H) * progress
         x = (w - draw_w) / 2
@@ -1642,7 +1716,7 @@ class MiniRecordingWindow(QWidget):
             self._hover_timer.stop()
             self._start_hover_polling("recording-enter")
             self._btn_rec_stop.setVisible(True)
-            self._animate_to(REC_HOVER_W, REC_H, 150)
+            self._animate_to(REC_HOVER_W, REC_H, MiniBarAnim.RECORD_HOVER_PANEL_MS)
             self._show_recording_status()
         else:
             self._sync_hover_tracking("enter")
@@ -1690,7 +1764,7 @@ class MiniRecordingWindow(QWidget):
             )
             if self._engine.state != "recording":
                 self._animate_to(
-                    self.width(), self.height(), 160,
+                    self.width(), self.height(), MiniBarAnim.DRAG_SNAP_MS,
                     QEasingCurve.Type.InOutQuart,
                 )
         self._drag_pos = None
