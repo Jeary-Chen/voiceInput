@@ -21,6 +21,7 @@ from core.log import logger
 from core.engine import VoiceEngine
 from core.config_sync import ConfigSync
 from core.faults import FaultKind
+from core.input_devices import InputDeviceSnapshot
 from core.updater import UpdateChecker, UpdateInfo, can_self_update
 from core.polisher import DEFAULT_INSTRUCTIONS
 from ui.mini_window import MiniRecordingWindow
@@ -51,6 +52,7 @@ _DEVICE_CHANGE_DEBOUNCE_MS = 500
 _DEVICE_STORM_WINDOW_SEC = 4.0
 _DEVICE_STORM_EVENT_LIMIT = 4
 _DEVICE_STORM_QUIET_SEC = 2.0
+_RECORDABLE_RETRY_DELAYS_MS = (1000, 2000, 4000)
 _NO_DEVICE_CHANGE = object()
 
 
@@ -75,44 +77,20 @@ class _ForegroundHotkeyGateFilter(QObject):
 
 class _DeviceRefreshWorker(QThread):
     """Enumerate audio devices off the main thread."""
-    result_ready = pyqtSignal(str, list)  # (default_name, devices)
+    result_ready = pyqtSignal(object)  # InputDeviceSnapshot
 
     def __init__(self):
         super().__init__()
 
     def run(self):
-        from core.recorder import VoiceRecorder
-        from core.device_watcher import (
-            get_default_capture_device_name,
-            get_full_device_names,
-        )
+        from core.input_devices import get_input_device_snapshot
+
         try:
-            full_names = get_full_device_names()
-            default_name = (
-                get_default_capture_device_name()
-                or VoiceRecorder.get_default_device_name()
-            )
-            raw_devices = VoiceRecorder.list_devices()
-            raw_by_name = {dev["name"]: dev for dev in raw_devices}
-            if full_names:
-                devices = [
-                    {
-                        "name": trunc,
-                        "display_name": full,
-                        "index": raw_by_name.get(trunc, {}).get("index"),
-                    }
-                    for trunc, full in full_names.items()
-                ]
-            else:
-                devices = raw_devices
-            if default_name:
-                trunc = default_name[:31]
-                if trunc in full_names:
-                    default_name = full_names[trunc]
+            snapshot = get_input_device_snapshot()
         except Exception:
-            default_name = "Unknown"
-            devices = []
-        self.result_ready.emit(default_name, devices)
+            logger.opt(exception=True).warning("[Tray] Device refresh failed")
+            snapshot = InputDeviceSnapshot.empty()
+        self.result_ready.emit(snapshot)
 
 
 class _RecorderPrepareWorker(QThread):
@@ -148,6 +126,54 @@ class _RecorderPrepareWorker(QThread):
         except Exception as e:
             logger.warning(f"[Tray] Deferred recorder prepare failed: {e}")
             self.prepare_done.emit(self._generation, "failed", False)
+
+
+class _RecordableProbeRetry:
+    """Retry while Windows sees an endpoint before PyAudio can open it."""
+
+    def __init__(self, refresh: Callable[[], None]):
+        self._attempt = 0
+        self._active = False
+        self._timer = QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(refresh)
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def reset(self) -> None:
+        self._attempt = 0
+        self._active = False
+        self._timer.stop()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def schedule_for(self, snapshot: InputDeviceSnapshot) -> None:
+        if not self.needs_retry(snapshot):
+            self.reset()
+            return
+        if self._attempt >= len(_RECORDABLE_RETRY_DELAYS_MS):
+            self._active = False
+            return
+        delay_ms = _RECORDABLE_RETRY_DELAYS_MS[self._attempt]
+        self._attempt += 1
+        self._active = True
+        logger.info(
+            f"[Tray] Visible input endpoint is not recordable yet; "
+            f"retrying device probe in {delay_ms}ms "
+            f"({self._attempt}/{len(_RECORDABLE_RETRY_DELAYS_MS)})"
+        )
+        self._timer.start(delay_ms)
+
+    @staticmethod
+    def needs_retry(snapshot: InputDeviceSnapshot) -> bool:
+        if not snapshot.devices:
+            return False
+        if not snapshot.has_recordable_device:
+            return True
+        return bool(snapshot.default_name and not snapshot.recordable_default_name)
 
 
 class VoiceTray(QSystemTrayIcon):
@@ -199,6 +225,13 @@ class VoiceTray(QSystemTrayIcon):
         self._recorder_prepare_timer.setSingleShot(True)
         self._recorder_prepare_timer.setInterval(200)
         self._recorder_prepare_timer.timeout.connect(self._deferred_recorder_prepare)
+        self._device_change_timer = QTimer()
+        self._device_change_timer.setSingleShot(True)
+        self._device_change_timer.setInterval(_DEVICE_CHANGE_DEBOUNCE_MS)
+        self._device_change_timer.timeout.connect(self._start_async_refresh)
+        self._recordable_retry = _RecordableProbeRetry(self._retry_input_recordable_probe)
+        self._input_rescan_needs_portaudio_reset = False
+        self._output_reopen_after_device_rescan = False
         self._sync_autostart_state(save_if_changed=True)
         self.refresh_idle_icon()
 
@@ -226,10 +259,6 @@ class VoiceTray(QSystemTrayIcon):
 
         from core.device_watcher import AudioDeviceWatcher
         self._device_watcher = AudioDeviceWatcher()
-        self._device_change_timer = QTimer()
-        self._device_change_timer.setSingleShot(True)
-        self._device_change_timer.setInterval(_DEVICE_CHANGE_DEBOUNCE_MS)
-        self._device_change_timer.timeout.connect(self._start_async_refresh)
         self._device_watcher.signals.changed.connect(self._on_audio_device_changed)
         self._device_watcher.start()
 
@@ -298,12 +327,12 @@ class VoiceTray(QSystemTrayIcon):
         apply_tray_menu_style(self._device_menu)
         install_left_cascade_submenu(self._device_menu, menu)
         self._device_menu.aboutToShow.connect(self._on_device_menu_show)
-        self._cached_default_name = ""
-        self._cached_devices: list[dict] = []
+        self._input_snapshot = InputDeviceSnapshot.empty()
         self._dev_refresh_running = False
         self._dev_refresh_repeat = False
         self._dev_refresh_ready = False
         self._dev_refresh_worker: _DeviceRefreshWorker | None = None
+        self._dev_refresh_workers: list[_DeviceRefreshWorker] = []
         self._dev_menu_dirty = True
         menu.addMenu(self._device_menu)
 
@@ -451,7 +480,11 @@ class VoiceTray(QSystemTrayIcon):
     # ── device refresh (background thread) ──
 
     def _on_audio_device_changed(self):
-        self._audio.refresh_output_device_async()
+        self._recordable_retry.reset()
+        self._input_rescan_needs_portaudio_reset = True
+        self._output_reopen_after_device_rescan = True
+        self._reset_input_portaudio_before_rescan()
+        self._audio.reset_for_device_rescan()
         now = time.monotonic()
         self._device_change_times = [
             t for t in self._device_change_times
@@ -483,38 +516,59 @@ class VoiceTray(QSystemTrayIcon):
         self._last_menu_refresh_time = now
         self._start_async_refresh()
 
+    def _reset_input_portaudio_before_rescan(self):
+        if not self._input_rescan_needs_portaudio_reset:
+            return
+        if self._engine.state == "recording":
+            return
+        self._input_rescan_needs_portaudio_reset = False
+        reset = getattr(self._engine.recorder, "reset_portaudio", None)
+        if reset is None:
+            return
+        reset("audio device changed")
+
+    def _retry_input_recordable_probe(self):
+        self._input_rescan_needs_portaudio_reset = True
+        self._start_async_refresh()
+
     def _start_async_refresh(self):
         if self._dev_refresh_running:
             self._dev_refresh_repeat = True
             return
+        self._reset_input_portaudio_before_rescan()
         self._dev_refresh_running = True
         worker = _DeviceRefreshWorker()
         worker.result_ready.connect(self._on_refresh_result)
-        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._on_device_refresh_worker_finished)
+        self._dev_refresh_workers.append(worker)
         self._dev_refresh_worker = worker
         worker.start()
 
-    def _on_refresh_result(self, default_name: str, devices: list):
-        unchanged = (
-            self._dev_refresh_ready
-            and default_name == self._cached_default_name
-            and devices == self._cached_devices
-        )
-        self._cached_default_name = default_name
-        self._cached_devices = devices
+    def _on_device_refresh_worker_finished(self):
+        worker = self.sender() if hasattr(self, "sender") else None
+        if worker is None:
+            worker = self._dev_refresh_worker
+        self._forget_background_worker(worker)
+        self._delete_worker_later(worker)
+
+    def _on_refresh_result(self, snapshot: InputDeviceSnapshot):
+        self._input_snapshot = snapshot
         self._dev_refresh_ready = True
         self._last_menu_refresh_time = time.monotonic()
+        self._dev_menu_dirty = True
         logger.info(f"[Tray] Device refresh done: "
-                    f"default='{default_name}', {len(devices)} device(s)")
+                    f"default='{snapshot.default_name}', {len(snapshot.devices)} device(s)")
         defer_audio_apply = self._device_change_in_storm()
         if defer_audio_apply:
             logger.info("[Tray] Device list refreshed during storm; audio apply deferred")
+            self._queue_recorder_recovery_after_storm()
         else:
             self._sync_system_default_device()
             self._auto_fallback_if_device_gone()
             self._recover_recorder_if_devices_returned()
-        if not unchanged:
-            self._rebuild_device_menu()
+            self._reopen_output_after_device_rescan()
+        self._recordable_retry.schedule_for(snapshot)
+        self._rebuild_device_menu()
         self._sync_tray_icon_with_engine()
         self._dev_refresh_running = False
         if self._dev_refresh_repeat:
@@ -522,11 +576,21 @@ class VoiceTray(QSystemTrayIcon):
             self._start_async_refresh()
             return
         if (
-            self._engine.state != "recording"
+            not defer_audio_apply
+            and self._engine.state != "recording"
             and self._recorder_prepare_worker is None
             and not self._engine.recorder.is_ready
+            and self._input_snapshot.has_recordable_device
         ):
-            self._start_recorder_prepare_worker()
+            self._start_recorder_prepare_worker(**self._recorder_prepare_target())
+
+    def _reopen_output_after_device_rescan(self):
+        if not self._output_reopen_after_device_rescan:
+            return
+        if self._device_change_in_storm():
+            return
+        self._output_reopen_after_device_rescan = False
+        self._audio.refresh_output_device_async()
 
     def _on_device_menu_show(self):
         if not self._dev_refresh_ready:
@@ -542,9 +606,14 @@ class VoiceTray(QSystemTrayIcon):
         """If following system default, rebind recorder when default device changed."""
         if self._config.mic_name:
             return
-        current_default = self._cached_default_name or ""
+        current_default = self._input_snapshot.recordable_default_name or ""
         recorder_name = self._engine.recorder.device_name or ""
-        if not current_default or recorder_name == current_default:
+        default_device = self._recordable_system_default_device()
+        if (
+            not current_default
+            or recorder_name in (current_default, getattr(default_device, "display_name", ""))
+            or not self._input_snapshot.has_recordable_device
+        ):
             return
         if self._engine.state != "recording":
             logger.info(
@@ -552,9 +621,12 @@ class VoiceTray(QSystemTrayIcon):
                 f"'{recorder_name}' -> '{current_default}', "
                 f"will reopen on next recording"
             )
-            self._start_recorder_prepare_worker(
-                invalidate_reason="system default device changed"
-            )
+            if default_device is not None:
+                self._schedule_recorder_device_apply(default_device.index, default_device.name)
+            else:
+                self._start_recorder_prepare_worker(
+                    invalidate_reason="system default device changed"
+                )
         else:
             self._pending_device_apply = True
             logger.info(f"[Tray] System default changed during recording, will apply: '{current_default}'")
@@ -569,37 +641,35 @@ class VoiceTray(QSystemTrayIcon):
         if not self._config.mic_name:
             return
         saved_name = self._config.mic_name
-        match = next((d for d in self._cached_devices if d["name"] == saved_name), None)
+        match = self._input_snapshot.find_by_name(saved_name)
         if match is not None:
-            if match["index"] is None and self._config.mic_index is not None:
-                self._config.mic_index = None
-                self._config.save()
-                if self._engine.state != "recording":
-                    self._schedule_recorder_device_apply(None, saved_name)
-                else:
-                    self._pending_device_apply = True
-                logger.info(f"[Tray] Device '{saved_name}' temporarily unresolved, cleared stale index")
-                return
-            if match["index"] is not None and match["index"] != self._config.mic_index:
+            if not match.is_recordable:
+                logger.info(
+                    f"[Tray] Selected device '{saved_name}' is visible but not recordable; "
+                    "switching to system default"
+                )
+            elif match.index != self._config.mic_index:
                 old_idx = self._config.mic_index
-                self._config.mic_index = match["index"]
+                self._config.mic_index = match.index
                 self._config.save()
                 if self._engine.state != "recording":
-                    self._schedule_recorder_device_apply(match["index"], saved_name)
+                    self._schedule_recorder_device_apply(match.index, saved_name)
                 else:
                     self._pending_device_apply = True
                 logger.info(f"[Tray] Device '{saved_name}' index changed "
-                            f"{old_idx} → {match['index']}")
-            return
+                            f"{old_idx} → {match.index}")
+                return
+            else:
+                return
         old = self._config.mic_index
         self._config.mic_index = None
         self._config.mic_name = ""
         self._config.save()
         if self._engine.state != "recording":
-            self._schedule_recorder_device_apply(None, "")
+            self._start_recorder_prepare_worker(**self._recorder_prepare_target())
         else:
             self._pending_device_apply = True
-        logger.info(f"[Tray] Selected device '{saved_name}' (index={old}) gone, "
+        logger.info(f"[Tray] Selected device '{saved_name}' (index={old}) unavailable, "
                     f"switched to system default")
 
     def _deferred_recorder_prepare(self):
@@ -642,18 +712,17 @@ class VoiceTray(QSystemTrayIcon):
             invalidate_reason=invalidate_reason,
         )
         worker.prepare_done.connect(self._on_recorder_prepare_done)
-        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._on_recorder_prepare_worker_finished)
         self._recorder_prepare_worker = worker
         logger.info(f"[Tray] Deferred recorder prepare started (gen={generation})")
         worker.start()
 
     def _on_recorder_prepare_done(self, generation: int, action: str, ok: bool):
-        if self._recorder_prepare_worker is not None:
-            self._recorder_prepare_worker = None
         logger.info(
             f"[Tray] Deferred recorder prepare finished "
             f"(gen={generation}, action={action}, ok={ok})"
         )
+        self._sync_device_fault_after_prepare(ok)
         if self._recorder_prepare_pending and self._engine.state != "recording":
             self._recorder_prepare_pending = False
             self._recorder_prepare_timer.start()
@@ -661,7 +730,29 @@ class VoiceTray(QSystemTrayIcon):
         if self._pending_record_start_source and self._engine.state == "ready":
             source = self._pending_record_start_source
             self._pending_record_start_source = None
+            if not self._recorder_is_ready():
+                logger.info(
+                    "[Tray] Recorder prepare finished without a usable input; "
+                    f"recording not started (source={source})"
+                )
+                self._engine.mic_unavailable.emit("未找到输入设备")
+                return
             self._begin_recording(source)
+
+    def _on_recorder_prepare_worker_finished(self):
+        worker = self.sender() if hasattr(self, "sender") else None
+        if worker is None:
+            worker = self._recorder_prepare_worker
+        self._forget_background_worker(worker)
+        self._delete_worker_later(worker)
+
+    def _sync_device_fault_after_prepare(self, ok: bool):
+        if not ok or self._engine.state != "ready":
+            return
+        if self._faults is not None:
+            self._faults.sync_device_from_recorder()
+        else:
+            self._sync_tray_icon_with_engine()
 
     def _schedule_recorder_device_apply(self, index: int | None, name: str):
         self._pending_device_apply = False
@@ -669,6 +760,24 @@ class VoiceTray(QSystemTrayIcon):
             device_index=index,
             preferred_name=name,
         )
+
+    def _recorder_prepare_target(self) -> dict:
+        if self._config.mic_name:
+            return {
+                "device_index": self._config.mic_index,
+                "preferred_name": self._config.mic_name,
+            }
+        default_device = self._recordable_system_default_device()
+        if default_device is None:
+            return {}
+        return {
+            "device_index": default_device.index,
+            "preferred_name": default_device.name,
+        }
+
+    def _recordable_system_default_device(self):
+        name = self._input_snapshot.recordable_default_name
+        return self._input_snapshot.find_by_name(name) if name else None
 
     def _recorder_is_ready(self) -> bool:
         return self._engine.recorder.is_ready
@@ -689,7 +798,7 @@ class VoiceTray(QSystemTrayIcon):
                 f"(source={source})"
             )
             self._pending_record_start_source = source
-            self._start_recorder_prepare_worker()
+            self._start_recorder_prepare_worker(**self._recorder_prepare_target())
             return
         self._begin_recording(source)
 
@@ -702,20 +811,32 @@ class VoiceTray(QSystemTrayIcon):
     def _recover_recorder_if_devices_returned(self):
         if self._engine.state == "recording" or not self._engine.recorder.no_device:
             return
-        if not self._cached_default_name and not self._cached_devices:
+        if not self._input_snapshot.has_recordable_device:
             return
         logger.info("[Tray] Input device available again, re-preparing recorder")
-        self._schedule_recorder_device_apply(
-            self._config.mic_index,
-            self._config.mic_name,
-        )
+        self._start_recorder_prepare_worker(**self._recorder_prepare_target())
+
+    def _queue_recorder_recovery_after_storm(self):
+        recorder = getattr(self._engine, "recorder", None)
+        if (
+            self._engine.state == "recording"
+            or recorder is None
+            or not getattr(recorder, "no_device", False)
+        ):
+            return
+        if not self._input_snapshot.has_recordable_device:
+            return
+        logger.info("[Tray] Input device available during storm, recorder recovery deferred")
+        self._recorder_prepare_pending_job = self._recorder_prepare_target()
+        self._recorder_prepare_timer.start()
 
     def _rebuild_device_menu(self):
         menu_visible = self._device_menu.isVisible()
         self._device_menu.clear()
         self._dev_menu_dirty = False
 
-        label = f"系统默认 ({self._cached_default_name})" if self._cached_default_name else "系统默认"
+        default_name = self._input_snapshot.default_name
+        label = f"系统默认 ({default_name})" if default_name else "系统默认"
         act_default = QAction(label, self._device_menu)
         act_default.setCheckable(True)
         act_default.setChecked(not self._config.mic_name)
@@ -723,18 +844,30 @@ class VoiceTray(QSystemTrayIcon):
         self._device_menu.addAction(act_default)
         self._device_menu.addSeparator()
 
-        if not self._cached_devices:
+        devices = self._input_snapshot.devices
+        if not devices:
             act = QAction("(未发现兼容设备)", self._device_menu)
             act.setEnabled(False)
             self._device_menu.addAction(act)
         else:
-            for dev in self._cached_devices:
-                display = dev.get("display_name", dev["name"])
-                act = QAction(display, self._device_menu)
+            for dev in devices:
+                if dev.is_recordable:
+                    label = dev.display_name
+                elif self._recordable_retry.active:
+                    label = f"{dev.display_name}（正在初始化）"
+                else:
+                    label = f"{dev.display_name}（不可录）"
+                act = QAction(label, self._device_menu)
                 act.setCheckable(True)
-                act.setChecked(self._config.mic_name == dev["name"])
+                act.setChecked(self._config.mic_name == dev.name)
+                act.setEnabled(dev.is_recordable)
                 act.triggered.connect(
-                    lambda checked, idx=dev.get("index"), name=dev["name"]: self._set_device(name, idx))
+                    lambda checked, idx=dev.index, name=dev.name: self._set_device(name, idx))
+                self._device_menu.addAction(act)
+            if not self._input_snapshot.has_recordable_device:
+                self._device_menu.addSeparator()
+                act = QAction("(未发现兼容设备)", self._device_menu)
+                act.setEnabled(False)
                 self._device_menu.addAction(act)
 
         if menu_visible:
@@ -1569,6 +1702,9 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_state(self, state: str):
         if state == "ready":
+            if self._input_rescan_needs_portaudio_reset:
+                self._reset_input_portaudio_before_rescan()
+                self._start_async_refresh()
             self._maybe_apply_deferred_input_device()
         if state == "ready" and self._config_sync is not None:
             self._config_sync.flush_pending_reload()
@@ -1696,7 +1832,66 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "recording":
             self._engine.cancel()
         self._device_watcher.stop()
+        self._device_change_timer.stop()
+        self._recordable_retry.stop()
+        self._recorder_prepare_timer.stop()
+        if not self._wait_for_background_workers():
+            logger.warning("[Tray] Quit deferred until background workers finish")
+            QTimer.singleShot(500, self._quit)
+            return
         self._audio.release()
         self._engine.recorder.release()
         self._stop_hotkey_listener()
         QApplication.quit()
+
+    def _wait_for_background_workers(self) -> bool:
+        ok = self._wait_for_worker(self._recorder_prepare_worker, "recorder prepare")
+        for worker in list(getattr(self, "_dev_refresh_workers", [])):
+            ok = self._wait_for_worker(worker, "device refresh") and ok
+        return ok
+
+    def _forget_background_worker(self, worker) -> None:
+        if worker is None:
+            return
+        workers = getattr(self, "_dev_refresh_workers", [])
+        if worker in workers:
+            workers.remove(worker)
+        if getattr(self, "_dev_refresh_worker", None) is worker:
+            self._dev_refresh_worker = None
+        if getattr(self, "_recorder_prepare_worker", None) is worker:
+            self._recorder_prepare_worker = None
+
+    def _delete_worker_later(self, worker) -> None:
+        if worker is None:
+            return
+        delete_later = getattr(worker, "deleteLater", None)
+        if delete_later is not None:
+            delete_later()
+
+    def _disconnect_worker_finished(self, worker, slot) -> None:
+        if worker is None:
+            return
+        finished = getattr(worker, "finished", None)
+        disconnect = getattr(finished, "disconnect", None)
+        if disconnect is None:
+            return
+        try:
+            disconnect(slot)
+        except (TypeError, RuntimeError):
+            pass
+
+    def _wait_for_worker(self, worker, label: str, timeout_ms: int = 2500) -> bool:
+        if worker is None:
+            return True
+        is_running = getattr(worker, "isRunning", None)
+        wait = getattr(worker, "wait", None)
+        if is_running is not None and wait is not None and is_running():
+            logger.info(f"[Tray] Waiting for {label} worker to finish")
+            if not wait(timeout_ms):
+                logger.warning(f"[Tray] {label} worker still running during quit")
+                return False
+        self._forget_background_worker(worker)
+        self._disconnect_worker_finished(worker, self._on_recorder_prepare_worker_finished)
+        self._disconnect_worker_finished(worker, self._on_device_refresh_worker_finished)
+        self._delete_worker_later(worker)
+        return True

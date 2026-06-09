@@ -19,6 +19,21 @@ _TAG = "[Engine]"
 
 COUNTDOWN_SEC = 10
 _MAX_UPLOAD_DURATION_SEC = 20 * 60  # 20 minutes
+_STOP_TAIL_MS = 350
+_MIN_EFFECTIVE_RECORDING_SEC = 0.25
+
+
+def _validation_duration(total_duration: float, reason: str) -> float:
+    """Duration used for UX validity checks, not for ASR input.
+
+    Stop requests include a short tail capture to avoid clipping final words.
+    That tail should not make an accidental tap look like real speech.
+    """
+    return max(0.0, total_duration - _STOP_TAIL_MS / 1000)
+
+
+def _recording_too_short(total_duration: float, reason: str) -> bool:
+    return _validation_duration(total_duration, reason) < _MIN_EFFECTIVE_RECORDING_SEC
 
 
 def _load_audio_file(path: str) -> tuple[bytes, float]:
@@ -321,6 +336,11 @@ class VoiceEngine(QObject):
         self._countdown_active = False
         self._max_reached.connect(self._stop_recording)
         self._mic_error.connect(self._on_recording_mic_error)
+        self._stop_tail_reason = ""
+        self._stop_tail_timer = QTimer(self)
+        self._stop_tail_timer.setSingleShot(True)
+        self._stop_tail_timer.setInterval(_STOP_TAIL_MS)
+        self._stop_tail_timer.timeout.connect(self._finish_stop_tail)
         self._watchdog = QTimer(self)
         self._watchdog.setInterval(1000)
         self._watchdog.timeout.connect(self._check_recording_health)
@@ -387,6 +407,7 @@ class VoiceEngine(QObject):
     def cancel(self):
         if self._state == "recording":
             logger.info(f"{_TAG} Recording cancelled by user")
+            self._cancel_stop_tail()
             self._stop_recording_async("cancel", cancel=True)
 
     def transcribe_file(self, file_path: str):
@@ -482,7 +503,7 @@ class VoiceEngine(QObject):
         if self._state != "recording":
             return
         logger.error(f"{_TAG} Mic error during recording, auto-stopping")
-        self._stop_recording_async("mic_error")
+        self._stop_recording("mic_error")
 
     def _check_recording_health(self):
         """Watchdog: detect stalled stream + countdown auto-stop."""
@@ -493,7 +514,7 @@ class VoiceEngine(QObject):
             logger.error(f"{_TAG} Audio stream stalled "
                          f"(no callback for >{self.recorder.STALL_TIMEOUT}s), "
                          f"device likely disconnected")
-            self._stop_recording_async("stalled")
+            self._stop_recording("stalled")
             return
 
         elapsed = self.get_duration()
@@ -530,7 +551,27 @@ class VoiceEngine(QObject):
     def _stop_recording(self, reason: str = "manual"):
         if self._state != "recording":
             return
+        if self._stop_tail_timer.isActive():
+            logger.debug(f"{_TAG} Stop tail already pending ({self._stop_tail_reason})")
+            return
+        self._stop_tail_reason = reason
+        logger.info(
+            f"{_TAG} Stop requested ({reason}); capturing "
+            f"{_STOP_TAIL_MS}ms tail audio"
+        )
+        self._stop_tail_timer.start()
+
+    def _finish_stop_tail(self):
+        if self._state != "recording":
+            return
+        reason = self._stop_tail_reason or "manual"
+        self._stop_tail_reason = ""
         self._stop_recording_async(reason)
+
+    def _cancel_stop_tail(self):
+        if self._stop_tail_timer.isActive():
+            self._stop_tail_timer.stop()
+        self._stop_tail_reason = ""
 
     def _stop_recording_async(self, reason: str, *, cancel: bool = False):
         if self._state != "recording":
@@ -565,6 +606,16 @@ class VoiceEngine(QObject):
         duration = len(pcm) / (VoiceRecorder.TARGET_RATE * 2)
         logger.info(f"{_TAG} Recording stopped — {duration:.1f}s, "
                     f"PCM {len(pcm)} bytes")
+
+        if _recording_too_short(duration, reason):
+            effective_duration = _validation_duration(duration, reason)
+            logger.info(
+                f"{_TAG} Recording too short: effective={effective_duration:.2f}s, "
+                f"total={duration:.2f}s, reason={reason}"
+            )
+            self.error_occurred.emit("录音过短，请重试")
+            self._set_state("ready")
+            return
 
         if self.recorder.is_silent():
             logger.info(f"{_TAG} Audio silent (peak={self.recorder.peak_amplitude}), "

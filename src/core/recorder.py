@@ -51,6 +51,53 @@ def _mix_to_mono(data: bytes, channels: int) -> bytes:
     return mono.tobytes()
 
 
+def _host_api_rank(name: str) -> int:
+    name_upper = name.upper()
+    if "WASAPI" in name_upper:
+        return 0
+    if "DIRECTSOUND" in name_upper:
+        return 1
+    if "MME" in name_upper:
+        return 2
+    return 3
+
+
+def _probe_input_open(
+    pa: pyaudio.PyAudio,
+    *,
+    index: int,
+    max_channels: int,
+    default_rate: int,
+) -> tuple[int, int] | None:
+    channels_to_try = [1]
+    if max_channels > 1:
+        channels_to_try.append(max_channels)
+
+    rates: list[int] = []
+    if default_rate > 0:
+        rates.append(default_rate)
+    rates.extend(rate for rate in _PREFERRED_RATES if rate not in rates)
+
+    for channels in channels_to_try:
+        for rate in rates:
+            try:
+                block = max(int(rate * _CALLBACK_BUFFER_SEC), _MIN_FRAMES_PER_BUFFER)
+                stream = pa.open(
+                    format=pyaudio.paInt16,
+                    channels=channels,
+                    rate=rate,
+                    input=True,
+                    input_device_index=index,
+                    start=False,
+                    frames_per_buffer=block,
+                )
+                stream.close()
+                return rate, channels
+            except Exception:
+                continue
+    return None
+
+
 class VoiceRecorder:
     TARGET_RATE = 16000
     CHANNELS = 1
@@ -168,6 +215,22 @@ class VoiceRecorder:
         with self._lifecycle_lock:
             self._release_pa()
             self._prepared = False
+
+    def reset_portaudio(self, reason: str = "") -> bool:
+        """Terminate PyAudio so the next prepare/enumeration sees fresh devices.
+
+        PortAudio may keep a process-wide device table while a PyAudio client is
+        alive.  Hot-plug handling must drop the pre-opened input client before
+        asking PyAudio for the new device list.
+        """
+        with self._lifecycle_lock:
+            had_audio_client = self._pa is not None or self._stream is not None
+            self._release_pa()
+            self._prepared = False
+            if had_audio_client:
+                suffix = f": {reason}" if reason else ""
+                logger.info(f"{_TAG} PyAudio reset for device rescan{suffix}")
+            return had_audio_client
 
     def invalidate_stream(self, reason: str = "") -> bool:
         """Drop pre-opened stream so start() will reopen against current devices.
@@ -605,31 +668,61 @@ class VoiceRecorder:
 
     @classmethod
     def list_devices(cls) -> list[dict]:
-        """List all WASAPI input devices (deduplicated by name)."""
+        """List open-verified PyAudio input devices.
+
+        Windows can expose capture endpoints that PyAudio cannot actually open.
+        Treat PyAudio `open(start=False)` as the recorder capability boundary.
+        """
         pa = pyaudio.PyAudio()
         try:
-            wasapi_idx = None
+            host_api_names: dict[int, str] = {}
             for h in range(pa.get_host_api_count()):
                 api = pa.get_host_api_info_by_index(h)
-                if "WASAPI" in api.get("name", ""):
-                    wasapi_idx = h
-                    break
+                host_api_names[h] = api.get("name", f"HostApi {h}")
 
-            devices = []
-            seen: set[str] = set()
+            candidates: list[tuple[int, int, str]] = []
             for i in range(pa.get_device_count()):
                 info = pa.get_device_info_by_index(i)
                 if info.get("maxInputChannels", 0) <= 0:
                     continue
-                if wasapi_idx is not None and info.get("hostApi") != wasapi_idx:
-                    continue
+                host_api = int(info.get("hostApi", -1))
+                host_name = host_api_names.get(host_api, f"HostApi {host_api}")
+                candidates.append((_host_api_rank(host_name), i, host_name))
+
+            devices: list[dict] = []
+            seen: set[str] = set()
+            for _, i, host_name in sorted(candidates):
+                info = pa.get_device_info_by_index(i)
                 name = _fix_name(info.get("name", f"Device {i}"))
                 if name in seen:
                     continue
+                max_channels = int(info.get("maxInputChannels", 0))
+                default_rate = int(info.get("defaultSampleRate", 0))
+                opened = _probe_input_open(
+                    pa,
+                    index=i,
+                    max_channels=max_channels,
+                    default_rate=default_rate,
+                )
+                if opened is None:
+                    logger.debug(
+                        f"{_TAG} Skipped input device {i} '{name}' "
+                        f"({host_name}): open probe failed"
+                    )
+                    continue
+                open_rate, open_channels = opened
                 seen.add(name)
-                devices.append({"index": i, "name": name})
+                devices.append({
+                    "index": i,
+                    "name": name,
+                    "host_api": host_name,
+                    "open_rate": open_rate,
+                    "open_channels": open_channels,
+                })
 
-            logger.debug(f"{_TAG} Enumerated {len(devices)} input device(s)")
+            hosts = ", ".join(sorted({dev["host_api"] for dev in devices}))
+            suffix = f" via {hosts}" if hosts else ""
+            logger.debug(f"{_TAG} Enumerated {len(devices)} input device(s){suffix}")
             return devices
         finally:
             pa.terminate()

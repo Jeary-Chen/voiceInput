@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QObject
 
-from core.engine import VoiceEngine
 from core.fault_notifications import spec_for_fault
 from core.fault_policy import (
     BalloonMode,
@@ -19,13 +18,14 @@ from core.fault_policy import (
 )
 from core.faults import FaultEvent, FaultKind, FaultSource, classify_fault
 from core.log import logger
-from ui.tray import VoiceTray
 
 if TYPE_CHECKING:
     from config import Config
     from core.config_sync import ConfigSync
+    from core.engine import VoiceEngine
     from ui.config_dialog import ConfigFaultHandler
     from ui.notifier import Notifier
+    from ui.tray import VoiceTray
 
 _TAG = "[Fault]"
 
@@ -103,6 +103,18 @@ class FaultCoordinator(QObject):
             not bool(self._tray.config.api_key),
             notify=False,
         )
+
+    def sync_device_from_recorder(self) -> None:
+        """Reconcile device fault presentation with the recorder's live state."""
+        recorder = self._tray.engine.recorder
+        if recorder.no_device:
+            self._tray.refresh_idle_icon()
+            return
+
+        if FaultKind.DEVICE in self._active:
+            self.set_active(FaultKind.DEVICE, False, notify=False)
+        else:
+            self._tray.refresh_idle_icon()
 
     def guard_recording_start(self) -> bool:
         if self._present_config_disk_if_active():

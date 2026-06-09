@@ -58,6 +58,24 @@ class _FakeStartWorker:
         self.thread_started = True
 
 
+class _FakeTimer:
+    def __init__(self):
+        self.active = False
+        self.starts = 0
+        self.stops = 0
+
+    def isActive(self):
+        return self.active
+
+    def start(self):
+        self.active = True
+        self.starts += 1
+
+    def stop(self):
+        self.active = False
+        self.stops += 1
+
+
 def _engine_base(state: str):
     from core.engine import VoiceEngine
 
@@ -66,6 +84,8 @@ def _engine_base(state: str):
     engine._start_worker = None
     engine._stop_worker = None
     engine._countdown_active = False
+    engine._stop_tail_timer = _FakeTimer()
+    engine._stop_tail_reason = ""
     engine.recorder = SimpleNamespace(
         stop=MagicMock(),
         cancel=MagicMock(),
@@ -85,6 +105,7 @@ def _engine_base(state: str):
     engine._on_audio_chunk = lambda data: None
     engine._on_max_reached = lambda: None
     engine._on_mic_error = lambda: None
+    engine._start_batch_transcribe = MagicMock()
 
     def _set_state(state):
         engine._state = state
@@ -98,6 +119,15 @@ def _engine_base(state: str):
     engine._stop_recording_async = (
         lambda reason, cancel=False:
         VoiceEngine._stop_recording_async(engine, reason, cancel=cancel)
+    )
+    engine._stop_recording = (
+        lambda reason="manual": VoiceEngine._stop_recording(engine, reason)
+    )
+    engine._finish_stop_tail = (
+        lambda: VoiceEngine._finish_stop_tail(engine)
+    )
+    engine._cancel_stop_tail = (
+        lambda: VoiceEngine._cancel_stop_tail(engine)
     )
     engine._on_recording_start_done = (
         lambda: VoiceEngine._on_recording_start_done(engine)
@@ -157,15 +187,51 @@ class EngineAsyncStopTests(unittest.TestCase):
         self.assertTrue(_FakeStopWorker.instances[0].started)
         self.assertEqual(_FakeStopWorker.instances[0].reason, "stalled")
 
+    def test_stop_request_captures_tail_before_async_stop(self):
+        from core.engine import VoiceEngine
+
+        engine = _engine_recording()
+        with patch("core.engine._RecorderStopWorker", _FakeStopWorker):
+            VoiceEngine._stop_recording(engine, "max_duration")
+
+        self.assertEqual(engine._state, "recording")
+        self.assertEqual(len(_FakeStopWorker.instances), 0)
+        self.assertTrue(engine._stop_tail_timer.active)
+        self.assertEqual(engine._stop_tail_reason, "max_duration")
+
+        with patch("core.engine._RecorderStopWorker", _FakeStopWorker):
+            VoiceEngine._finish_stop_tail(engine)
+
+        self.assertEqual(engine._state, "processing")
+        self.assertEqual(len(_FakeStopWorker.instances), 1)
+        self.assertTrue(_FakeStopWorker.instances[0].started)
+        self.assertEqual(_FakeStopWorker.instances[0].reason, "max_duration")
+        self.assertEqual(engine._stop_tail_reason, "")
+
+    def test_stop_tail_ignores_duplicate_stop_request(self):
+        from core.engine import VoiceEngine
+
+        engine = _engine_recording()
+        VoiceEngine._stop_recording(engine)
+        VoiceEngine._stop_recording(engine)
+
+        self.assertEqual(engine._stop_tail_timer.starts, 1)
+        self.assertEqual(len(_FakeStopWorker.instances), 0)
+
     def test_cancel_request_starts_cancel_worker_without_sync_cancel(self):
         from core.engine import VoiceEngine
 
         engine = _engine_recording()
+        engine._stop_tail_timer.active = True
+        engine._stop_tail_reason = "manual"
         with patch("core.engine._RecorderStopWorker", _FakeStopWorker):
             VoiceEngine.cancel(engine)
 
         engine.recorder.cancel.assert_not_called()
         self.assertTrue(_FakeStopWorker.instances[0].cancel)
+        self.assertFalse(engine._stop_tail_timer.active)
+        self.assertEqual(engine._stop_tail_timer.stops, 1)
+        self.assertEqual(engine._stop_tail_reason, "")
 
     def test_stalled_empty_result_reports_device_fault(self):
         from core.engine import VoiceEngine
@@ -175,6 +241,55 @@ class EngineAsyncStopTests(unittest.TestCase):
 
         self.assertEqual(engine._state, "ready")
         self.assertTrue(engine.mic_unavailable.emitted)
+        self.assertFalse(engine.error_occurred.emitted)
+
+    def test_manual_stop_short_effective_duration_skips_asr(self):
+        from core.engine import VoiceEngine
+        from core.recorder import VoiceRecorder
+
+        engine = _engine_recording()
+        engine.recorder.is_silent = MagicMock(return_value=False)
+        engine.recorder.peak_amplitude = 1000
+        pcm = b"\0" * int(VoiceRecorder.TARGET_RATE * 2 * 0.45)
+
+        VoiceEngine._on_recording_stop_done(engine, "manual", False, pcm)
+
+        self.assertEqual(engine._state, "ready")
+        self.assertEqual(engine.error_occurred.emitted, [("录音过短，请重试",)])
+        engine.recorder.is_silent.assert_not_called()
+        engine._start_batch_transcribe.assert_not_called()
+
+    def test_non_manual_stop_also_subtracts_tail_for_short_check(self):
+        from core.engine import VoiceEngine
+        from core.recorder import VoiceRecorder
+
+        engine = _engine_recording()
+        engine.recorder.is_silent = MagicMock(return_value=False)
+        engine.recorder.peak_amplitude = 1000
+        pcm = b"\0" * int(VoiceRecorder.TARGET_RATE * 2 * 0.45)
+
+        VoiceEngine._on_recording_stop_done(engine, "max_duration", False, pcm)
+
+        self.assertEqual(engine._state, "ready")
+        self.assertEqual(engine.error_occurred.emitted, [("录音过短，请重试",)])
+        engine.recorder.is_silent.assert_not_called()
+        engine._start_batch_transcribe.assert_not_called()
+
+    def test_non_manual_stop_keeps_full_pcm_for_asr_when_effective_duration_ok(self):
+        from core.engine import VoiceEngine
+        from core.recorder import VoiceRecorder
+
+        engine = _engine_recording()
+        engine.recorder.is_silent = MagicMock(return_value=False)
+        engine.recorder.peak_amplitude = 1000
+        pcm = b"\0" * int(VoiceRecorder.TARGET_RATE * 2 * 0.80)
+
+        VoiceEngine._on_recording_stop_done(engine, "max_duration", False, pcm)
+
+        engine._start_batch_transcribe.assert_called_once()
+        args = engine._start_batch_transcribe.call_args.args
+        self.assertEqual(args[0], pcm)
+        self.assertAlmostEqual(args[1], 0.80)
         self.assertFalse(engine.error_occurred.emitted)
 
 

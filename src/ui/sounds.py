@@ -290,10 +290,30 @@ class AudioCues:
             self._reopen_timer = timer
             timer.start()
 
+    def reset_for_device_rescan(self):
+        """Drop the output PyAudio client before a global device rescan."""
+        with self._init_lock:
+            if self._released:
+                return
+            if self._reopen_timer is not None:
+                self._reopen_timer.cancel()
+                self._reopen_timer = None
+            self._init_started = False
+        old_stream, old_pa = self._detach_current_stream()
+        self._close_detached_stream(old_stream, old_pa)
+        if old_stream is not None or old_pa is not None:
+            logger.info(f"{_TAG} PyAudio reset for device rescan")
+
     def _reopen_stream(self):
         with self._init_lock:
             self._reopen_timer = None
             self._init_started = False
+        old_stream, old_pa = self._detach_current_stream()
+        self._close_detached_stream(old_stream, old_pa)
+        logger.info(f"{_TAG} Reopening callback stream for current default output")
+        self._init_stream()
+
+    def _detach_current_stream(self):
         old_stream = None
         old_pa = None
         with self._lock:
@@ -304,6 +324,10 @@ class AudioCues:
             self._stream_ready = False
             self._output_device_name = None
             self._buf.clear()
+        return old_stream, old_pa
+
+    @staticmethod
+    def _close_detached_stream(old_stream, old_pa):
         if old_stream is not None:
             try:
                 old_stream.stop_stream()
@@ -315,8 +339,6 @@ class AudioCues:
                 old_pa.terminate()
             except Exception:
                 pass
-        logger.info(f"{_TAG} Reopening callback stream for current default output")
-        self._init_stream()
 
     def _audio_callback(self, in_data, frame_count, time_info, status):
         needed = frame_count * 2  # 16-bit mono
