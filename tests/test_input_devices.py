@@ -141,6 +141,31 @@ class InputDeviceSnapshotTests(unittest.TestCase):
         self.assertFalse(snapshot.devices[0].is_recordable)
         self.assertTrue(snapshot.has_recordable_device)
 
+    def test_snapshot_matches_windows_renamed_device_to_pyaudio_alias(self):
+        from core.input_devices import get_input_device_snapshot
+
+        pyaudio_name = "耳机 (HUAWEI FreeBuds SE 2)"
+        windows_name = "耳机 (2- HUAWEI FreeBuds SE 2)"
+        with patch(
+            "core.input_devices.VoiceRecorder.list_devices",
+            return_value=[{"name": pyaudio_name, "index": 4}],
+        ):
+            with patch(
+                "core.input_devices.get_default_capture_device_name",
+                return_value=windows_name,
+            ):
+                with patch(
+                    "core.input_devices.get_full_device_names",
+                    return_value={windows_name: windows_name},
+                ):
+                    snapshot = get_input_device_snapshot()
+
+        self.assertEqual(len(snapshot.devices), 1)
+        self.assertEqual(snapshot.devices[0].display_name, windows_name)
+        self.assertEqual(snapshot.devices[0].index, 4)
+        self.assertTrue(snapshot.devices[0].is_recordable)
+        self.assertEqual(snapshot.recordable_default_name, pyaudio_name)
+
 
 if __name__ == "__main__":
     unittest.main()

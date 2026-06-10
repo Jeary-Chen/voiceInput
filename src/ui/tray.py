@@ -622,7 +622,7 @@ class VoiceTray(QSystemTrayIcon):
                 f"will reopen on next recording"
             )
             if default_device is not None:
-                self._schedule_recorder_device_apply(default_device.index, default_device.name)
+                self._schedule_recorder_device_apply(None, "")
             else:
                 self._start_recorder_prepare_worker(
                     invalidate_reason="system default device changed"
@@ -767,12 +767,11 @@ class VoiceTray(QSystemTrayIcon):
                 "device_index": self._config.mic_index,
                 "preferred_name": self._config.mic_name,
             }
-        default_device = self._recordable_system_default_device()
-        if default_device is None:
+        if not self._input_snapshot.has_recordable_device:
             return {}
         return {
-            "device_index": default_device.index,
-            "preferred_name": default_device.name,
+            "device_index": None,
+            "preferred_name": "",
         }
 
     def _recordable_system_default_device(self):

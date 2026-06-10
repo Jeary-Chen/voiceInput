@@ -5,6 +5,7 @@ from typing import Callable
 import numpy as np
 import pyaudio
 
+from core.device_names import fix_device_name
 from core.log import logger
 
 _TAG = "[Recorder]"
@@ -19,19 +20,6 @@ _TAG = "[Recorder]"
 _PREFERRED_RATES = (16000, 32000, 48000, 44100, 22050, 8000)
 _CALLBACK_BUFFER_SEC = 0.20
 _MIN_FRAMES_PER_BUFFER = 2400
-
-
-def _fix_name(name: str) -> str:
-    """Fix PyAudio device name encoding on Chinese Windows.
-
-    PyAudio sometimes decodes UTF-8 device name bytes using the system
-    codepage (GBK), producing mojibake like '鑰虫満' instead of '耳机'.
-    Re-encoding as GBK and decoding as UTF-8 recovers the original text.
-    """
-    try:
-        return name.encode("gbk").decode("utf-8")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return name
 
 
 def _resample(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
@@ -186,7 +174,7 @@ class VoiceRecorder:
                 return
 
             self._no_device = False
-            self._device_name = _fix_name(info.get("name", "Unknown"))
+            self._device_name = fix_device_name(info.get("name", "Unknown"))
             self._native_rate = int(info.get("defaultSampleRate", 0))
             self._max_channels = int(info.get("maxInputChannels", self.CHANNELS))
 
@@ -377,7 +365,7 @@ class VoiceRecorder:
             return
 
         self._no_device = False
-        self._device_name = _fix_name(info.get("name", "Unknown"))
+        self._device_name = fix_device_name(info.get("name", "Unknown"))
         self._native_rate = int(info.get("defaultSampleRate", 0))
         self._max_channels = int(info.get("maxInputChannels", self.CHANNELS))
         self._stream_rate, self._stream_channels = self._negotiate_params()
@@ -693,7 +681,7 @@ class VoiceRecorder:
             seen: set[str] = set()
             for _, i, host_name in sorted(candidates):
                 info = pa.get_device_info_by_index(i)
-                name = _fix_name(info.get("name", f"Device {i}"))
+                name = fix_device_name(info.get("name", f"Device {i}"))
                 if name in seen:
                     continue
                 max_channels = int(info.get("maxInputChannels", 0))
@@ -732,7 +720,7 @@ class VoiceRecorder:
         pa = pyaudio.PyAudio()
         try:
             info = pa.get_default_input_device_info()
-            return _fix_name(info.get("name", "Unknown"))
+            return fix_device_name(info.get("name", "Unknown"))
         except Exception:
             return "Unknown"
         finally:

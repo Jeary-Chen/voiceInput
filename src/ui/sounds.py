@@ -20,6 +20,7 @@ import time
 
 import pyaudio
 
+from core.device_names import device_labels_overlap, fix_device_name
 from core.device_watcher import get_default_render_device_name
 from core.log import logger
 
@@ -32,17 +33,6 @@ _START_DEBOUNCE_SEC = 0.25
 _COLD_THRESHOLD_SEC = 2.0
 _WARMUP_SILENCE_SEC = 0.1
 _OUTPUT_REOPEN_DEBOUNCE_SEC = 0.35
-
-
-def _fix_name(name: str) -> str:
-    try:
-        return name.encode("gbk").decode("utf-8")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return name
-
-
-def _normalized_device_name(name: str) -> str:
-    return " ".join(_fix_name(name).casefold().split())
 
 
 def _gen_pcm(samples: list[float]) -> bytes:
@@ -114,7 +104,6 @@ def _resolve_default_output_device(pa: pyaudio.PyAudio) -> tuple[int | None, str
     if not default_name:
         return None, None
 
-    default_norm = _normalized_device_name(default_name)
     fallback: tuple[int, str] | None = None
     try:
         wasapi_hosts = {
@@ -126,12 +115,8 @@ def _resolve_default_output_device(pa: pyaudio.PyAudio) -> tuple[int | None, str
             info = pa.get_device_info_by_index(idx)
             if int(info.get("maxOutputChannels", 0) or 0) <= 0:
                 continue
-            name = _fix_name(str(info.get("name", "")))
-            name_norm = _normalized_device_name(name)
-            if not name_norm:
-                continue
-            matches = name_norm == default_norm or name_norm in default_norm or default_norm in name_norm
-            if not matches:
+            name = fix_device_name(str(info.get("name", "")))
+            if not device_labels_overlap(name, default_name):
                 continue
             if info.get("hostApi") in wasapi_hosts:
                 return idx, name

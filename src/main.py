@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from core.config_sync import ConfigSync
-from core.log import logger, install_qt_handler
+from core.log import flush_log, logger, install_qt_handler
 from core.engine import VoiceEngine
 from ui import icons
 from ui.config_dialog import ConfigFaultHandler, load_config_at_startup
@@ -149,6 +149,8 @@ def main():
     _create_shutdown_event()
     app.aboutToQuit.connect(_release_app_mutex)
     app.aboutToQuit.connect(_release_shutdown_event)
+    app.aboutToQuit.connect(lambda: logger.info("[Main] QApplication aboutToQuit"))
+    app.aboutToQuit.connect(flush_log)
 
     config_sync = ConfigSync(config)
     app.aboutToQuit.connect(config_sync.stop)

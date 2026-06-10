@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.device_names import (
+    device_identity_key,
+    is_system_capture_alias,
+    same_device_name,
+)
 from core.device_watcher import get_default_capture_device_name, get_full_device_names
 from core.recorder import VoiceRecorder
 
@@ -45,27 +50,65 @@ class InputDeviceSnapshot:
         return cls(default_name="", recordable_default_name="", devices=())
 
 
-def get_input_device_snapshot() -> InputDeviceSnapshot:
-    """Return the single source of truth for recordable input devices.
+class _RawDeviceIndex:
+    def __init__(self, raw_devices: list[dict]):
+        self._exact = {device["name"]: device for device in raw_devices}
+        self._by_identity: dict[str, dict] = {}
+        for device in raw_devices:
+            key = device_identity_key(device["name"])
+            if key:
+                self._by_identity.setdefault(key, device)
 
-    PyAudio decides which devices are actually usable for recording. Windows
-    Core Audio is used only to decorate PyAudio devices with full friendly names
-    and to identify the current default when it maps back to a PyAudio device.
-    """
+    def lookup(self, *names: str) -> dict | None:
+        for name in names:
+            if name and name in self._exact:
+                return self._exact[name]
+        for name in names:
+            key = device_identity_key(name)
+            if key:
+                device = self._by_identity.get(key)
+                if device is not None:
+                    return device
+        return None
+
+    def iter_names(self):
+        return self._exact.keys()
+
+
+class _FullNameIndex:
+    def __init__(self, full_names: dict[str, str]):
+        self._by_trunc = full_names
+        self._by_identity: dict[str, str] = {}
+        for trunc, full in full_names.items():
+            for name in (trunc, full):
+                key = device_identity_key(name)
+                if key:
+                    self._by_identity.setdefault(key, full)
+
+    def display_name(self, raw_name: str) -> str:
+        if raw_name in self._by_trunc:
+            return self._by_trunc[raw_name]
+        key = device_identity_key(raw_name)
+        return self._by_identity.get(key, raw_name)
+
+
+def get_input_device_snapshot() -> InputDeviceSnapshot:
+    """Build menu/runtime snapshot: PyAudio decides recordability, COM decorates names."""
     system_default_name = get_default_capture_device_name() or ""
     raw_devices = VoiceRecorder.list_devices()
     full_names = get_full_device_names()
-    raw_by_name = {dev["name"]: dev for dev in raw_devices}
-    devices = _merge_visible_and_recordable_devices(raw_by_name, full_names)
+
+    raw_index = _RawDeviceIndex(raw_devices)
+    full_index = _FullNameIndex(full_names)
+
     recordable_devices = tuple(
         InputDevice(
-            name=dev["name"],
-            display_name=full_names.get(dev["name"], dev["name"]),
-            index=dev["index"],
+            name=device["name"],
+            display_name=full_index.display_name(device["name"]),
+            index=device["index"],
         )
-        for dev in raw_devices
+        for device in raw_devices
     )
-
     recordable_default_name = _recordable_default_name(
         recordable_devices,
         system_default_name,
@@ -73,38 +116,42 @@ def get_input_device_snapshot() -> InputDeviceSnapshot:
     return InputDeviceSnapshot(
         default_name=system_default_name or recordable_default_name,
         recordable_default_name=recordable_default_name,
-        devices=devices,
+        devices=_merge_visible_devices(raw_index, full_names, full_index),
         recordable_devices=recordable_devices,
     )
 
 
-def _merge_visible_and_recordable_devices(
-    raw_by_name: dict[str, dict],
+def _merge_visible_devices(
+    raw_index: _RawDeviceIndex,
     full_names: dict[str, str],
+    full_index: _FullNameIndex,
 ) -> tuple[InputDevice, ...]:
     devices: list[InputDevice] = []
     seen: set[str] = set()
 
-    for raw_name, full_name in full_names.items():
-        raw_device = raw_by_name.get(raw_name)
+    for trunc, full_name in full_names.items():
+        raw_device = raw_index.lookup(trunc, full_name)
         devices.append(
             InputDevice(
-                name=raw_name,
+                name=trunc,
                 display_name=full_name,
                 index=raw_device["index"] if raw_device is not None else None,
             )
         )
-        seen.add(raw_name)
+        seen.add(trunc)
+        if raw_device is not None:
+            seen.add(raw_device["name"])
 
-    for raw_name, raw_device in raw_by_name.items():
-        if raw_name in seen:
+    for raw_name in raw_index.iter_names():
+        if raw_name in seen or is_system_capture_alias(raw_name):
             continue
-        if _is_system_alias_device(raw_name):
+        raw_device = raw_index.lookup(raw_name)
+        if raw_device is None:
             continue
         devices.append(
             InputDevice(
                 name=raw_name,
-                display_name=raw_name,
+                display_name=full_index.display_name(raw_name),
                 index=raw_device["index"],
             )
         )
@@ -112,47 +159,26 @@ def _merge_visible_and_recordable_devices(
     return tuple(devices)
 
 
-def _is_system_alias_device(name: str) -> bool:
-    normalized = _normalize_device_name(name)
-    aliases = {
-        "microsoft声音映射器input",
-        "microsoftsoundmapperinput",
-        "主声音捕获驱动程序",
-        "primarysoundcapturedriver",
-    }
-    return normalized in aliases
-
-
 def _recordable_default_name(
     devices: tuple[InputDevice, ...],
     system_default_name: str,
 ) -> str:
-    recordable_devices = [device for device in devices if device.is_recordable]
-    if not recordable_devices:
+    recordable = [device for device in devices if device.is_recordable]
+    if not recordable:
         return ""
 
     if system_default_name:
-        truncated = system_default_name[:31]
-        for device in recordable_devices:
-            if device.name == truncated or _same_device_name(device.display_name, system_default_name):
+        for device in recordable:
+            if same_device_name(device.name, system_default_name) or same_device_name(
+                device.display_name, system_default_name
+            ):
                 return device.name
-        # During hot-plug, PyAudio can briefly keep reporting the old default.
-        # Do not bind that stale device to the current Windows default endpoint.
         return ""
 
     fallback_name = VoiceRecorder.get_default_device_name()
     if fallback_name == "Unknown":
-        fallback_name = ""
-    for device in recordable_devices:
-        if fallback_name and device.name == fallback_name:
+        return ""
+    for device in recordable:
+        if same_device_name(device.name, fallback_name):
             return device.name
-
     return ""
-
-
-def _same_device_name(left: str, right: str) -> bool:
-    return _normalize_device_name(left) == _normalize_device_name(right)
-
-
-def _normalize_device_name(name: str) -> str:
-    return "".join(ch for ch in name.casefold() if ch.isalnum())

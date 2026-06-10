@@ -299,7 +299,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
 
         VoiceTray._sync_system_default_device(tray)
 
-        self.assertEqual(calls, [{"device_index": 2, "preferred_name": "New Default"}])
+        self.assertEqual(calls, [{"device_index": None, "preferred_name": ""}])
         self.assertFalse(tray._pending_device_apply)
 
     def test_display_only_system_default_does_not_reopen_recorder(self):
@@ -516,7 +516,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         self.assertEqual(calls, ["timer", "rebuild", "icon"])
         self.assertEqual(
             tray._recorder_prepare_pending_job,
-            {"device_index": 1, "preferred_name": "Recovered Mic"},
+            {"device_index": None, "preferred_name": ""},
         )
 
     def test_refresh_schedules_retry_for_visible_but_unrecordable_device(self):
@@ -679,7 +679,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
 
         VoiceTray._request_record_start(tray, "hotkey")
 
-        self.assertEqual(calls, [{"device_index": 7, "preferred_name": "Bluetooth Mic"}])
+        self.assertEqual(calls, [{"device_index": None, "preferred_name": ""}])
         self.assertEqual(tray._pending_record_start_source, "hotkey")
 
     def test_prepare_done_reschedules_pending_prepare(self):
