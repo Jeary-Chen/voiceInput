@@ -1004,7 +1004,13 @@ class VoiceTray(QSystemTrayIcon):
         """停止全局 ComboHotkeyThread 并等待 pynput 钩子退出。"""
         self._clear_hotkey_hold_state()
         self._hotkey.stop_hotkey()
-        self._hotkey.wait(2000)
+        if self._hotkey.wait(2000):
+            logger.info("[Hotkey] Listener stopped")
+        else:
+            logger.warning(
+                "[Hotkey] Listener thread did not exit within 2s — "
+                "old keyboard hook may linger"
+            )
 
     def _spawn_hotkey_thread(self, combo: str | None = None) -> None:
         """新建并启动 ComboHotkeyThread（替换 self._hotkey）。调用前应已 stop_hotkey_listener。"""
@@ -1013,6 +1019,7 @@ class VoiceTray(QSystemTrayIcon):
         self._hotkey.triggered.connect(self._on_hotkey)
         self._hotkey.released.connect(self._on_hotkey_release)
         self._hotkey.start()
+        logger.info(f"[Hotkey] Listener started (combo={key})")
 
     def _should_suppress_hotkey_listener(self) -> bool:
         return self._hotkey_pause_depth > 0 or self._foreground_hotkey_pause_active
@@ -1020,11 +1027,16 @@ class VoiceTray(QSystemTrayIcon):
     def _update_hotkey_listener_suppression(self) -> None:
         suppress = self._should_suppress_hotkey_listener()
         if suppress and not self._hotkey_listener_suppressed:
+            logger.info(
+                f"[Hotkey] Suppressing listener (pause_depth={self._hotkey_pause_depth}, "
+                f"fg_gate={self._foreground_hotkey_pause_active})"
+            )
             self._stop_hotkey_listener()
             self._hotkey_listener_suppressed = True
         elif not suppress and self._hotkey_listener_suppressed:
             if QCoreApplication.closingDown():
                 return
+            logger.info("[Hotkey] Resuming listener")
             self._spawn_hotkey_thread()
             self._hotkey_listener_suppressed = False
 
@@ -1479,7 +1491,7 @@ class VoiceTray(QSystemTrayIcon):
     def _on_tray_click(self):
         """Tray icon click: simple toggle, no hold-to-cancel."""
         logger.debug(f"[Tray] Toggle requested via tray/mini (state={self._engine.state})")
-        if self._engine.state == "processing":
+        if self._engine.state in ("processing", "cancelling"):
             return
         if self._engine.state == "ready":
             if self._faults and self._faults.guard_recording_start():
@@ -1657,7 +1669,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_hotkey(self):
         logger.debug(f"[Tray] Toggle requested via hotkey down (state={self._engine.state})")
-        if self._engine.state == "processing":
+        if self._engine.state in ("processing", "cancelling"):
             return
         if self._engine.state == "ready":
             if self._faults and self._faults.guard_recording_start():
@@ -1710,11 +1722,12 @@ class VoiceTray(QSystemTrayIcon):
         self._sync_tray_icon_with_engine()
         if state == "recording":
             self._act_record.setText("停止录音")
+            self._act_record.setEnabled(True)
             self._act_rec_info.setVisible(True)
             self._act_upload.setVisible(False)
             self._update_rec_info()
             self._rec_info_timer.start()
-        elif state == "processing":
+        elif state in ("processing", "cancelling"):
             self._act_record.setText("处理中...")
             self._act_record.setEnabled(False)
             self._act_rec_info.setVisible(False)

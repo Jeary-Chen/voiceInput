@@ -307,7 +307,7 @@ class _PynputHotkeyGrabWorker(threading.Thread):
                 return True
             name = _VK_TO_NAME.get(data.vkCode)
             if not name:
-                logger.debug("[HotkeyGrab] pass-through unmapped vk=0x%02X", data.vkCode)
+                logger.debug(f"[HotkeyGrab] pass-through unmapped vk=0x{data.vkCode:02X}")
                 return True
             try:
                 if msg in (0x0100, 0x0104):
@@ -316,7 +316,10 @@ class _PynputHotkeyGrabWorker(threading.Thread):
                     self_ref._sigs.key_up.emit(name)
             except RuntimeError:
                 # 对话框已关、_grab_sig 已删时 emit 失败；勿 suppress，否则按键整桌失效
-                logger.debug("[HotkeyGrab] emit failed (dialog closed?), vk=0x%02X — passing through", data.vkCode)
+                logger.debug(
+                    f"[HotkeyGrab] emit failed (dialog closed?), "
+                    f"vk=0x{data.vkCode:02X} — passing through"
+                )
                 return False
             self_ref._kb_listener.suppress_event()
 
@@ -501,13 +504,20 @@ class _HotkeyDialog(QDialog):
             self._sync_grab_debounce.start()
         super().changeEvent(event)
 
-    def closeEvent(self, event):
-        # 须先于停定时器，防止 sync 与 _start 在关窗过程中再起线程
+    def done(self, result: int):
+        # accept()/reject()/Esc/点 X 最终都汇聚到 done()；在此单点卸钩。
+        # 仅靠 closeEvent 会漏掉 accept/reject 路径，导致全局抓键线程泄漏。
+        self._dispose_hotkey_grab()
+        super().done(result)
+
+    def _dispose_hotkey_grab(self):
+        """幂等卸钩：须先置 disposed 再停定时器，防止关窗过程中 sync 再起线程。"""
+        if self._hotkey_grab_disposed:
+            return
         self._hotkey_grab_disposed = True
         self._sync_grab_debounce.stop()
         self._fg_poll.stop()
         self._stop_hotkey_grab()
-        super().closeEvent(event)
 
     def sync_hotkey_grab_with_activation(self):
         """仅当本对话框为系统前台时挂全局钩子；否则撤钩并复位 chord。"""

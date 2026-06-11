@@ -288,7 +288,7 @@ class _FinalizeWorker(QThread):
 
 
 class VoiceEngine(QObject):
-    state_changed = pyqtSignal(str)       # "ready" | "recording" | "processing"
+    state_changed = pyqtSignal(str)       # "ready" | "recording" | "processing" | "cancelling"
     audio_data = pyqtSignal(bytes)         # raw PCM chunks for waveform
     live_text = pyqtSignal(str)            # status text for expanded panel
     transcription_done = pyqtSignal(str)   # final text
@@ -579,8 +579,9 @@ class VoiceEngine(QObject):
         if self._stop_worker is not None:
             logger.debug(f"{_TAG} Stop already in progress; ignored ({reason})")
             return
-        self._set_state("processing")
-        self.live_text.emit("正在停止录音…")
+        # 作废与正常停止区分上报：cancelling 不属于「处理中」，UI 不应显示处理指示。
+        self._set_state("cancelling" if cancel else "processing")
+        self.live_text.emit("正在取消…" if cancel else "正在停止录音…")
         worker = _RecorderStopWorker(self.recorder, reason, cancel=cancel)
         worker.stopped.connect(self._on_recording_stop_done)
         worker.failed.connect(self._on_recording_stop_failed)

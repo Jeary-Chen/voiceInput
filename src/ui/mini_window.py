@@ -920,7 +920,7 @@ class MiniRecordingWindow(QWidget):
         is_hover = mode == "hover"
         is_rec = mode == "recording"
 
-        self._waveform.setVisible(mode in ("recording", "processing", "done"))
+        self._waveform.setVisible(mode in ("recording", "processing", "cancelling", "done"))
         self._btn_action.setVisible(is_hover)
         self._btn_rec_stop.setVisible(is_rec)
         self._btn_polish.setVisible(is_hover)
@@ -1216,7 +1216,7 @@ class MiniRecordingWindow(QWidget):
         if self._mode == "idle" and self._engine.state == "ready":
             self._show_idle_surface()
             return
-        if self._mode in ("hover", "recording", "processing", "done"):
+        if self._mode in ("hover", "recording", "processing", "cancelling", "done"):
             w, h = self._target_size
             if self._mode == "recording":
                 w = REC_HOVER_W if self._hovered else REC_W
@@ -1568,16 +1568,24 @@ class MiniRecordingWindow(QWidget):
 
         self._begin_recording_enter()
 
-    def _apply_processing(self):
+    def _enter_busy(self, mode: str):
+        """录音结束后的过渡态（processing / cancelling）共用的进入逻辑。"""
         self._cancel_deferred_shrink()
-        self._stop_hover_polling("processing")
-        self._mode = "processing"
+        self._stop_hover_polling(mode)
+        self._mode = mode
         self._hovered = False
         self._hide_recording_status()
         self._waveform.freeze()
-        self._dot_status.setStyleSheet(f"color: {Theme.COLOR_PROCESSING.name()};")
-        self._set_widgets_for_mode("processing")
+        self._set_widgets_for_mode(mode)
         self._animate_to(REC_W, REC_H, MiniBarAnim.PROCESSING_SHRINK_MS)
+
+    def _apply_processing(self):
+        self._dot_status.setStyleSheet(f"color: {Theme.COLOR_PROCESSING.name()};")
+        self._enter_busy("processing")
+
+    def _apply_cancelling(self):
+        # 作废录音只是回收过渡，不展示处理指示点（_set_widgets_for_mode 白名单外）。
+        self._enter_busy("cancelling")
 
     def _apply_done(self):
         self._mode = "done"
@@ -1623,9 +1631,12 @@ class MiniRecordingWindow(QWidget):
         elif state == "processing":
             self._countdown_popup.hide()
             self._apply_processing()
+        elif state == "cancelling":
+            self._countdown_popup.hide()
+            self._apply_cancelling()
         elif state == "ready":
             self._countdown_popup.hide()
-            if self._mode in ("recording", "processing"):
+            if self._mode in ("recording", "processing", "cancelling"):
                 self._shrink_to_idle()
 
     def _on_audio(self, data: bytes):
