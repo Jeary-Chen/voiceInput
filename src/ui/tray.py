@@ -1663,13 +1663,14 @@ class VoiceTray(QSystemTrayIcon):
             self._restore_idle_icon()
 
     def _show_update_ready_dialog(self):
-        if not self._updater.latest:
+        version = self._updater.staged_version
+        if not version:
             return
         if self._update_ready_dlg is not None:
             self._update_ready_dlg.raise_()
             self._update_ready_dlg.activateWindow()
             return
-        dlg = _UpdateReadyDialog(self._updater.latest.version)
+        dlg = _UpdateReadyDialog(version)
         dlg.setWindowModality(Qt.WindowModality.NonModal)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.finished.connect(self._on_update_ready_finished)
@@ -1684,10 +1685,28 @@ class VoiceTray(QSystemTrayIcon):
         if (dlg is not None
                 and result == QDialog.DialogCode.Accepted
                 and dlg.restart_now):
-            self._updater.install(quit_fn=self._quit)
+            if not self._updater.install_ready(dlg.version, quit_fn=self._quit):
+                logger.info(
+                    f"[Updater] Ready dialog expired for v{dlg.version}; "
+                    "showing latest update state"
+                )
+                self.show_tray_message(
+                    "VoiceInput",
+                    "已下载的更新已过期，请下载最新版本",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+                self._set_update_status("idle")
+                if self._updater.latest:
+                    self._update_widget.set_found(self._updater.latest.version)
+                else:
+                    self._update_widget.set_idle()
 
     def _on_update_available(self, info: UpdateInfo):
         logger.debug(f"[DEBUG] _on_update_available | remote={info.version}")
+        if self._update_ready_dlg is not None:
+            self._update_ready_dlg.reject()
+        self._set_update_status("idle")
         self._update_widget.set_found(info.version)
 
     def _on_no_update(self):

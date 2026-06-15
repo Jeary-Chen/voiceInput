@@ -116,6 +116,7 @@ class _UpdateReadyDialog(QDialog):
 
     def __init__(self, version: str, parent=None):
         super().__init__(parent)
+        self._version = version
         self._restart_now = False
         self.setWindowTitle("更新已准备好")
         self.setWindowIcon(icons.app_icon())
@@ -151,6 +152,10 @@ class _UpdateReadyDialog(QDialog):
     @property
     def restart_now(self) -> bool:
         return self._restart_now
+
+    @property
+    def version(self) -> str:
+        return self._version
 
     def _accept_restart(self):
         self._restart_now = True

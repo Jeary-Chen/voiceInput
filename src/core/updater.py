@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import sys
 import subprocess
@@ -10,6 +11,7 @@ import time
 import urllib.request
 import urllib.error
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
@@ -407,6 +409,73 @@ _STAGING_DIR_NAME = "VoiceInput_update_staging"
 _STAGE_VERSION_FILE = ".update_version"
 
 
+@dataclass(frozen=True)
+class StagedUpdate:
+    version: str
+    staging_dir: Path
+    source_dir: Path
+
+
+class StagedUpdateStore:
+    """Owns update staging metadata, validation, and cleanup."""
+
+    def __init__(self, *, temp_dir: Path | None = None):
+        root = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
+        self.staging_dir = root / _STAGING_DIR_NAME
+
+    def clear(self) -> None:
+        if self.staging_dir.exists():
+            shutil.rmtree(self.staging_dir)
+
+    def write_version(self, version: str) -> None:
+        (self.staging_dir / _STAGE_VERSION_FILE).write_text(version, encoding="utf-8")
+
+    def load(self) -> StagedUpdate | None:
+        if not self.staging_dir.is_dir():
+            return None
+        version = self._read_staged_version()
+        if not version:
+            return None
+        source = self._source_dir()
+        if self._read_source_version(source) != version:
+            logger.warning(
+                f"[Updater] Staged update version mismatch; marker={version}, "
+                f"source={source}"
+            )
+            return None
+        return StagedUpdate(version=version, staging_dir=self.staging_dir, source_dir=source)
+
+    def validate(self, expected_version: str) -> StagedUpdate | None:
+        staged = self.load()
+        if staged is None:
+            return None
+        if staged.version != expected_version:
+            return None
+        return staged
+
+    def _read_staged_version(self) -> str:
+        ver_file = self.staging_dir / _STAGE_VERSION_FILE
+        if not ver_file.is_file():
+            return ""
+        try:
+            return ver_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _source_dir(self) -> Path:
+        inner = self.staging_dir / "VoiceInput"
+        return inner if inner.is_dir() else self.staging_dir
+
+    def _read_source_version(self, source: Path) -> str:
+        version_file = source / "src" / "_version.py"
+        try:
+            content = version_file.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        match = re.search(r'VERSION\s*=\s*"([^"]+)"', content)
+        return match.group(1) if match else ""
+
+
 class _StageWorker(QThread):
     """Extract a downloaded zip to a staging directory."""
     progress = pyqtSignal(int)   # percent 0-100
@@ -420,12 +489,13 @@ class _StageWorker(QThread):
 
     def run(self):
         started = time.perf_counter()
-        staging_dir = Path(tempfile.gettempdir()) / _STAGING_DIR_NAME
+        store = StagedUpdateStore()
+        staging_dir = store.staging_dir
         logger.debug(f"[DEBUG] _StageWorker.run | zip={self._zip_path}, staging={staging_dir}")
         try:
             if staging_dir.exists():
                 clean_started = time.perf_counter()
-                shutil.rmtree(staging_dir)
+                store.clear()
                 logger.debug(
                     f"[DEBUG] _StageWorker.run | clean_existing_staging elapsed_ms={_elapsed_ms(clean_started)}"
                 )
@@ -458,7 +528,7 @@ class _StageWorker(QThread):
                 f"[DEBUG] _StageWorker.run | extract_complete elapsed_ms={_elapsed_ms(extract_started)}"
             )
             version_started = time.perf_counter()
-            (staging_dir / _STAGE_VERSION_FILE).write_text(self._version, encoding="utf-8")
+            store.write_version(self._version)
             logger.debug(
                 f"[DEBUG] _StageWorker.run | write_version elapsed_ms={_elapsed_ms(version_started)}"
             )
@@ -489,7 +559,8 @@ class UpdateChecker:
         self._latest: UpdateInfo | None = None
         self._downloaded_path: str | None = None
         self._downloaded_expected_size: int = 0
-        self._staged_dir: str | None = None
+        self._staged: StagedUpdate | None = None
+        self._staged_store = StagedUpdateStore()
         # callbacks
         self._cb_available = None
         self._cb_no_update = None
@@ -515,7 +586,11 @@ class UpdateChecker:
 
     @property
     def is_ready_to_install(self) -> bool:
-        return self._staged_dir is not None and Path(self._staged_dir).exists()
+        return self._staged is not None and self._staged.staging_dir.exists()
+
+    @property
+    def staged_version(self) -> str:
+        return self._staged.version if self._staged is not None else ""
 
     def start(self, *, on_available=None, on_no_update=None, on_check_failed=None,
               on_dl_progress=None, on_dl_done=None, on_dl_failed=None,
@@ -563,27 +638,40 @@ class UpdateChecker:
         self._dl_worker.failed.connect(self._on_dl_failed)
         self._dl_worker.start()
 
-    def install(self, *, quit_fn=None):
+    def install_ready(self, version: str, *, quit_fn=None) -> bool:
+        if self._staged is None or self._staged.version != version:
+            logger.warning(
+                f"[Updater] Install request expired: requested={version}, "
+                f"staged={self.staged_version or '(none)'}"
+            )
+            return False
+        staged = self._staged_store.validate(version)
+        if staged is None:
+            logger.warning(f"[Updater] Install request rejected: staged v{version} is no longer valid")
+            self._staged = None
+            if self._staged_store.staging_dir.exists():
+                self._staged_store.clear()
+            return False
+        self._staged = staged
+        return self.install(quit_fn=quit_fn)
+
+    def install(self, *, quit_fn=None) -> bool:
         """Copy staged files over the app directory and restart."""
         started = time.perf_counter()
-        if not self._staged_dir:
-            logger.debug("[DEBUG] UpdateChecker.install | no staged_dir, returning")
-            return
-        if not self._latest:
-            logger.error("[Updater] Install aborted: no update metadata")
-            return
-        staged = Path(self._staged_dir)
+        if self._staged is None:
+            logger.debug("[DEBUG] UpdateChecker.install | no staged update, returning")
+            return False
+        staged_update = self._staged
+        staged = staged_update.staging_dir
         if not staged.exists():
             logger.error("[Updater] Install aborted: staging directory missing")
-            self._staged_dir = None
-            return
+            self._staged = None
+            return False
         app_dir = Path(__file__).resolve().parent.parent.parent
         exe_path = app_dir / "VoiceInput.exe"
-        # The zip contains a top-level "VoiceInput/" directory
-        inner = staged / "VoiceInput"
-        source = inner if inner.is_dir() else staged
+        source = staged_update.source_dir
         old_pid = os.getpid()
-        target_version = self._latest.version
+        target_version = staged_update.version
         logger.info(
             f"[Updater] Installing v{target_version} from staged: {source} → {app_dir} "
             f"(old_pid={old_pid})"
@@ -630,7 +718,7 @@ class UpdateChecker:
                 f"[DEBUG] UpdateChecker.install | launch_exception={type(e).__name__}: {e}, "
                 f"total_elapsed_ms={_elapsed_ms(started)}"
             )
-            return
+            return False
         if quit_fn is not None:
             logger.debug("[DEBUG] UpdateChecker.install | calling quit_fn()")
             quit_fn()
@@ -638,6 +726,7 @@ class UpdateChecker:
             logger.debug("[DEBUG] UpdateChecker.install | calling QApplication.quit()")
             from PyQt6.QtWidgets import QApplication
             QApplication.quit()
+        return True
 
     # ── internal callbacks ──
 
@@ -646,15 +735,17 @@ class UpdateChecker:
         if isinstance(result, UpdateInfo):
             self._latest = result
             self._downloaded_path = None
-            self._staged_dir = None
-            if self._try_reuse_staging(result.version):
+            if self._sync_staging_for_latest(result.version):
                 return
             if self._cb_available:
                 self._cb_available(result)
         elif result == _NO_UPDATE:
+            self._clear_staging_when_no_update()
             if self._cb_no_update:
                 self._cb_no_update()
         elif result == _CHECK_ERROR:
+            if self._restore_staging_after_check_failure():
+                return
             if self._cb_check_failed:
                 self._cb_check_failed()
 
@@ -681,24 +772,53 @@ class UpdateChecker:
 
     # ── staging ──
 
-    def _try_reuse_staging(self, version: str) -> bool:
-        """Return True if a previously staged directory for *version* exists."""
-        staging_dir = Path(tempfile.gettempdir()) / _STAGING_DIR_NAME
-        ver_file = staging_dir / _STAGE_VERSION_FILE
-        if not ver_file.is_file():
+    def _sync_staging_for_latest(self, version: str) -> bool:
+        """Keep only the staging payload that matches the latest release."""
+        staged = self._staged_store.load()
+        if staged is None:
+            self._staged = None
+            if self._staged_store.staging_dir.exists():
+                logger.info("[Updater] Discarding invalid staged update")
+                self._staged_store.clear()
             return False
-        try:
-            staged_ver = ver_file.read_text(encoding="utf-8").strip()
-        except OSError:
+
+        if staged.version != version:
+            logger.info(
+                f"[Updater] Discarding staged v{staged.version}; "
+                f"newer v{version} is available"
+            )
+            self._staged_store.clear()
+            self._staged = None
             return False
-        if staged_ver != version:
-            logger.debug(f"[DEBUG] _try_reuse_staging | version mismatch: staged={staged_ver}, wanted={version}")
-            return False
+
         logger.info(f"[Updater] Reusing existing staging directory for v{version}")
-        self._staged_dir = str(staging_dir)
+        self._staged = staged
         if self._cb_stage_done:
             self._cb_stage_done()
         return True
+
+    def _restore_staging_after_check_failure(self) -> bool:
+        staged = self._staged_store.load()
+        if staged is None:
+            self._staged = None
+            if self._staged_store.staging_dir.exists():
+                logger.info("[Updater] Discarding invalid staged update after check failure")
+                self._staged_store.clear()
+            return False
+        logger.info(
+            f"[Updater] Update check did not find a newer release; "
+            f"keeping staged v{staged.version}"
+        )
+        self._staged = staged
+        if self._cb_stage_done:
+            self._cb_stage_done()
+        return True
+
+    def _clear_staging_when_no_update(self) -> None:
+        self._staged = None
+        if self._staged_store.staging_dir.exists():
+            logger.info("[Updater] Discarding staged update because no newer release is available")
+            self._staged_store.clear()
 
     def _start_staging(self, zip_path: str):
         zip_size = Path(zip_path).stat().st_size if Path(zip_path).exists() else -1
@@ -717,7 +837,17 @@ class UpdateChecker:
 
     def _on_stage_done(self, staged_dir: str):
         logger.info(f"[Updater] Staging complete: {staged_dir}")
-        self._staged_dir = staged_dir
+        expected_version = self._latest.version if self._latest else ""
+        staged = self._staged_store.validate(expected_version)
+        if staged is None:
+            self._staged = None
+            self._staged_store.clear()
+            msg = "更新包版本校验失败，请重新下载"
+            logger.error(f"[Updater] {msg} (expected={expected_version})")
+            if self._cb_stage_failed:
+                self._cb_stage_failed(msg)
+            return
+        self._staged = staged
         # Clean up the downloaded zip
         if self._downloaded_path:
             try:
