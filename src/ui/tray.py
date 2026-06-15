@@ -47,6 +47,7 @@ _AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_VALUE_NAME = "VoiceInput"
 
 
+_TRAY_MENU_DEFAULT_DEVICE = "__tray_default_device__"
 _TRAY_MENU_DEFAULT_PROMPT = "__tray_default_prompt__"
 _DEVICE_CHANGE_DEBOUNCE_MS = 500
 _DEVICE_STORM_WINDOW_SEC = 4.0
@@ -54,6 +55,53 @@ _DEVICE_STORM_EVENT_LIMIT = 4
 _DEVICE_STORM_QUIET_SEC = 2.0
 _RECORDABLE_RETRY_DELAYS_MS = (1000, 2000, 4000)
 _NO_DEVICE_CHANGE = object()
+
+
+def _set_action_checked(action: QAction, checked: bool) -> None:
+    action.blockSignals(True)
+    action.setChecked(checked)
+    action.blockSignals(False)
+
+
+def _sync_checkable_actions(
+    actions,
+    selected_key,
+    *,
+    fallback_key=None,
+) -> bool:
+    """Project config-backed single selection onto checkable menu actions."""
+    matched = False
+    fallback_action = None
+    for action in actions:
+        if action.isSeparator() or not action.isCheckable():
+            continue
+        key = action.data()
+        if fallback_key is not None and key == fallback_key:
+            fallback_action = action
+        checked = key == selected_key
+        if checked:
+            matched = True
+        _set_action_checked(action, checked)
+
+    if not matched and fallback_action is not None:
+        _set_action_checked(fallback_action, True)
+        matched = True
+    return matched
+
+
+def _device_menu_selected_key(config, snapshot: InputDeviceSnapshot):
+    mic_name = getattr(config, "mic_name", "") or ""
+    if mic_name and snapshot.find_by_name(mic_name) is not None:
+        return mic_name
+    return _TRAY_MENU_DEFAULT_DEVICE
+
+
+def _sync_device_menu_actions(actions, config, snapshot: InputDeviceSnapshot) -> bool:
+    return _sync_checkable_actions(
+        actions,
+        _device_menu_selected_key(config, snapshot),
+        fallback_key=_TRAY_MENU_DEFAULT_DEVICE,
+    )
 
 
 class _ForegroundHotkeyGateFilter(QObject):
@@ -342,6 +390,7 @@ class VoiceTray(QSystemTrayIcon):
         for mode_id, mode_name in [("transcribe", "纯转录"), ("polish", "智能润色")]:
             act = QAction(mode_name, self._mode_menu)
             act.setCheckable(True)
+            act.setData(mode_id)
             act.setChecked(self._config.mode == mode_id)
             act.triggered.connect(lambda checked, m=mode_id: self._set_mode(m))
             self._mode_menu.addAction(act)
@@ -373,6 +422,7 @@ class VoiceTray(QSystemTrayIcon):
         for dur_sec, display in self._duration_presets:
             act = QAction(display, self._duration_menu)
             act.setCheckable(True)
+            act.setData(dur_sec)
             act.setChecked(self._config.smart_chunk_max_duration_sec == dur_sec)
             act.triggered.connect(
                 lambda checked, d=dur_sec: self._set_max_duration(d))
@@ -838,7 +888,7 @@ class VoiceTray(QSystemTrayIcon):
         label = f"系统默认 ({default_name})" if default_name else "系统默认"
         act_default = QAction(label, self._device_menu)
         act_default.setCheckable(True)
-        act_default.setChecked(not self._config.mic_name)
+        act_default.setData(_TRAY_MENU_DEFAULT_DEVICE)
         act_default.triggered.connect(lambda checked: self._set_default_device())
         self._device_menu.addAction(act_default)
         self._device_menu.addSeparator()
@@ -858,16 +908,23 @@ class VoiceTray(QSystemTrayIcon):
                     label = f"{dev.display_name}（不可录）"
                 act = QAction(label, self._device_menu)
                 act.setCheckable(True)
-                act.setChecked(self._config.mic_name == dev.name)
+                act.setData(dev.name)
                 act.setEnabled(dev.is_recordable)
                 act.triggered.connect(
-                    lambda checked, idx=dev.index, name=dev.name: self._set_device(name, idx))
+                    lambda checked, idx=dev.index, name=dev.name: self._set_device(name, idx)
+                )
                 self._device_menu.addAction(act)
             if not self._input_snapshot.has_recordable_device:
                 self._device_menu.addSeparator()
                 act = QAction("(未发现兼容设备)", self._device_menu)
                 act.setEnabled(False)
                 self._device_menu.addAction(act)
+
+        _sync_device_menu_actions(
+            self._device_menu.actions(),
+            self._config,
+            self._input_snapshot,
+        )
 
         if menu_visible:
             # Keep the popup and its parent-hover relationship intact; only the action
@@ -881,8 +938,16 @@ class VoiceTray(QSystemTrayIcon):
             self._device_menu.updateGeometry()
             self._device_menu.update()
 
+    def _sync_device_menu_checks(self):
+        _sync_device_menu_actions(
+            self._device_menu.actions(),
+            self._config,
+            self._input_snapshot,
+        )
+
     def _set_mode(self, mode_id: str):
         if self._config.mode == mode_id:
+            self._sync_mode_menu()
             return
         self._config.mode = mode_id
         self._config.save()
@@ -899,9 +964,7 @@ class VoiceTray(QSystemTrayIcon):
         self._act_show_result_text.blockSignals(False)
 
     def _sync_mode_menu(self):
-        for act in self._mode_menu.actions():
-            mode_name_map = {"纯转录": "transcribe", "智能润色": "polish"}
-            act.setChecked(mode_name_map.get(act.text(), "") == self._config.mode)
+        _sync_checkable_actions(self._mode_menu.actions(), self._config.mode)
 
     def _rebuild_prompt_menu(self):
         self._prompt_menu.clear()
@@ -930,17 +993,16 @@ class VoiceTray(QSystemTrayIcon):
     def _sync_prompt_menu_checks(self):
         """仅更新勾选，不在弹出时 clear 子菜单，避免 Windows 上首次展开几何错位。"""
         cur = self._config.active_prompt_id or ""
-        for act in self._prompt_menu.actions():
-            if act.isSeparator() or not act.isCheckable():
-                continue
-            d = act.data()
-            if d == _TRAY_MENU_DEFAULT_PROMPT:
-                act.setChecked(not cur)
-            elif isinstance(d, str) and d:
-                act.setChecked(cur == d)
+        selected = cur or _TRAY_MENU_DEFAULT_PROMPT
+        _sync_checkable_actions(
+            self._prompt_menu.actions(),
+            selected,
+            fallback_key=_TRAY_MENU_DEFAULT_PROMPT,
+        )
 
     def _set_active_prompt(self, prompt_id: str):
         if (self._config.active_prompt_id or "") == prompt_id:
+            self._sync_prompt_menu_checks()
             return
         self._config.active_prompt_id = prompt_id
         self._config.save()
@@ -1126,22 +1188,25 @@ class VoiceTray(QSystemTrayIcon):
         for model_id, display_name in self._polish_model_menu_entries():
             act = QAction(display_name, self._polish_model_menu)
             act.setCheckable(True)
+            act.setData(model_id)
             act.setChecked(model_id == current)
             act.triggered.connect(lambda checked, m=model_id: self._set_polish_model(m))
             self._polish_model_menu.addAction(act)
 
+    def _sync_polish_model_menu_checks(self):
+        _sync_checkable_actions(
+            self._polish_model_menu.actions(),
+            self._config.polish_model,
+        )
+
     def _set_polish_model(self, model_id: str):
         if self._config.polish_model == model_id:
+            self._sync_polish_model_menu_checks()
             return
         self._config.polish_model = model_id
         self._config.save()
         self._engine.polisher.set_model(model_id)
-        for act in self._polish_model_menu.actions():
-            mid = next(
-                (m for m, d in self._polish_model_menu_entries() if d == act.text()),
-                "",
-            )
-            act.setChecked(mid == model_id)
+        self._sync_polish_model_menu_checks()
         logger.info(f"[Tray] Polish model → {model_id}")
 
     def _configure_hotkey(self):
@@ -1220,12 +1285,18 @@ class VoiceTray(QSystemTrayIcon):
 
     def _set_max_duration(self, seconds: int):
         if self._config.smart_chunk_max_duration_sec == seconds:
+            self._sync_duration_menu()
             return
         self._config.smart_chunk_max_duration_sec = seconds
         self._config.save()
-        for i, (dur_sec, _) in enumerate(self._duration_presets):
-            self._duration_menu.actions()[i].setChecked(dur_sec == seconds)
+        self._sync_duration_menu()
         logger.info(f"[Tray] Max recording duration → {seconds}s")
+
+    def _sync_duration_menu(self):
+        _sync_checkable_actions(
+            self._duration_menu.actions(),
+            self._config.smart_chunk_max_duration_sec,
+        )
 
     def _toggle_hide_idle_mini(self, checked: bool):
         self._config.hide_mini_window_when_idle = checked
@@ -1323,6 +1394,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _set_default_device(self):
         if not self._config.mic_name:
+            self._sync_device_menu_checks()
             return
         self._config.mic_index = None
         self._config.mic_name = ""
@@ -1344,6 +1416,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _set_device(self, name: str, idx: int | None = None):
         if self._config.mic_name == name:
+            self._sync_device_menu_checks()
             return
         self._config.mic_name = name
         self._config.mic_index = idx
@@ -1418,13 +1491,6 @@ class VoiceTray(QSystemTrayIcon):
     def _refresh_ui_from_config(self, changed: set[str]) -> None:
         """Sync tray menu / audio state after config reload."""
 
-        def _set_checked(action, value: bool) -> None:
-            if action is None:
-                return
-            action.blockSignals(True)
-            action.setChecked(value)
-            action.blockSignals(False)
-
         if "mode" in changed:
             self._sync_mode_menu()
 
@@ -1438,12 +1504,7 @@ class VoiceTray(QSystemTrayIcon):
                 dlg.sync_from_config()
 
         if "smart_chunk_max_duration_sec" in changed:
-            cur = self._config.smart_chunk_max_duration_sec
-            for act in self._duration_menu.actions():
-                for dur_sec, display in self._duration_presets:
-                    if act.text() == display:
-                        _set_checked(act, dur_sec == cur)
-                        break
+            self._sync_duration_menu()
 
         for field, action in (
             ("silence_trim", self._act_silence_trim),
@@ -1455,7 +1516,8 @@ class VoiceTray(QSystemTrayIcon):
             ("save_audio", self._act_save_audio),
         ):
             if field in changed:
-                _set_checked(action, getattr(self._config, field))
+                if action is not None:
+                    _set_action_checked(action, getattr(self._config, field))
 
         if "autostart_enabled" in changed:
             self._sync_autostart_state()
@@ -1473,6 +1535,8 @@ class VoiceTray(QSystemTrayIcon):
 
         if changed & {"mic_name", "mic_index"}:
             self._dev_menu_dirty = True
+            if self._dev_refresh_ready:
+                self._sync_device_menu_checks()
 
         if "tray_click_to_record" in changed:
             try:

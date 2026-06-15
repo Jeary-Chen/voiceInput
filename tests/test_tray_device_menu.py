@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QApplication, QMenu
 
 
@@ -704,10 +705,12 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
     def test_set_default_device_skips_when_already_default(self):
         from ui.tray import VoiceTray
 
+        calls = []
         config = SimpleNamespace(mic_name="", mic_index=None, save=lambda: (_ for _ in ()).throw(RuntimeError("save")))
         tray = SimpleNamespace(
             _config=config,
             _engine=SimpleNamespace(state="recording"),
+            _sync_device_menu_checks=lambda: calls.append("sync"),
             _pending_device_apply=False,
             _rebuild_device_menu=lambda: (_ for _ in ()).throw(RuntimeError("rebuild")),
             _clear_device_fault=lambda: (_ for _ in ()).throw(RuntimeError("clear")),
@@ -717,9 +720,12 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
 
         VoiceTray._set_default_device(tray)
 
+        self.assertEqual(calls, ["sync"])
+
     def test_set_device_skips_when_already_selected(self):
         from ui.tray import VoiceTray
 
+        calls = []
         config = SimpleNamespace(
             mic_name="Headphones",
             mic_index=1,
@@ -728,6 +734,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         tray = SimpleNamespace(
             _config=config,
             _engine=SimpleNamespace(state="recording"),
+            _sync_device_menu_checks=lambda: calls.append("sync"),
             _pending_device_apply=False,
             _rebuild_device_menu=lambda: (_ for _ in ()).throw(RuntimeError("rebuild")),
             _clear_device_fault=lambda: (_ for _ in ()).throw(RuntimeError("clear")),
@@ -737,17 +744,119 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
 
         VoiceTray._set_device(tray, "Headphones", 1)
 
+        self.assertEqual(calls, ["sync"])
+
+    def test_reselecting_default_device_action_keeps_it_checked(self):
+        from ui.tray import VoiceTray
+
+        menu = QMenu()
+        tray = SimpleNamespace(
+            _config=SimpleNamespace(
+                mic_name="",
+                mic_index=None,
+                save=lambda: (_ for _ in ()).throw(RuntimeError("save")),
+            ),
+            _input_snapshot=_snapshot(
+                "Built-in Mic",
+                [{"name": "Built-in Mic", "display_name": "Built-in Mic", "index": 1}],
+            ),
+            _dev_menu_dirty=True,
+            _device_menu=menu,
+            _engine=SimpleNamespace(state="ready"),
+            contextMenu=lambda: None,
+        )
+        _bind_recordable_retry_state(tray)
+        tray._sync_device_menu_checks = lambda: VoiceTray._sync_device_menu_checks(tray)
+        tray._set_default_device = lambda: VoiceTray._set_default_device(tray)
+        tray._set_device = lambda name, idx=None: VoiceTray._set_device(tray, name, idx)
+
+        VoiceTray._rebuild_device_menu(tray)
+        default_action = next(action for action in menu.actions() if action.isCheckable())
+
+        self.assertTrue(default_action.isChecked())
+        default_action.trigger()
+
+        self.assertTrue(default_action.isChecked())
+        self.assertEqual(tray._config.mic_name, "")
+
+    def test_reselecting_device_action_keeps_it_checked(self):
+        from ui.tray import VoiceTray
+
+        menu = QMenu()
+        tray = SimpleNamespace(
+            _config=SimpleNamespace(
+                mic_name="Headphones",
+                mic_index=2,
+                save=lambda: (_ for _ in ()).throw(RuntimeError("save")),
+            ),
+            _input_snapshot=_snapshot(
+                "Built-in Mic",
+                [
+                    {"name": "Built-in Mic", "display_name": "Built-in Mic", "index": 1},
+                    {"name": "Headphones", "display_name": "Headphones", "index": 2},
+                ],
+            ),
+            _dev_menu_dirty=True,
+            _device_menu=menu,
+            _engine=SimpleNamespace(state="ready"),
+            contextMenu=lambda: None,
+        )
+        _bind_recordable_retry_state(tray)
+        tray._sync_device_menu_checks = lambda: VoiceTray._sync_device_menu_checks(tray)
+        tray._set_default_device = lambda: VoiceTray._set_default_device(tray)
+        tray._set_device = lambda name, idx=None: VoiceTray._set_device(tray, name, idx)
+
+        VoiceTray._rebuild_device_menu(tray)
+        device_action = next(action for action in menu.actions() if action.text() == "Headphones")
+
+        self.assertTrue(device_action.isChecked())
+        device_action.trigger()
+
+        self.assertTrue(device_action.isChecked())
+        self.assertEqual(tray._config.mic_name, "Headphones")
+
     def test_set_mode_skips_when_unchanged(self):
         from ui.tray import VoiceTray
 
+        calls = []
         config = SimpleNamespace(mode="polish", save=lambda: (_ for _ in ()).throw(RuntimeError("save")))
         tray = SimpleNamespace(
             _config=config,
-            _sync_mode_menu=lambda: (_ for _ in ()).throw(RuntimeError("sync")),
+            _sync_mode_menu=lambda: calls.append("sync"),
             _mini=SimpleNamespace(sync_mode=lambda: (_ for _ in ()).throw(RuntimeError("mini"))),
         )
 
         VoiceTray._set_mode(tray, "polish")
+
+        self.assertEqual(calls, ["sync"])
+
+    def test_reselecting_mode_restores_checked_action(self):
+        from ui.tray import VoiceTray
+
+        menu = QMenu()
+        transcribe = QAction("纯转录", menu)
+        transcribe.setCheckable(True)
+        transcribe.setData("transcribe")
+        menu.addAction(transcribe)
+        polish = QAction("智能润色", menu)
+        polish.setCheckable(True)
+        polish.setData("polish")
+        polish.setChecked(False)
+        menu.addAction(polish)
+        tray = SimpleNamespace(
+            _config=SimpleNamespace(
+                mode="polish",
+                save=lambda: (_ for _ in ()).throw(RuntimeError("save")),
+            ),
+            _mode_menu=menu,
+            _mini=SimpleNamespace(sync_mode=lambda: (_ for _ in ()).throw(RuntimeError("mini"))),
+        )
+        tray._sync_mode_menu = lambda: VoiceTray._sync_mode_menu(tray)
+
+        VoiceTray._set_mode(tray, "polish")
+
+        self.assertFalse(transcribe.isChecked())
+        self.assertTrue(polish.isChecked())
 
     def test_prepare_done_starts_pending_recording_when_idle(self):
         from ui.tray import VoiceTray
