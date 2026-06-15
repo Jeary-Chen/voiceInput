@@ -1,3 +1,3 @@
 """Build-time application version."""
 
-VERSION = "1.4.15"
+VERSION = "1.4.16"
