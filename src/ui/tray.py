@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from config import Config, enabled_polish_model_menu_items
-from core.log import logger
+from core.log import logger, log_event
 from core.engine import VoiceEngine
 from core.config_sync import ConfigSync
 from core.faults import FaultKind
@@ -125,20 +125,22 @@ class _ForegroundHotkeyGateFilter(QObject):
 
 class _DeviceRefreshWorker(QThread):
     """Enumerate audio devices off the main thread."""
-    result_ready = pyqtSignal(object)  # InputDeviceSnapshot
+    result_ready = pyqtSignal(int, object)  # generation, InputDeviceSnapshot
 
-    def __init__(self):
+    def __init__(self, generation: int, *, open_probe: bool = True):
         super().__init__()
+        self._generation = generation
+        self._open_probe = open_probe
 
     def run(self):
         from core.input_devices import get_input_device_snapshot
 
         try:
-            snapshot = get_input_device_snapshot()
+            snapshot = get_input_device_snapshot(open_probe=self._open_probe)
         except Exception:
             logger.opt(exception=True).warning("[Tray] Device refresh failed")
             snapshot = InputDeviceSnapshot.empty()
-        self.result_ready.emit(snapshot)
+        self.result_ready.emit(self._generation, snapshot)
 
 
 class _RecorderPrepareWorker(QThread):
@@ -264,6 +266,8 @@ class VoiceTray(QSystemTrayIcon):
         self._pending_device_apply = False
         self._device_change_times: list[float] = []
         self._device_storm_until = 0.0
+        self._device_change_generation = 0
+        self._active_refresh_generation = 0
         self._recorder_prepare_worker: _RecorderPrepareWorker | None = None
         self._recorder_prepare_pending = False
         self._recorder_prepare_pending_job: dict | None = None
@@ -533,8 +537,7 @@ class VoiceTray(QSystemTrayIcon):
         self._recordable_retry.reset()
         self._input_rescan_needs_portaudio_reset = True
         self._output_reopen_after_device_rescan = True
-        self._reset_input_portaudio_before_rescan()
-        self._audio.reset_for_device_rescan()
+        self._device_change_generation += 1
         now = time.monotonic()
         self._device_change_times = [
             t for t in self._device_change_times
@@ -554,6 +557,18 @@ class VoiceTray(QSystemTrayIcon):
                 f"({len(self._device_change_times)} events/"
                 f"{_DEVICE_STORM_WINDOW_SEC:.0f}s), delaying audio apply"
             )
+        log_event(
+            "INFO",
+            "audio.device.change.queued",
+            "Audio device change queued",
+            generation=self._device_change_generation,
+            state=self._engine.state,
+            storm_events=len(self._device_change_times),
+            debounce_ms=delay_ms,
+            storm_until=round(self._device_storm_until, 3),
+            input_reset_pending=self._input_rescan_needs_portaudio_reset,
+            output_reopen_pending=self._output_reopen_after_device_rescan,
+        )
         self._device_change_timer.start(delay_ms)
 
     def _device_change_in_storm(self) -> bool:
@@ -575,7 +590,14 @@ class VoiceTray(QSystemTrayIcon):
         reset = getattr(self._engine.recorder, "reset_portaudio", None)
         if reset is None:
             return
-        reset("audio device changed")
+        changed = reset("audio device changed")
+        log_event(
+            "INFO",
+            "audio.input.portaudio.reset",
+            "Input PortAudio reset before device rescan",
+            changed=changed,
+            state=self._engine.state,
+        )
 
     def _retry_input_recordable_probe(self):
         self._input_rescan_needs_portaudio_reset = True
@@ -585,14 +607,40 @@ class VoiceTray(QSystemTrayIcon):
         if self._dev_refresh_running:
             self._dev_refresh_repeat = True
             return
-        self._reset_input_portaudio_before_rescan()
+        open_probe = self._engine.state != "recording"
+        if open_probe:
+            self._reset_input_portaudio_before_rescan()
+            self._reset_output_portaudio_before_rescan()
         self._dev_refresh_running = True
-        worker = _DeviceRefreshWorker()
+        generation = self._device_change_generation
+        self._active_refresh_generation = generation
+        log_event(
+            "DEBUG",
+            "audio.device.refresh.start",
+            "Audio device refresh started",
+            generation=generation,
+            state=self._engine.state,
+            open_probe=open_probe,
+        )
+        worker = _DeviceRefreshWorker(generation, open_probe=open_probe)
         worker.result_ready.connect(self._on_refresh_result)
         worker.finished.connect(self._on_device_refresh_worker_finished)
         self._dev_refresh_workers.append(worker)
         self._dev_refresh_worker = worker
         worker.start()
+
+    def _reset_output_portaudio_before_rescan(self):
+        if not self._output_reopen_after_device_rescan:
+            return
+        if self._engine.state == "recording":
+            return
+        self._audio.reset_for_device_rescan()
+        log_event(
+            "INFO",
+            "audio.output.portaudio.reset",
+            "Output PortAudio reset before device rescan",
+            state=self._engine.state,
+        )
 
     def _on_device_refresh_worker_finished(self):
         worker = self.sender() if hasattr(self, "sender") else None
@@ -601,29 +649,56 @@ class VoiceTray(QSystemTrayIcon):
         self._forget_background_worker(worker)
         self._delete_worker_later(worker)
 
-    def _on_refresh_result(self, snapshot: InputDeviceSnapshot):
+    def _on_refresh_result(self, generation_or_snapshot, snapshot: InputDeviceSnapshot | None = None):
+        generation = None
+        if snapshot is None:
+            snapshot = generation_or_snapshot
+        else:
+            generation = int(generation_or_snapshot)
+
+        if generation is not None and generation < self._device_change_generation:
+            log_event(
+                "DEBUG",
+                "audio.device.refresh.stale",
+                "Ignoring stale device refresh",
+                generation=generation,
+                current_generation=self._device_change_generation,
+            )
+            self._finish_device_refresh()
+            return
+
         self._input_snapshot = snapshot
         self._dev_refresh_ready = True
         self._last_menu_refresh_time = time.monotonic()
         self._dev_menu_dirty = True
-        logger.info(f"[Tray] Device refresh done: "
-                    f"default='{snapshot.default_name}', {len(snapshot.devices)} device(s)")
+        log_event(
+            "INFO",
+            "audio.device.refresh.end",
+            "Audio device refresh finished",
+            generation=generation if generation is not None else self._device_change_generation,
+            default=snapshot.default_name,
+            devices=len(snapshot.devices),
+            recordable_devices=len(snapshot.recordable_devices),
+            has_recordable=snapshot.has_recordable_device,
+        )
         defer_audio_apply = self._device_change_in_storm()
         if defer_audio_apply:
-            logger.info("[Tray] Device list refreshed during storm; audio apply deferred")
+            log_event(
+                "INFO",
+                "audio.device.apply.deferred",
+                "Device list refreshed during storm; audio apply deferred",
+                generation=generation if generation is not None else self._device_change_generation,
+            )
             self._queue_recorder_recovery_after_storm()
         else:
             self._sync_system_default_device()
             self._auto_fallback_if_device_gone()
             self._recover_recorder_if_devices_returned()
-            self._reopen_output_after_device_rescan()
         self._recordable_retry.schedule_for(snapshot)
         self._rebuild_device_menu()
         self._sync_tray_icon_with_engine()
-        self._dev_refresh_running = False
-        if self._dev_refresh_repeat:
-            self._dev_refresh_repeat = False
-            self._start_async_refresh()
+        repeat_started = self._finish_device_refresh()
+        if repeat_started:
             return
         if (
             not defer_audio_apply
@@ -633,13 +708,35 @@ class VoiceTray(QSystemTrayIcon):
             and self._input_snapshot.has_recordable_device
         ):
             self._start_recorder_prepare_worker(**self._recorder_prepare_target())
+        if not defer_audio_apply:
+            self._reopen_output_after_device_rescan()
 
-    def _reopen_output_after_device_rescan(self):
+    def _finish_device_refresh(self) -> bool:
+        self._dev_refresh_running = False
+        if self._dev_refresh_repeat:
+            self._dev_refresh_repeat = False
+            self._start_async_refresh()
+            return True
+        return False
+
+    def _reopen_output_after_device_rescan(self, *, after_prepare: bool = False):
         if not self._output_reopen_after_device_rescan:
             return
         if self._device_change_in_storm():
             return
+        if self._engine.state == "recording":
+            return
+        if self._recorder_prepare_worker is not None and not after_prepare:
+            return
+        if self._recorder_prepare_pending:
+            return
         self._output_reopen_after_device_rescan = False
+        log_event(
+            "INFO",
+            "audio.output.reopen.scheduled",
+            "Output audio reopen scheduled after device rescan",
+            after_prepare=after_prepare,
+        )
         self._audio.refresh_output_device_async()
 
     def _on_device_menu_show(self):
@@ -768,6 +865,12 @@ class VoiceTray(QSystemTrayIcon):
         worker.start()
 
     def _on_recorder_prepare_done(self, generation: int, action: str, ok: bool):
+        if generation != self._recorder_prepare_generation:
+            logger.debug(
+                f"[Tray] Ignoring stale recorder prepare "
+                f"(gen={generation}, current={self._recorder_prepare_generation})"
+            )
+            return
         logger.info(
             f"[Tray] Deferred recorder prepare finished "
             f"(gen={generation}, action={action}, ok={ok})"
@@ -788,6 +891,8 @@ class VoiceTray(QSystemTrayIcon):
                 self._engine.mic_unavailable.emit("未找到输入设备")
                 return
             self._begin_recording(source)
+            return
+        self._reopen_output_after_device_rescan(after_prepare=True)
 
     def _on_recorder_prepare_worker_finished(self):
         worker = self.sender() if hasattr(self, "sender") else None
@@ -1796,8 +1901,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_state(self, state: str):
         if state == "ready":
-            if self._input_rescan_needs_portaudio_reset:
-                self._reset_input_portaudio_before_rescan()
+            if self._input_rescan_needs_portaudio_reset or self._output_reopen_after_device_rescan:
                 self._start_async_refresh()
             self._maybe_apply_deferred_input_device()
         if state == "ready" and self._config_sync is not None:

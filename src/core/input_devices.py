@@ -92,10 +92,15 @@ class _FullNameIndex:
         return self._by_identity.get(key, raw_name)
 
 
-def get_input_device_snapshot() -> InputDeviceSnapshot:
-    """Build menu/runtime snapshot: PyAudio decides recordability, COM decorates names."""
+def get_input_device_snapshot(*, open_probe: bool = True) -> InputDeviceSnapshot:
+    """Build menu/runtime snapshot.
+
+    PyAudio decides recordability when ``open_probe`` is true.  During active
+    recording, callers can pass ``open_probe=False`` to avoid creating another
+    PortAudio client while the input callback stream is live.
+    """
     system_default_name = get_default_capture_device_name() or ""
-    raw_devices = VoiceRecorder.list_devices()
+    raw_devices = VoiceRecorder.list_devices() if open_probe else []
     full_names = get_full_device_names()
 
     raw_index = _RawDeviceIndex(raw_devices)

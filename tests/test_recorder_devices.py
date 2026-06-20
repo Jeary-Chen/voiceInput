@@ -1,5 +1,6 @@
 import sys
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -55,6 +56,14 @@ class _FakeStream:
 
 
 class VoiceRecorderDeviceListTests(unittest.TestCase):
+    def _record_guard_reasons(self, reasons):
+        @contextmanager
+        def guard(reason=""):
+            reasons.append(reason)
+            yield
+
+        return guard
+
     def test_list_devices_uses_non_wasapi_fallback_inputs(self):
         from core.recorder import VoiceRecorder
 
@@ -146,6 +155,42 @@ class VoiceRecorderDeviceListTests(unittest.TestCase):
         self.assertIsNone(recorder._pa)
         self.assertIsNone(recorder._stream)
         self.assertFalse(recorder._prepared)
+
+    def test_list_devices_serializes_enumeration_and_probe(self):
+        from core.recorder import VoiceRecorder
+
+        reasons = []
+        fake_pa = _FakePyAudio(
+            host_apis=[{"name": "Windows WASAPI"}],
+            devices=[
+                {"name": "Working Mic", "hostApi": 0, "maxInputChannels": 1, "defaultSampleRate": 16000},
+            ],
+        )
+
+        with patch("core.recorder.pyaudio.PyAudio", return_value=fake_pa):
+            with patch("core.recorder.portaudio_session", self._record_guard_reasons(reasons)):
+                VoiceRecorder.list_devices()
+
+        self.assertIn("recorder.list_devices", reasons)
+        self.assertIn("recorder.probe_input_open", reasons)
+        self.assertTrue(fake_pa.terminated)
+
+    def test_reset_portaudio_serializes_stop_close_and_terminate(self):
+        from core.recorder import VoiceRecorder
+
+        reasons = []
+        fake_pa = _FakePyAudio(host_apis=[], devices=[])
+        fake_stream = _FakeStream()
+        recorder = VoiceRecorder()
+        recorder._pa = fake_pa
+        recorder._stream = fake_stream
+
+        with patch("core.recorder.portaudio_session", self._record_guard_reasons(reasons)):
+            recorder.reset_portaudio("device changed")
+
+        self.assertIn("recorder.stop_stream", reasons)
+        self.assertIn("recorder.close_stream", reasons)
+        self.assertIn("recorder.terminate", reasons)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,8 @@ import pyaudio
 
 from core.device_names import device_labels_overlap, fix_device_name
 from core.device_watcher import get_default_render_device_name
-from core.log import logger
+from core.log import logger, log_event
+from core.portaudio_guard import portaudio_session
 
 _DEFAULT_SAMPLE_RATE = 44100
 _COMMON_SAMPLE_RATES = (44100, 48000, 22050, 16000)
@@ -205,57 +206,77 @@ class AudioCues:
         stream = None
         try:
             t0 = time.perf_counter()
-            pa = pyaudio.PyAudio()
-            device_index, device_name = _resolve_default_output_device(pa)
-            base_open_kwargs = dict(
-                format=pyaudio.paInt16,
-                channels=1,
-                output=True,
-                frames_per_buffer=_FRAMES_PER_BUFFER,
-                stream_callback=self._audio_callback,
-            )
-            if device_index is not None:
-                base_open_kwargs["output_device_index"] = device_index
-            sample_rate = _DEFAULT_SAMPLE_RATE
-            last_error: Exception | None = None
-            for candidate_rate in _candidate_output_sample_rates(pa, device_index):
-                try:
-                    stream = pa.open(**base_open_kwargs, rate=candidate_rate)
-                    sample_rate = candidate_rate
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.debug(f"{_TAG} Output open failed at {candidate_rate} Hz: {e}")
-            if stream is None:
-                raise last_error or RuntimeError("No compatible output sample rate")
+            with portaudio_session("sounds.init_stream"):
+                pa = pyaudio.PyAudio()
+                device_index, device_name = _resolve_default_output_device(pa)
+                base_open_kwargs = dict(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    output=True,
+                    frames_per_buffer=_FRAMES_PER_BUFFER,
+                    stream_callback=self._audio_callback,
+                )
+                if device_index is not None:
+                    base_open_kwargs["output_device_index"] = device_index
+                sample_rate = _DEFAULT_SAMPLE_RATE
+                last_error: Exception | None = None
+                for candidate_rate in _candidate_output_sample_rates(pa, device_index):
+                    try:
+                        stream = pa.open(**base_open_kwargs, rate=candidate_rate)
+                        sample_rate = candidate_rate
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logger.debug(f"{_TAG} Output open failed at {candidate_rate} Hz: {e}")
+                if stream is None:
+                    raise last_error or RuntimeError("No compatible output sample rate")
             ms = (time.perf_counter() - t0) * 1000
             route = device_name or "system default"
-            logger.info(f"{_TAG} Callback stream ready ({ms:.0f}ms, output={route}, rate={sample_rate}Hz)")
+            log_event(
+                "INFO",
+                "audio.output.stream.ready",
+                "Output callback stream ready",
+                output=route,
+                rate=sample_rate,
+                duration_ms=int(ms),
+            )
+            close_new_stream = False
             with self._lock:
                 if self._released:
+                    close_new_stream = True
+                else:
+                    self._pa = pa
+                    self._stream = stream
+                    self._stream_ready = True
+                    self._output_device_name = device_name
+                    self._set_sample_rate_locked(sample_rate)
+            if close_new_stream:
+                with portaudio_session("sounds.init_stream.release_race"):
                     try:
                         stream.stop_stream()
                         stream.close()
                     finally:
                         pa.terminate()
-                    return
-                self._pa = pa
-                self._stream = stream
-                self._stream_ready = True
-                self._output_device_name = device_name
-                self._set_sample_rate_locked(sample_rate)
+                return
         except Exception as e:
-            logger.warning(f"{_TAG} Stream init failed: {e}")
-            try:
-                if stream is not None:
-                    stream.close()
-            except Exception:
-                pass
-            try:
-                if pa is not None:
-                    pa.terminate()
-            except Exception:
-                pass
+            log_event(
+                "WARNING",
+                "audio.output.stream.init_failed",
+                "Output callback stream init failed",
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            with portaudio_session("sounds.init_stream.cleanup"):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+                try:
+                    if pa is not None:
+                        pa.terminate()
+                except Exception:
+                    pass
             with self._lock:
                 self._stream_ready = False
                 self._output_device_name = None
@@ -287,7 +308,13 @@ class AudioCues:
         old_stream, old_pa = self._detach_current_stream()
         self._close_detached_stream(old_stream, old_pa)
         if old_stream is not None or old_pa is not None:
-            logger.info(f"{_TAG} PyAudio reset for device rescan")
+            log_event(
+                "INFO",
+                "audio.output.portaudio.reset",
+                "Output PortAudio reset for device rescan",
+                had_stream=old_stream is not None,
+                had_audio_client=old_pa is not None,
+            )
 
     def _reopen_stream(self):
         with self._init_lock:
@@ -295,7 +322,13 @@ class AudioCues:
             self._init_started = False
         old_stream, old_pa = self._detach_current_stream()
         self._close_detached_stream(old_stream, old_pa)
-        logger.info(f"{_TAG} Reopening callback stream for current default output")
+        log_event(
+            "INFO",
+            "audio.output.stream.reopen",
+            "Reopening output callback stream for current default output",
+            had_stream=old_stream is not None,
+            had_audio_client=old_pa is not None,
+        )
         self._init_stream()
 
     def _detach_current_stream(self):
@@ -313,29 +346,34 @@ class AudioCues:
 
     @staticmethod
     def _close_detached_stream(old_stream, old_pa):
-        if old_stream is not None:
-            try:
-                old_stream.stop_stream()
-                old_stream.close()
-            except Exception:
-                pass
-        if old_pa is not None:
-            try:
-                old_pa.terminate()
-            except Exception:
-                pass
+        with portaudio_session("sounds.close_detached_stream"):
+            if old_stream is not None:
+                try:
+                    old_stream.stop_stream()
+                    old_stream.close()
+                except Exception:
+                    pass
+            if old_pa is not None:
+                try:
+                    old_pa.terminate()
+                except Exception:
+                    pass
 
     def _audio_callback(self, in_data, frame_count, time_info, status):
         needed = frame_count * 2  # 16-bit mono
         data = b""
-        while len(data) < needed and self._buf:
-            chunk = self._buf[0]
-            take = needed - len(data)
-            if len(chunk) <= take:
-                data += self._buf.popleft()
-            else:
-                data += chunk[:take]
-                self._buf[0] = chunk[take:]
+        with self._lock:
+            while len(data) < needed and self._buf:
+                chunk = self._buf[0]
+                take = needed - len(data)
+                if len(chunk) <= take:
+                    if hasattr(self._buf, "popleft"):
+                        data += self._buf.popleft()
+                    else:
+                        data += self._buf.pop(0)
+                else:
+                    data += chunk[:take]
+                    self._buf[0] = chunk[take:]
         if len(data) < needed:
             data += b"\x00" * (needed - len(data))
         return (data, pyaudio.paContinue)
@@ -347,20 +385,9 @@ class AudioCues:
             if self._reopen_timer is not None:
                 self._reopen_timer.cancel()
                 self._reopen_timer = None
+        old_stream, old_pa = self._detach_current_stream()
+        self._close_detached_stream(old_stream, old_pa)
         with self._lock:
-            if self._stream is not None:
-                try:
-                    self._stream.stop_stream()
-                    self._stream.close()
-                except Exception:
-                    pass
-                self._stream = None
-            if self._pa:
-                try:
-                    self._pa.terminate()
-                except Exception:
-                    pass
-                self._pa = None
             self._stream_ready = False
             self._output_device_name = None
             self._buf.clear()

@@ -13,7 +13,7 @@ from ctypes.wintypes import DWORD, LPCWSTR
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from core.log import logger
+from core.log import logger, log_event
 
 _TAG = "[DeviceWatcher]"
 
@@ -230,17 +230,22 @@ class _NotificationClient(COMObject):
         self._emitter = emitter
 
     def OnDeviceStateChanged(self, pwstrDeviceId, dwNewState):
-        logger.info(f"{_TAG} OnDeviceStateChanged state={dwNewState}")
+        log_event(
+            "INFO",
+            "audio.device.state_changed",
+            "Windows audio device state changed",
+            state=dwNewState,
+        )
         self._emitter.changed.emit()
         return 0
 
     def OnDeviceAdded(self, pwstrDeviceId):
-        logger.info(f"{_TAG} OnDeviceAdded")
+        log_event("INFO", "audio.device.added", "Windows audio device added")
         self._emitter.changed.emit()
         return 0
 
     def OnDeviceRemoved(self, pwstrDeviceId):
-        logger.info(f"{_TAG} OnDeviceRemoved")
+        log_event("INFO", "audio.device.removed", "Windows audio device removed")
         self._emitter.changed.emit()
         return 0
 
@@ -249,7 +254,13 @@ class _NotificationClient(COMObject):
             logger.debug(f"{_TAG} Ignored default change flow={flow} role={role}")
             return 0
         kind = "render" if flow == _eRender else "capture"
-        logger.info(f"{_TAG} OnDefaultDeviceChanged kind={kind} role={role}")
+        log_event(
+            "INFO",
+            "audio.device.default_changed",
+            "Windows default audio device changed",
+            kind=kind,
+            role=role,
+        )
         self._emitter.changed.emit()
         return 0
 

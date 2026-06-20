@@ -166,6 +166,25 @@ class InputDeviceSnapshotTests(unittest.TestCase):
         self.assertTrue(snapshot.devices[0].is_recordable)
         self.assertEqual(snapshot.recordable_default_name, pyaudio_name)
 
+    def test_snapshot_can_skip_pyaudio_open_probe_while_recording(self):
+        from core.input_devices import get_input_device_snapshot
+
+        with patch("core.input_devices.VoiceRecorder.list_devices") as list_devices:
+            with patch(
+                "core.input_devices.get_default_capture_device_name",
+                return_value="Bluetooth Mic",
+            ):
+                with patch(
+                    "core.input_devices.get_full_device_names",
+                    return_value={"Bluetooth Mic": "Bluetooth Mic"},
+                ):
+                    snapshot = get_input_device_snapshot(open_probe=False)
+
+        list_devices.assert_not_called()
+        self.assertEqual(snapshot.default_name, "Bluetooth Mic")
+        self.assertFalse(snapshot.devices[0].is_recordable)
+        self.assertFalse(snapshot.has_recordable_device)
+
 
 if __name__ == "__main__":
     unittest.main()

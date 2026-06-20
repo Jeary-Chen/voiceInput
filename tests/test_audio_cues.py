@@ -1,5 +1,6 @@
 import sys
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -61,6 +62,14 @@ class _FakeOpeningPyAudio(_FakePyAudio):
 
 
 class AudioCuesTests(unittest.TestCase):
+    def _record_guard_reasons(self, reasons):
+        @contextmanager
+        def guard(reason=""):
+            reasons.append(reason)
+            yield
+
+        return guard
+
     def _cues(self) -> AudioCues:
         cues = AudioCues.__new__(AudioCues)
         cues._enabled = True
@@ -161,6 +170,39 @@ class AudioCuesTests(unittest.TestCase):
         old_pa.terminate.assert_called_once_with()
         self.assertEqual(cues._buf, [])
         init_stream.assert_called_once_with()
+
+    def test_close_detached_stream_uses_portaudio_guard(self):
+        reasons = []
+        old_pa = MagicMock()
+        old_stream = MagicMock()
+
+        with patch("ui.sounds.portaudio_session", self._record_guard_reasons(reasons)):
+            AudioCues._close_detached_stream(old_stream, old_pa)
+
+        self.assertEqual(reasons, ["sounds.close_detached_stream"])
+        old_stream.stop_stream.assert_called_once_with()
+        old_stream.close.assert_called_once_with()
+        old_pa.terminate.assert_called_once_with()
+
+    def test_audio_callback_drains_buffer_under_lock(self):
+        cues = self._cues()
+        entries = []
+
+        class RecordingLock:
+            def __enter__(self):
+                entries.append("enter")
+
+            def __exit__(self, exc_type, exc, tb):
+                entries.append("exit")
+
+        cues._lock = RecordingLock()
+        cues._buf = [b"abc"]
+
+        data, status = cues._audio_callback(None, 2, None, None)
+
+        self.assertEqual(entries, ["enter", "exit"])
+        self.assertEqual(data, b"abc\x00")
+        self.assertEqual(status, 0)
 
     def test_resolve_default_output_prefers_matching_wasapi_device(self):
         pa = _FakePyAudio([

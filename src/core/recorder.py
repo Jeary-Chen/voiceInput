@@ -6,7 +6,8 @@ import numpy as np
 import pyaudio
 
 from core.device_names import fix_device_name
-from core.log import logger
+from core.log import logger, log_event
+from core.portaudio_guard import portaudio_session
 
 _TAG = "[Recorder]"
 
@@ -70,16 +71,17 @@ def _probe_input_open(
         for rate in rates:
             try:
                 block = max(int(rate * _CALLBACK_BUFFER_SEC), _MIN_FRAMES_PER_BUFFER)
-                stream = pa.open(
-                    format=pyaudio.paInt16,
-                    channels=channels,
-                    rate=rate,
-                    input=True,
-                    input_device_index=index,
-                    start=False,
-                    frames_per_buffer=block,
-                )
-                stream.close()
+                with portaudio_session("recorder.probe_input_open"):
+                    stream = pa.open(
+                        format=pyaudio.paInt16,
+                        channels=channels,
+                        rate=rate,
+                        input=True,
+                        input_device_index=index,
+                        start=False,
+                        frames_per_buffer=block,
+                    )
+                    stream.close()
                 return rate, channels
             except Exception:
                 continue
@@ -154,49 +156,74 @@ class VoiceRecorder:
         If the pre-open fails (rare), start() will retry on demand.
         """
         with self._lifecycle_lock:
-            self._prepared = False
-            self._close_stream()
-            self._release_pa()
-            t0 = time.perf_counter()
-            self._pa = pyaudio.PyAudio()
-            info = self._device_info()
+            with portaudio_session("recorder.prepare"):
+                self._prepared = False
+                self._close_stream()
+                self._release_pa()
+                t0 = time.perf_counter()
+                log_event(
+                    "DEBUG",
+                    "recorder.prepare.start",
+                    "Recorder prepare started",
+                    device_index=self._device_index,
+                    preferred_name=self._preferred_name or "system default",
+                )
+                self._pa = pyaudio.PyAudio()
+                info = self._device_info()
 
-            if info is None:
+                if info is None:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                    self._no_device = True
+                    self._device_name = "Unknown"
+                    self._native_rate = 0
+                    self._max_channels = 0
+                    self._stream_rate = self.TARGET_RATE
+                    self._stream_channels = self.CHANNELS
+                    log_event(
+                        "INFO",
+                        "recorder.prepare.end",
+                        "Recorder prepared without input device",
+                        ready=False,
+                        no_device=True,
+                        duration_ms=int(elapsed_ms),
+                    )
+                    self._prepared = True
+                    return
+
+                self._no_device = False
+                self._device_name = fix_device_name(info.get("name", "Unknown"))
+                self._native_rate = int(info.get("defaultSampleRate", 0))
+                self._max_channels = int(info.get("maxInputChannels", self.CHANNELS))
+
+                self._stream_rate, self._stream_channels = self._negotiate_params()
+
+                stream_ok = self._try_open_at(self._stream_rate, self._stream_channels)
+                if not stream_ok:
+                    logger.warning(f"{_TAG} Negotiated params failed, trying alternatives")
+                    stream_ok = self._try_open_stream()
+
                 elapsed_ms = (time.perf_counter() - t0) * 1000
-                self._no_device = True
-                self._device_name = "Unknown"
-                self._native_rate = 0
-                self._max_channels = 0
-                self._stream_rate = self.TARGET_RATE
-                self._stream_channels = self.CHANNELS
-                logger.info(f"{_TAG} No input device | NO STREAM ({elapsed_ms:.0f}ms)")
+                ch_note = f" ch={self._stream_channels}→mono" \
+                    if self._stream_channels > 1 else ""
+                rate_note = f" resample→{self.TARGET_RATE}" \
+                    if self._stream_rate != self.TARGET_RATE else ""
+                status = "ready" if stream_ok else "NO STREAM"
+                log_event(
+                    "INFO",
+                    "recorder.prepare.end",
+                    f"Recorder prepared ({status})",
+                    device=self._device_name,
+                    ready=stream_ok,
+                    no_device=False,
+                    native_rate=self._native_rate,
+                    max_channels=self._max_channels,
+                    stream_rate=self._stream_rate,
+                    stream_channels=self._stream_channels,
+                    channel_note=ch_note.strip(),
+                    rate_note=rate_note.strip(),
+                    duration_ms=int(elapsed_ms),
+                )
                 self._prepared = True
-                return
-
-            self._no_device = False
-            self._device_name = fix_device_name(info.get("name", "Unknown"))
-            self._native_rate = int(info.get("defaultSampleRate", 0))
-            self._max_channels = int(info.get("maxInputChannels", self.CHANNELS))
-
-            self._stream_rate, self._stream_channels = self._negotiate_params()
-
-            stream_ok = self._try_open_at(self._stream_rate, self._stream_channels)
-            if not stream_ok:
-                logger.warning(f"{_TAG} Negotiated params failed, trying alternatives")
-                stream_ok = self._try_open_stream()
-
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            ch_note = f" ch={self._stream_channels}→mono" \
-                if self._stream_channels > 1 else ""
-            rate_note = f" resample→{self.TARGET_RATE}" \
-                if self._stream_rate != self.TARGET_RATE else ""
-            status = "ready" if stream_ok else "NO STREAM"
-            logger.info(
-                f"{_TAG} Prepared '{self._device_name}' | "
-                f"native={self._native_rate} Hz ch={self._max_channels} | "
-                f"stream={self._stream_rate} Hz{ch_note}{rate_note} | "
-                f"{status} ({elapsed_ms:.0f}ms)")
-            self._prepared = True
 
     def release(self):
         """Full shutdown — terminate PyAudio. Call on app exit."""
@@ -217,7 +244,13 @@ class VoiceRecorder:
             self._prepared = False
             if had_audio_client:
                 suffix = f": {reason}" if reason else ""
-                logger.info(f"{_TAG} PyAudio reset for device rescan{suffix}")
+                log_event(
+                    "INFO",
+                    "recorder.portaudio.reset",
+                    "Recorder PortAudio reset",
+                    reason=reason,
+                    had_audio_client=had_audio_client,
+                )
             return had_audio_client
 
     def invalidate_stream(self, reason: str = "") -> bool:
@@ -258,9 +291,14 @@ class VoiceRecorder:
             old_name = self._preferred_name
             self._device_index = index
             self._preferred_name = preferred_name
-            logger.info(
-                f"{_TAG} Device changed: index {old} → {index}, "
-                f"name '{old_name or 'system default'}' → '{preferred_name or 'system default'}'"
+            log_event(
+                "INFO",
+                "recorder.device.changed",
+                "Recorder input device changed",
+                old_index=old,
+                new_index=index,
+                old_name=old_name or "system default",
+                new_name=preferred_name or "system default",
             )
             self.prepare()
 
@@ -298,7 +336,8 @@ class VoiceRecorder:
             t0 = time.perf_counter()
             self._recording = True
             try:
-                self._stream.start_stream()
+                with portaudio_session("recorder.start_stream"):
+                    self._stream.start_stream()
             except OSError:
                 self._recording = False
                 logger.warning(f"{_TAG} start_stream() failed, re-opening")
@@ -307,7 +346,8 @@ class VoiceRecorder:
                     if not self._try_open_stream():
                         raise OSError(f"无法打开设备 '{self._device_name}'")
                 self._recording = True
-                self._stream.start_stream()
+                with portaudio_session("recorder.start_stream.retry"):
+                    self._stream.start_stream()
             start_ms = (time.perf_counter() - t0) * 1000
 
             dev_label = f"device {self._device_index}" \
@@ -424,7 +464,8 @@ class VoiceRecorder:
             )
             if self._device_index is not None:
                 kwargs["input_device_index"] = self._device_index
-            self._stream = self._pa.open(**kwargs)
+            with portaudio_session("recorder.open_stream"):
+                self._stream = self._pa.open(**kwargs)
             self._stream_channels = channels
             self._stream_rate = rate
             notes = []
@@ -476,14 +517,16 @@ class VoiceRecorder:
             )
         if self._device_index is not None:
             try:
-                return self._pa.get_device_info_by_index(self._device_index)
+                with portaudio_session("recorder.device_info_by_index"):
+                    return self._pa.get_device_info_by_index(self._device_index)
             except OSError:
                 logger.warning(
                     f"{_TAG} Device index {self._device_index} no longer valid, "
                     f"falling back to system default")
                 self._device_index = None
         try:
-            info = self._pa.get_default_input_device_info()
+            with portaudio_session("recorder.default_input_device_info"):
+                info = self._pa.get_default_input_device_info()
             try:
                 from core.device_watcher import get_default_capture_device_name
                 full_name = get_default_capture_device_name()
@@ -527,12 +570,13 @@ class VoiceRecorder:
         if channels is None:
             channels = self.CHANNELS
         try:
-            return bool(self._pa.is_format_supported(
-                rate,
-                input_device=self._device_index,
-                input_channels=channels,
-                input_format=pyaudio.paInt16,
-            ))
+            with portaudio_session("recorder.is_format_supported"):
+                return bool(self._pa.is_format_supported(
+                    rate,
+                    input_device=self._device_index,
+                    input_channels=channels,
+                    input_format=pyaudio.paInt16,
+                ))
         except (ValueError, OSError):
             return False
 
@@ -592,9 +636,10 @@ class VoiceRecorder:
         """Stop the audio stream (releases mic indicator) but keep it open."""
         if self._stream:
             try:
-                was_active = self._stream.is_active()
-                if was_active:
-                    self._stream.stop_stream()
+                with portaudio_session("recorder.stop_stream"):
+                    was_active = self._stream.is_active()
+                    if was_active:
+                        self._stream.stop_stream()
                 logger.debug(f"{_TAG} _stop_stream: was_active={was_active}")
             except Exception as e:
                 logger.debug(f"{_TAG} _stop_stream error: {e}")
@@ -604,7 +649,8 @@ class VoiceRecorder:
         self._stop_stream()
         if self._stream:
             try:
-                self._stream.close()
+                with portaudio_session("recorder.close_stream"):
+                    self._stream.close()
             except Exception:
                 pass
             self._stream = None
@@ -614,7 +660,8 @@ class VoiceRecorder:
         self._close_stream()
         if self._pa:
             try:
-                self._pa.terminate()
+                with portaudio_session("recorder.terminate"):
+                    self._pa.terminate()
             except Exception:
                 pass
             self._pa = None
@@ -661,67 +708,69 @@ class VoiceRecorder:
         Windows can expose capture endpoints that PyAudio cannot actually open.
         Treat PyAudio `open(start=False)` as the recorder capability boundary.
         """
-        pa = pyaudio.PyAudio()
-        try:
-            host_api_names: dict[int, str] = {}
-            for h in range(pa.get_host_api_count()):
-                api = pa.get_host_api_info_by_index(h)
-                host_api_names[h] = api.get("name", f"HostApi {h}")
+        with portaudio_session("recorder.list_devices"):
+            pa = pyaudio.PyAudio()
+            try:
+                host_api_names: dict[int, str] = {}
+                for h in range(pa.get_host_api_count()):
+                    api = pa.get_host_api_info_by_index(h)
+                    host_api_names[h] = api.get("name", f"HostApi {h}")
 
-            candidates: list[tuple[int, int, str]] = []
-            for i in range(pa.get_device_count()):
-                info = pa.get_device_info_by_index(i)
-                if info.get("maxInputChannels", 0) <= 0:
-                    continue
-                host_api = int(info.get("hostApi", -1))
-                host_name = host_api_names.get(host_api, f"HostApi {host_api}")
-                candidates.append((_host_api_rank(host_name), i, host_name))
+                candidates: list[tuple[int, int, str]] = []
+                for i in range(pa.get_device_count()):
+                    info = pa.get_device_info_by_index(i)
+                    if info.get("maxInputChannels", 0) <= 0:
+                        continue
+                    host_api = int(info.get("hostApi", -1))
+                    host_name = host_api_names.get(host_api, f"HostApi {host_api}")
+                    candidates.append((_host_api_rank(host_name), i, host_name))
 
-            devices: list[dict] = []
-            seen: set[str] = set()
-            for _, i, host_name in sorted(candidates):
-                info = pa.get_device_info_by_index(i)
-                name = fix_device_name(info.get("name", f"Device {i}"))
-                if name in seen:
-                    continue
-                max_channels = int(info.get("maxInputChannels", 0))
-                default_rate = int(info.get("defaultSampleRate", 0))
-                opened = _probe_input_open(
-                    pa,
-                    index=i,
-                    max_channels=max_channels,
-                    default_rate=default_rate,
-                )
-                if opened is None:
-                    logger.debug(
-                        f"{_TAG} Skipped input device {i} '{name}' "
-                        f"({host_name}): open probe failed"
+                devices: list[dict] = []
+                seen: set[str] = set()
+                for _, i, host_name in sorted(candidates):
+                    info = pa.get_device_info_by_index(i)
+                    name = fix_device_name(info.get("name", f"Device {i}"))
+                    if name in seen:
+                        continue
+                    max_channels = int(info.get("maxInputChannels", 0))
+                    default_rate = int(info.get("defaultSampleRate", 0))
+                    opened = _probe_input_open(
+                        pa,
+                        index=i,
+                        max_channels=max_channels,
+                        default_rate=default_rate,
                     )
-                    continue
-                open_rate, open_channels = opened
-                seen.add(name)
-                devices.append({
-                    "index": i,
-                    "name": name,
-                    "host_api": host_name,
-                    "open_rate": open_rate,
-                    "open_channels": open_channels,
-                })
+                    if opened is None:
+                        logger.debug(
+                            f"{_TAG} Skipped input device {i} '{name}' "
+                            f"({host_name}): open probe failed"
+                        )
+                        continue
+                    open_rate, open_channels = opened
+                    seen.add(name)
+                    devices.append({
+                        "index": i,
+                        "name": name,
+                        "host_api": host_name,
+                        "open_rate": open_rate,
+                        "open_channels": open_channels,
+                    })
 
-            hosts = ", ".join(sorted({dev["host_api"] for dev in devices}))
-            suffix = f" via {hosts}" if hosts else ""
-            logger.debug(f"{_TAG} Enumerated {len(devices)} input device(s){suffix}")
-            return devices
-        finally:
-            pa.terminate()
+                hosts = ", ".join(sorted({dev["host_api"] for dev in devices}))
+                suffix = f" via {hosts}" if hosts else ""
+                logger.debug(f"{_TAG} Enumerated {len(devices)} input device(s){suffix}")
+                return devices
+            finally:
+                pa.terminate()
 
     @classmethod
     def get_default_device_name(cls) -> str:
-        pa = pyaudio.PyAudio()
-        try:
-            info = pa.get_default_input_device_info()
-            return fix_device_name(info.get("name", "Unknown"))
-        except Exception:
-            return "Unknown"
-        finally:
-            pa.terminate()
+        with portaudio_session("recorder.get_default_device_name"):
+            pa = pyaudio.PyAudio()
+            try:
+                info = pa.get_default_input_device_info()
+                return fix_device_name(info.get("name", "Unknown"))
+            except Exception:
+                return "Unknown"
+            finally:
+                pa.terminate()

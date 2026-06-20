@@ -48,6 +48,7 @@ class LogCrashHandlerTests(unittest.TestCase):
         content = self._session_log.read_text(encoding="utf-8")
         self.assertIn("[UNHANDLED_EXCEPTION]", content)
         self.assertIn("RuntimeError: boom", content)
+        self.assertIn(f"run={log_module.run_id}", content)
 
     def test_thread_exception_hook_records_thread_name(self):
         log_module = self._import_log_module()
@@ -123,7 +124,40 @@ class LogCrashHandlerTests(unittest.TestCase):
         with patch.object(log_module.logger, "info") as info:
             log_module._log_normal_shutdown()
             log_module._log_normal_shutdown()
-            info.assert_called_once_with("[Runtime] Process exiting normally")
+            self.assertEqual(info.call_count, 1)
+            message = info.call_args.args[0]
+            self.assertIn("app.lifecycle.end - Process exiting normally", message)
+            self.assertIn("exit_code=0", message)
+
+    def test_format_event_uses_stable_event_and_key_value_fields(self):
+        log_module = self._import_log_module()
+
+        message = log_module.format_event(
+            "audio.device.changed",
+            "Audio device changed",
+            generation=3,
+            default_name="Built-in Mic",
+            open_probe=True,
+        )
+
+        self.assertIn("audio.device.changed - Audio device changed", message)
+        self.assertIn("generation=3", message)
+        self.assertIn('default_name="Built-in Mic"', message)
+        self.assertIn("open_probe=true", message)
+
+    def test_format_event_redacts_sensitive_fields(self):
+        log_module = self._import_log_module()
+
+        message = log_module.format_event(
+            "config.api_key.updated",
+            "API key updated",
+            api_key="sk-secret",
+            hotkey="f1",
+        )
+
+        self.assertIn("api_key=[REDACTED]", message)
+        self.assertIn("hotkey=f1", message)
+        self.assertNotIn("sk-secret", message)
 
 
 if __name__ == "__main__":

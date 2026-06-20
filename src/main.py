@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from core.config_sync import ConfigSync
-from core.log import flush_log, logger, install_qt_handler
+from core.log import flush_log, logger, install_qt_handler, log_event
 from core.engine import VoiceEngine
 from ui import icons
 from ui.config_dialog import ConfigFaultHandler, load_config_at_startup
@@ -37,13 +37,15 @@ _shutdown_event_handle = None
 _shutdown_bridge = None
 
 
-def _runtime_summary() -> str:
+def _runtime_fields() -> dict[str, str]:
     from _version import VERSION
 
-    return (
-        f"version={VERSION}, main={Path(__file__).resolve()}, "
-        f"exe={Path(sys.executable).resolve()}, cwd={Path.cwd()}"
-    )
+    return {
+        "version": VERSION,
+        "main": str(Path(__file__).resolve()),
+        "exe": str(Path(sys.executable).resolve()),
+        "cwd": str(Path.cwd()),
+    }
 
 
 def _is_already_running() -> bool:
@@ -131,7 +133,7 @@ def main():
     install_qt_handler()
 
     if _is_already_running():
-        logger.warning("VoiceInput is already running, exiting.")
+        log_event("WARNING", "app.single_instance.blocked", "VoiceInput is already running")
         sys.exit(0)
 
     # Config must be validated before any application icon or tray UI appears.
@@ -140,7 +142,7 @@ def main():
 
     app.setApplicationName("VoiceInput")
     app.setWindowIcon(icons.app_icon())
-    logger.info(f"[Runtime] {_runtime_summary()}")
+    log_event("INFO", "app.lifecycle.start", "Application runtime initialized", **_runtime_fields())
 
     server = QLocalServer()
     server.removeServer(_APP_KEY)
@@ -149,7 +151,7 @@ def main():
     _create_shutdown_event()
     app.aboutToQuit.connect(_release_app_mutex)
     app.aboutToQuit.connect(_release_shutdown_event)
-    app.aboutToQuit.connect(lambda: logger.info("[Main] QApplication aboutToQuit"))
+    app.aboutToQuit.connect(lambda: log_event("INFO", "app.qt.about_to_quit", "QApplication aboutToQuit"))
     app.aboutToQuit.connect(flush_log)
 
     config_sync = ConfigSync(config)
@@ -157,8 +159,8 @@ def main():
 
     if not config.api_key:
         from config import _config_path
-        logger.warning("API key not configured")
-        logger.info(f"Set DASHSCOPE_API_KEY env var or edit: {_config_path()}")
+        log_event("WARNING", "config.api_key.missing", "API key not configured")
+        log_event("INFO", "config.api_key.hint", "Configure API key via environment or config file", config_path=_config_path())
 
     engine = VoiceEngine(config)
     mini = MiniRecordingWindow(engine)
@@ -177,7 +179,7 @@ def main():
     _start_shutdown_watcher(tray._quit)
 
     hotkey_display = config.hotkey.replace("+", " + ").title()
-    logger.success(f"VoiceInput started. Press {hotkey_display} to record.")
+    log_event("SUCCESS", "app.ready", "VoiceInput started", hotkey=hotkey_display)
 
     tray.reveal()
     mini.refresh_visibility()

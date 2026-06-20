@@ -350,19 +350,20 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             ),
             _device_change_times=[0.0, 1.0, 2.0],
             _device_storm_until=0.0,
+            _device_change_generation=0,
             _device_change_timer=SimpleNamespace(start=lambda delay: starts.append(delay)),
             _input_rescan_needs_portaudio_reset=False,
+            _output_reopen_after_device_rescan=False,
         )
         _bind_recordable_retry_state(tray)
-        tray._reset_input_portaudio_before_rescan = (
-            lambda: VoiceTray._reset_input_portaudio_before_rescan(tray)
-        )
 
         with patch("ui.tray.time.monotonic", return_value=3.0):
             VoiceTray._on_audio_device_changed(tray)
 
-        self.assertEqual(calls, [("reset", "audio device changed"), "audio_reset"])
-        self.assertFalse(tray._input_rescan_needs_portaudio_reset)
+        self.assertEqual(calls, [])
+        self.assertTrue(tray._input_rescan_needs_portaudio_reset)
+        self.assertTrue(tray._output_reopen_after_device_rescan)
+        self.assertEqual(tray._device_change_generation, 1)
         self.assertEqual(starts, [2000])
         self.assertAlmostEqual(tray._device_storm_until, 5.0)
 
@@ -382,19 +383,80 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             ),
             _device_change_times=[],
             _device_storm_until=0.0,
+            _device_change_generation=0,
             _device_change_timer=SimpleNamespace(start=lambda delay: calls.append(("timer", delay))),
             _input_rescan_needs_portaudio_reset=False,
+            _output_reopen_after_device_rescan=False,
         )
         _bind_recordable_retry_state(tray)
-        tray._reset_input_portaudio_before_rescan = (
-            lambda: VoiceTray._reset_input_portaudio_before_rescan(tray)
-        )
 
         with patch("ui.tray.time.monotonic", return_value=3.0):
             VoiceTray._on_audio_device_changed(tray)
 
-        self.assertEqual(calls, ["audio_reset", ("timer", 500)])
+        self.assertEqual(calls, [("timer", 500)])
         self.assertTrue(tray._input_rescan_needs_portaudio_reset)
+        self.assertTrue(tray._output_reopen_after_device_rescan)
+
+    def test_start_refresh_resets_audio_once_after_debounce(self):
+        from ui.tray import VoiceTray
+
+        calls = []
+
+        class FakeSignal:
+            def connect(self, callback):
+                calls.append(("connect", callback.__name__))
+
+        class FakeWorker:
+            result_ready = FakeSignal()
+            finished = FakeSignal()
+
+            def __init__(self, generation, *, open_probe=True):
+                calls.append(("worker", generation, open_probe))
+
+            def start(self):
+                calls.append("start")
+
+        tray = SimpleNamespace(
+            _dev_refresh_running=False,
+            _dev_refresh_repeat=False,
+            _input_rescan_needs_portaudio_reset=True,
+            _output_reopen_after_device_rescan=True,
+            _engine=SimpleNamespace(
+                state="ready",
+                recorder=SimpleNamespace(
+                    reset_portaudio=lambda reason: calls.append(("reset", reason)),
+                ),
+            ),
+            _audio=SimpleNamespace(
+                reset_for_device_rescan=lambda: calls.append("audio_reset"),
+            ),
+            _device_change_generation=3,
+            _dev_refresh_workers=[],
+            _on_refresh_result=lambda *args: None,
+            _on_device_refresh_worker_finished=lambda: None,
+        )
+        tray._reset_input_portaudio_before_rescan = (
+            lambda: VoiceTray._reset_input_portaudio_before_rescan(tray)
+        )
+        tray._reset_output_portaudio_before_rescan = (
+            lambda: VoiceTray._reset_output_portaudio_before_rescan(tray)
+        )
+
+        with patch("ui.tray._DeviceRefreshWorker", FakeWorker):
+            VoiceTray._start_async_refresh(tray)
+
+        self.assertIn(("reset", "audio device changed"), calls)
+        self.assertIn("audio_reset", calls)
+        self.assertIn(("worker", 3, True), calls)
+        self.assertFalse(tray._input_rescan_needs_portaudio_reset)
+
+    def test_device_refresh_worker_skips_open_probe_when_requested(self):
+        from ui.tray import _DeviceRefreshWorker
+
+        with patch("core.input_devices.get_input_device_snapshot") as snapshot:
+            _DeviceRefreshWorker(4, open_probe=False).run()
+
+        snapshot.assert_called_once_with(open_probe=False)
 
     def test_refresh_during_storm_only_updates_menu_cache(self):
         from ui.tray import VoiceTray
@@ -405,6 +467,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _input_snapshot=_snapshot("Old Mic"),
             _last_menu_refresh_time=0.0,
             _device_storm_until=999.0,
+            _device_change_generation=0,
             _dev_refresh_running=True,
             _dev_refresh_repeat=False,
             _engine=SimpleNamespace(
@@ -451,6 +514,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _dev_refresh_ready=True,
             _input_snapshot=snapshot,
             _last_menu_refresh_time=0.0,
+            _device_change_generation=0,
             _dev_refresh_running=True,
             _dev_refresh_repeat=False,
             _engine=SimpleNamespace(
@@ -482,6 +546,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _input_snapshot=_snapshot(),
             _last_menu_refresh_time=0.0,
             _device_storm_until=999.0,
+            _device_change_generation=0,
             _dev_refresh_running=True,
             _dev_refresh_repeat=False,
             _config=SimpleNamespace(mic_index=None, mic_name=""),
@@ -528,6 +593,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _dev_refresh_ready=True,
             _input_snapshot=_snapshot(),
             _last_menu_refresh_time=0.0,
+            _device_change_generation=0,
             _dev_refresh_running=True,
             _dev_refresh_repeat=False,
             _engine=SimpleNamespace(
@@ -567,6 +633,28 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         self.assertEqual(len(tray._recordable_retry.scheduled_snapshots), 1)
         self.assertTrue(tray._recordable_retry.active)
         self.assertIn(("rebuild", True), calls)
+
+    def test_stale_refresh_result_is_ignored(self):
+        from ui.tray import VoiceTray
+
+        calls = []
+        tray = SimpleNamespace(
+            _device_change_generation=2,
+            _dev_refresh_running=True,
+            _dev_refresh_repeat=False,
+            _finish_device_refresh=lambda: VoiceTray._finish_device_refresh(tray),
+            _sync_system_default_device=lambda: calls.append("sync"),
+            _rebuild_device_menu=lambda: calls.append("rebuild"),
+        )
+
+        VoiceTray._on_refresh_result(
+            tray,
+            1,
+            _snapshot("Old Mic", [{"name": "Old Mic", "display_name": "Old Mic", "index": 1}]),
+        )
+
+        self.assertEqual(calls, [])
+        self.assertFalse(tray._dev_refresh_running)
 
     def test_deferred_recorder_prepare_starts_worker_when_quiet(self):
         from ui.tray import VoiceTray
@@ -691,6 +779,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _engine=SimpleNamespace(state="ready"),
             _recorder_prepare_worker=object(),
             _recorder_prepare_pending=True,
+            _recorder_prepare_generation=1,
             _recorder_prepare_timer=SimpleNamespace(start=lambda: calls.append("timer")),
             _pending_record_start_source=None,
             _sync_device_fault_after_prepare=lambda ok: None,
@@ -866,6 +955,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _engine=SimpleNamespace(state="ready"),
             _recorder_prepare_worker=object(),
             _recorder_prepare_pending=False,
+            _recorder_prepare_generation=1,
             _pending_record_start_source="hotkey",
             _begin_recording=lambda source: calls.append(source),
             _sync_device_fault_after_prepare=lambda ok: None,
@@ -891,6 +981,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             ),
             _recorder_prepare_worker=object(),
             _recorder_prepare_pending=False,
+            _recorder_prepare_generation=1,
             _pending_record_start_source="hotkey",
             _begin_recording=lambda source: calls.append(("begin", source)),
             _sync_device_fault_after_prepare=lambda ok: None,
@@ -914,10 +1005,13 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             ),
             _recorder_prepare_worker=worker,
             _recorder_prepare_pending=False,
+            _recorder_prepare_generation=1,
             _pending_record_start_source=None,
+            _output_reopen_after_device_rescan=False,
             _faults=SimpleNamespace(
                 sync_device_from_recorder=lambda: calls.append("sync_device"),
             ),
+            _reopen_output_after_device_rescan=lambda **kwargs: calls.append(("reopen", kwargs)),
         )
         tray._sync_device_fault_after_prepare = (
             lambda ok: VoiceTray._sync_device_fault_after_prepare(tray, ok)
@@ -926,7 +1020,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         VoiceTray._on_recorder_prepare_done(tray, 1, "set_device", True)
 
         self.assertIs(tray._recorder_prepare_worker, worker)
-        self.assertEqual(calls, ["sync_device"])
+        self.assertEqual(calls, ["sync_device", ("reopen", {"after_prepare": True})])
 
     def test_prepare_worker_reference_is_released_after_finished(self):
         from ui.tray import VoiceTray
