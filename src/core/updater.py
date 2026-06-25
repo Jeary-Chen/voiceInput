@@ -571,6 +571,20 @@ class UpdateChecker:
         self._cb_stage_progress = None
         self._cb_stage_done = None
         self._cb_stage_failed = None
+        self._last_install_error: str | None = None
+
+    @property
+    def last_install_error(self) -> str | None:
+        return self._last_install_error
+
+    @property
+    def install_log_path(self) -> Path:
+        return _update_install_log_path()
+
+    def _fail_install(self, message: str) -> bool:
+        self._last_install_error = message
+        logger.error(f"[Updater] Install failed: {message}")
+        return False
 
     @property
     def latest(self) -> UpdateInfo | None:
@@ -639,19 +653,18 @@ class UpdateChecker:
         self._dl_worker.start()
 
     def install_ready(self, version: str, *, quit_fn=None) -> bool:
+        self._last_install_error = None
         if self._staged is None or self._staged.version != version:
-            logger.warning(
-                f"[Updater] Install request expired: requested={version}, "
-                f"staged={self.staged_version or '(none)'}"
+            return self._fail_install(
+                f"安装请求已过期：请求 v{version}，"
+                f"当前 staging 为 v{self.staged_version or '无'}"
             )
-            return False
         staged = self._staged_store.validate(version)
         if staged is None:
-            logger.warning(f"[Updater] Install request rejected: staged v{version} is no longer valid")
             self._staged = None
             if self._staged_store.staging_dir.exists():
                 self._staged_store.clear()
-            return False
+            return self._fail_install(f"已下载的 v{version} 更新包无效或已损坏，请重新下载")
         self._staged = staged
         return self.install(quit_fn=quit_fn)
 
@@ -660,13 +673,12 @@ class UpdateChecker:
         started = time.perf_counter()
         if self._staged is None:
             logger.debug("[DEBUG] UpdateChecker.install | no staged update, returning")
-            return False
+            return self._fail_install("没有可用的 staging 更新")
         staged_update = self._staged
         staged = staged_update.staging_dir
         if not staged.exists():
-            logger.error("[Updater] Install aborted: staging directory missing")
             self._staged = None
-            return False
+            return self._fail_install(f"更新暂存目录不存在: {staged}")
         app_dir = Path(__file__).resolve().parent.parent.parent
         exe_path = app_dir / "VoiceInput.exe"
         source = staged_update.source_dir
@@ -702,7 +714,7 @@ class UpdateChecker:
             f"[DEBUG] UpdateChecker.install | write_script elapsed_ms={_elapsed_ms(write_started)}, "
             f"bytes={len(ps_content.encode('utf-8'))}"
         )
-        cmd = ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                "-File", str(script)]
         try:
             launch_started = time.perf_counter()
@@ -713,12 +725,12 @@ class UpdateChecker:
                 f"pre_quit_total_elapsed_ms={_elapsed_ms(started)}"
             )
         except Exception as e:
-            logger.error(f"[Updater] Install script launch failed: {e}")
             logger.debug(
                 f"[DEBUG] UpdateChecker.install | launch_exception={type(e).__name__}: {e}, "
                 f"total_elapsed_ms={_elapsed_ms(started)}"
             )
-            return False
+            return self._fail_install(str(e))
+        self._last_install_error = None
         if quit_fn is not None:
             logger.debug("[DEBUG] UpdateChecker.install | calling quit_fn()")
             quit_fn()

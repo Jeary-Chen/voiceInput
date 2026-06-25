@@ -206,6 +206,7 @@ class UpdateMetadataTests(unittest.TestCase):
             checker._staged = StagedUpdate("1.4.17", staging, source)
 
             self.assertFalse(checker.install_ready("1.4.18"))
+            self.assertIn("1.4.18", checker.last_install_error or "")
 
     def test_install_ready_revalidates_staging_before_install(self):
         with tempfile.TemporaryDirectory() as tmp:

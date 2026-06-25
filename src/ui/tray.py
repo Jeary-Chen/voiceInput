@@ -31,7 +31,7 @@ from ui.hotkey import ComboHotkeyThread, _HotkeyDialog, _hotkey_display
 from ui.window_focus import widget_is_foreground
 from ui.apikey_dialog import _ApiKeyDialog
 from ui.update_ui import (
-    _UpdateNotesDialog, _UpdateReadyDialog, _UpdateMenuHelper,
+    _UpdateNotesDialog, _UpdateReadyDialog, _UpdateFailedDialog, _UpdateMenuHelper,
     anchor_left_cascade_submenu, apply_tray_menu_style, install_left_cascade_submenu,
 )
 from ui.prompt_dialog import _PolishPromptDialog
@@ -244,6 +244,7 @@ class VoiceTray(QSystemTrayIcon):
         self._apikey_dlg: _ApiKeyDialog | None = None
         self._update_notes_dlg: _UpdateNotesDialog | None = None
         self._update_ready_dlg: _UpdateReadyDialog | None = None
+        self._update_failed_dlg: _UpdateFailedDialog | None = None
         self._update_status = "idle"  # idle | downloading | ready
         self._hotkey_pause_depth = 0
         self._foreground_hotkey_pause_active = False
@@ -1718,20 +1719,34 @@ class VoiceTray(QSystemTrayIcon):
         self._update_widget.set_checking()
         self._updater.check_now()
 
-    def _show_update_notes(self, info: UpdateInfo):
-        if self._update_notes_dlg is not None:
-            self._update_notes_dlg.raise_()
-            self._update_notes_dlg.activateWindow()
+    def _present_update_dialog(
+        self,
+        existing: QDialog | None,
+        new_dlg: QDialog,
+        *,
+        assign: Callable[[QDialog], None],
+        on_finished,
+    ) -> None:
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
             return
+        new_dlg.setWindowModality(Qt.WindowModality.NonModal)
+        new_dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        new_dlg.finished.connect(on_finished)
+        assign(new_dlg)
+        new_dlg.show()
+        new_dlg.raise_()
+        new_dlg.activateWindow()
+
+    def _show_update_notes(self, info: UpdateInfo):
         from _version import VERSION
-        dlg = _UpdateNotesDialog(info, VERSION)
-        dlg.setWindowModality(Qt.WindowModality.NonModal)
-        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dlg.finished.connect(self._on_update_notes_finished)
-        self._update_notes_dlg = dlg
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        self._present_update_dialog(
+            self._update_notes_dlg,
+            _UpdateNotesDialog(info, VERSION),
+            assign=lambda dlg: setattr(self, "_update_notes_dlg", dlg),
+            on_finished=self._on_update_notes_finished,
+        )
 
     def _on_update_notes_finished(self, result: int):
         dlg = self._update_notes_dlg
@@ -1771,18 +1786,33 @@ class VoiceTray(QSystemTrayIcon):
         version = self._updater.staged_version
         if not version:
             return
-        if self._update_ready_dlg is not None:
-            self._update_ready_dlg.raise_()
-            self._update_ready_dlg.activateWindow()
-            return
-        dlg = _UpdateReadyDialog(version)
-        dlg.setWindowModality(Qt.WindowModality.NonModal)
-        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dlg.finished.connect(self._on_update_ready_finished)
-        self._update_ready_dlg = dlg
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        self._present_update_dialog(
+            self._update_ready_dlg,
+            _UpdateReadyDialog(version),
+            assign=lambda dlg: setattr(self, "_update_ready_dlg", dlg),
+            on_finished=self._on_update_ready_finished,
+        )
+
+    def _show_update_failed_dialog(self, message: str):
+        log_path = str(self._updater.install_log_path) if self._updater else ""
+        self._present_update_dialog(
+            self._update_failed_dlg,
+            _UpdateFailedDialog(message, log_path=log_path),
+            assign=lambda dlg: setattr(self, "_update_failed_dlg", dlg),
+            on_finished=self._on_update_failed_finished,
+        )
+
+    def _on_update_failed_finished(self, _result: int):
+        self._update_failed_dlg = None
+
+    def _restore_update_ui_after_install_failure(self) -> None:
+        self._set_update_status("ready")
+        if self._updater.is_ready_to_install:
+            self._update_widget.set_ready()
+        elif self._updater.latest:
+            self._update_widget.set_found(self._updater.latest.version)
+        else:
+            self._update_widget.set_idle()
 
     def _on_update_ready_finished(self, result: int):
         dlg = self._update_ready_dlg
@@ -1791,21 +1821,11 @@ class VoiceTray(QSystemTrayIcon):
                 and result == QDialog.DialogCode.Accepted
                 and dlg.restart_now):
             if not self._updater.install_ready(dlg.version, quit_fn=self._quit):
-                logger.info(
-                    f"[Updater] Ready dialog expired for v{dlg.version}; "
-                    "showing latest update state"
-                )
-                self.show_tray_message(
-                    "VoiceInput",
-                    "已下载的更新已过期，请下载最新版本",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    3000,
-                )
-                self._set_update_status("idle")
-                if self._updater.latest:
-                    self._update_widget.set_found(self._updater.latest.version)
-                else:
-                    self._update_widget.set_idle()
+                error = self._updater.last_install_error or ""
+                logger.info(f"[Updater] Install aborted in UI: {error}")
+                self._restore_update_ui_after_install_failure()
+                self._show_update_failed_dialog(error)
+                return
 
     def _on_update_available(self, info: UpdateInfo):
         logger.debug(f"[DEBUG] _on_update_available | remote={info.version}")

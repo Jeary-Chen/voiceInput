@@ -162,6 +162,46 @@ class _UpdateReadyDialog(QDialog):
         self.accept()
 
 
+class _UpdateFailedDialog(QDialog):
+    """Shows the install/update failure reason reported by UpdateChecker."""
+
+    def __init__(self, message: str, log_path: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("更新失败")
+        self.setWindowIcon(icons.app_icon())
+        self.setFixedSize(480, 280)
+        apply_dialog_chrome(self)
+
+        root = create_dialog_root_layout(self, spacing=12)
+
+        title = QLabel("更新未能完成")
+        title.setStyleSheet(_DIALOG_TITLE_QSS)
+        root.addWidget(title)
+
+        body = QTextBrowser()
+        body.setReadOnly(True)
+        apply_dialog_scroll_area(body, _DIALOG_TEXTEDIT_QSS)
+        body.setPlainText(message.strip() or "未知错误")
+        root.addWidget(body, 1)
+
+        hints = ["安装过程未启动，当前版本仍在运行，可稍后重试。"]
+        if log_path:
+            hints.append(f"详细日志：{log_path}")
+        hint = QLabel("\n".join(hints))
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_DIALOG_HINT_QSS)
+        root.addWidget(hint)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        btn_ok = QPushButton("知道了")
+        btn_ok.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_ok.setStyleSheet(_DIALOG_BTN_PRIMARY)
+        btn_ok.clicked.connect(self.accept)
+        row.addWidget(btn_ok)
+        root.addLayout(row)
+
+
 class _MenuLabel(QLabel):
     """QLabel styled as a menu item with hover highlight, for QWidgetAction."""
 
