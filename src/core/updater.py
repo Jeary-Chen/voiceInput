@@ -18,6 +18,7 @@ from typing import NamedTuple
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer
 
 from _version import VERSION
+from core.app_paths import install_root, installed_exe_path
 from core.log import logger
 from core.network import open_update_url
 
@@ -193,11 +194,8 @@ def can_self_update() -> bool:
     src/.  PyInstaller onefile extracts to a temp dir (_MEIPASS), and dev-mode
     (run.ps1 / .venv) has no VoiceInput.exe — neither can self-update.
     """
-    if getattr(sys, "_MEIPASS", None):
-        return False
     try:
-        app_dir = Path(__file__).resolve().parent.parent.parent
-        return (app_dir / "VoiceInput.exe").is_file()
+        return installed_exe_path() is not None
     except Exception:
         return False
 
@@ -209,7 +207,7 @@ def _is_installed_version() -> bool:
     False for embedded-Python builds) against known install paths.
     """
     try:
-        code_dir = Path(__file__).resolve().parent.parent.parent
+        code_dir = install_root()
     except Exception:
         return False
     install_bases = []
@@ -679,8 +677,10 @@ class UpdateChecker:
         if not staged.exists():
             self._staged = None
             return self._fail_install(f"更新暂存目录不存在: {staged}")
-        app_dir = Path(__file__).resolve().parent.parent.parent
-        exe_path = app_dir / "VoiceInput.exe"
+        app_dir = install_root()
+        exe_path = installed_exe_path()
+        if exe_path is None:
+            return self._fail_install("当前运行方式无法确定安装目录")
         source = staged_update.source_dir
         old_pid = os.getpid()
         target_version = staged_update.version

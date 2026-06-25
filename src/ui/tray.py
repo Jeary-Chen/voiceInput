@@ -22,6 +22,12 @@ from core.engine import VoiceEngine
 from core.config_sync import ConfigSync
 from core.faults import FaultKind
 from core.input_devices import InputDeviceSnapshot
+from core.autostart import (
+    AutostartWatcher,
+    read_enabled as read_autostart_enabled,
+    write_enabled as write_autostart_enabled,
+)
+from core.app_paths import autostart_command
 from core.updater import UpdateChecker, UpdateInfo, can_self_update
 from core.polisher import DEFAULT_INSTRUCTIONS
 from ui.mini_window import MiniRecordingWindow
@@ -43,10 +49,6 @@ if TYPE_CHECKING:
 _T_modal = TypeVar("_T_modal")
 
 
-_AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_AUTOSTART_VALUE_NAME = "VoiceInput"
-
-
 _TRAY_MENU_DEFAULT_DEVICE = "__tray_default_device__"
 _TRAY_MENU_DEFAULT_PROMPT = "__tray_default_prompt__"
 _DEVICE_CHANGE_DEBOUNCE_MS = 500
@@ -55,6 +57,18 @@ _DEVICE_STORM_EVENT_LIMIT = 4
 _DEVICE_STORM_QUIET_SEC = 2.0
 _RECORDABLE_RETRY_DELAYS_MS = (1000, 2000, 4000)
 _NO_DEVICE_CHANGE = object()
+_AUTOSTART_CONFIG_ECHO_MS = 500
+
+# (config field, QAction attribute on VoiceTray)
+_TRAY_BOOL_MENU_ACTIONS = (
+    ("silence_trim", "_act_silence_trim"),
+    ("show_countdown", "_act_show_countdown"),
+    ("paste_result", "_act_paste_result"),
+    ("show_result_text", "_act_show_result_text"),
+    ("mini_bar_show_timer", "_act_mini_bar_timer"),
+    ("hide_mini_window_when_idle", "_act_hide_idle_mini"),
+    ("save_audio", "_act_save_audio"),
+)
 
 
 def _set_action_checked(action: QAction, checked: bool) -> None:
@@ -285,8 +299,16 @@ class VoiceTray(QSystemTrayIcon):
         self._recordable_retry = _RecordableProbeRetry(self._retry_input_recordable_probe)
         self._input_rescan_needs_portaudio_reset = False
         self._output_reopen_after_device_rescan = False
-        self._sync_autostart_state(save_if_changed=True)
+        self._ignore_autostart_config_echo = False
+        self._sync_autostart_state()
         self.refresh_idle_icon()
+
+        self._autostart_watcher = AutostartWatcher(self)
+        self._autostart_watcher.changed.connect(
+            self._sync_autostart_state,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._autostart_watcher.start()
 
         self._build_menu()
 
@@ -410,7 +432,6 @@ class VoiceTray(QSystemTrayIcon):
         self._prompt_menu = QMenu("自定义提示词", menu)
         apply_tray_menu_style(self._prompt_menu)
         install_left_cascade_submenu(self._prompt_menu, menu)
-        self._prompt_menu.aboutToShow.connect(self._sync_prompt_menu_checks)
         menu.addMenu(self._prompt_menu)
 
         # ── 录音参数 ──
@@ -576,6 +597,7 @@ class VoiceTray(QSystemTrayIcon):
         return time.monotonic() < self._device_storm_until
 
     def _on_menu_about_to_show(self):
+        self._sync_config_backed_menu_checks()
         now = time.monotonic()
         if now - self._last_menu_refresh_time < self._menu_refresh_min_interval:
             return
@@ -1065,9 +1087,26 @@ class VoiceTray(QSystemTrayIcon):
         self._sync_mode_menu()
 
     def _on_mini_show_result_changed(self, on: bool):
-        self._act_show_result_text.blockSignals(True)
-        self._act_show_result_text.setChecked(on)
-        self._act_show_result_text.blockSignals(False)
+        _set_action_checked(self._act_show_result_text, on)
+
+    def _sync_config_backed_menu_checks(self) -> None:
+        """Refresh checkable menu state in place; never rebuild submenus here."""
+        self._sync_autostart_state()
+        self._sync_mode_menu()
+        self._sync_polish_model_menu_checks()
+        self._sync_duration_menu()
+        self._sync_prompt_menu_checks()
+        if self._dev_refresh_ready and not self._dev_menu_dirty:
+            self._sync_device_menu_checks()
+        self._sync_bool_config_actions()
+
+    def _sync_bool_config_actions(self, changed: set[str] | None = None) -> None:
+        for field, attr in _TRAY_BOOL_MENU_ACTIONS:
+            if changed is not None and field not in changed:
+                continue
+            action = getattr(self, attr, None)
+            if action is not None:
+                _set_action_checked(action, getattr(self._config, field))
 
     def _sync_mode_menu(self):
         _sync_checkable_actions(self._mode_menu.actions(), self._config.mode)
@@ -1128,13 +1167,14 @@ class VoiceTray(QSystemTrayIcon):
             self._prompt_dlg.raise_()
             self._prompt_dlg.activateWindow()
             return
+        self._prompt_menu_rebuilt = False
         dlg = _PolishPromptDialog(
             self._config.custom_prompts,
             self._config.active_prompt_id,
             default_text=DEFAULT_INSTRUCTIONS,
             config=self._config,
             on_active_applied=self._sync_prompt_menu_checks,
-            on_prompts_saved=self._rebuild_prompt_menu,
+            on_prompts_saved=self._on_prompts_menu_rebuilt,
             run_modal_with_hotkey_paused=self.run_modal_with_hotkey_paused,
         )
         dlg.setWindowModality(Qt.WindowModality.NonModal)
@@ -1146,13 +1186,18 @@ class VoiceTray(QSystemTrayIcon):
         dlg.raise_()
         dlg.activateWindow()
 
+    def _on_prompts_menu_rebuilt(self):
+        self._prompt_menu_rebuilt = True
+        self._rebuild_prompt_menu()
+
     def _on_prompt_dlg_finished(self, _result: int):
         # Prompt list is persisted from _PolishPromptDialog._do_save; active_prompt_id
         # may also be updated immediately via「设为当前」.
         # Do not copy dlg state here: dlg.accepted stayed True after a prior save and would
         # re-apply unsaved edits when the user chose「不保存」on close.
         self._prompt_dlg = None
-        self._rebuild_prompt_menu()
+        if not getattr(self, "_prompt_menu_rebuilt", False):
+            self._sync_prompt_menu_checks()
 
     def _menu_parent(self):
         """Parent for modal dialogs so they stay above the tray context."""
@@ -1416,73 +1461,34 @@ class VoiceTray(QSystemTrayIcon):
         self._mini.sync_show_result()
         logger.info(f"[Tray] Show result text → {'on' if checked else 'off'}")
 
-    def _sync_autostart_state(self, save_if_changed: bool = False):
-        actual = self._read_autostart_enabled()
-        changed = self._config.autostart_enabled != actual
-        self._config.autostart_enabled = actual
-        if save_if_changed and changed:
-            self._config.save()
-        if hasattr(self, "_act_autostart"):
-            self._act_autostart.blockSignals(True)
-            self._act_autostart.setChecked(actual)
-            self._act_autostart.blockSignals(False)
+    def _clear_autostart_config_echo(self) -> None:
+        self._ignore_autostart_config_echo = False
 
-    def _read_autostart_enabled(self) -> bool:
-        if sys.platform != "win32":
-            return False
-        try:
-            import winreg
-            with winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                _AUTOSTART_RUN_KEY,
-                0,
-                winreg.KEY_QUERY_VALUE,
-            ) as key:
-                value, _ = winreg.QueryValueEx(key, _AUTOSTART_VALUE_NAME)
-            return bool(str(value).strip())
-        except FileNotFoundError:
-            return False
-        except OSError:
-            return False
+    def _sync_autostart_state(self):
+        """Align config + menu with Windows Run/StartupApproved (source of truth)."""
+        actual = read_autostart_enabled()
+        if self._config.autostart_enabled != actual:
+            self._config.autostart_enabled = actual
+            self._ignore_autostart_config_echo = True
+            try:
+                self._config.save(touched=frozenset({"autostart_enabled"}))
+            finally:
+                QTimer.singleShot(
+                    _AUTOSTART_CONFIG_ECHO_MS,
+                    self._clear_autostart_config_echo,
+                )
+        if hasattr(self, "_act_autostart"):
+            _set_action_checked(self._act_autostart, actual)
 
     def _resolve_autostart_command(self) -> str | None:
-        src_dir = os.path.dirname(os.path.abspath(__file__))
-        app_root = os.path.dirname(src_dir)
-        if os.path.basename(app_root).lower() == "src":
-            app_root = os.path.dirname(app_root)
-        exe = os.path.join(app_root, "VoiceInput.exe")
-        if not os.path.isfile(exe):
-            return None
-        return f'"{exe}"'
-
-    def _write_autostart_enabled(self, enabled: bool):
-        if sys.platform != "win32":
-            raise RuntimeError("当前平台不支持开机自启")
-
-        import winreg
-
-        if enabled:
-            command = self._resolve_autostart_command()
-            if not command:
-                raise RuntimeError("当前运行方式无法确定启动命令，请使用安装包版本后再设置")
-            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_RUN_KEY) as key:
-                winreg.SetValueEx(key, _AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, command)
-            return
-
-        try:
-            with winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                _AUTOSTART_RUN_KEY,
-                0,
-                winreg.KEY_SET_VALUE,
-            ) as key:
-                winreg.DeleteValue(key, _AUTOSTART_VALUE_NAME)
-        except FileNotFoundError:
-            return
+        return autostart_command()
 
     def _toggle_autostart(self, checked: bool):
         try:
-            self._write_autostart_enabled(checked)
+            command = self._resolve_autostart_command() if checked else ""
+            if checked and not command:
+                raise RuntimeError("当前运行方式无法确定启动命令，请使用安装包版本后再设置")
+            write_autostart_enabled(checked, command)
         except Exception as e:
             logger.warning(f"[Tray] Autostart toggle failed: {e}")
             self.show_tray_message(
@@ -1494,8 +1500,8 @@ class VoiceTray(QSystemTrayIcon):
             self._sync_autostart_state()
             return
 
-        self._config.autostart_enabled = checked
-        self._config.save()
+        self._sync_autostart_state()
+        self._autostart_watcher.mark_current()
         logger.info(f"[Tray] Autostart → {'on' if checked else 'off'}")
 
     def _set_default_device(self):
@@ -1600,11 +1606,18 @@ class VoiceTray(QSystemTrayIcon):
         if "mode" in changed:
             self._sync_mode_menu()
 
-        if changed & {"polish_model", "polish_models", "enabled_polish_models"}:
+        if changed & {"polish_models", "enabled_polish_models"}:
             self._populate_polish_menu()
+        elif "polish_model" in changed:
+            self._sync_polish_model_menu_checks()
 
-        if changed & {"custom_prompts", "active_prompt_id"}:
+        if "custom_prompts" in changed:
             self._rebuild_prompt_menu()
+            dlg = self._prompt_dlg
+            if dlg is not None:
+                dlg.sync_from_config()
+        elif "active_prompt_id" in changed:
+            self._sync_prompt_menu_checks()
             dlg = self._prompt_dlg
             if dlg is not None:
                 dlg.sync_from_config()
@@ -1612,20 +1625,9 @@ class VoiceTray(QSystemTrayIcon):
         if "smart_chunk_max_duration_sec" in changed:
             self._sync_duration_menu()
 
-        for field, action in (
-            ("silence_trim", self._act_silence_trim),
-            ("show_countdown", self._act_show_countdown),
-            ("paste_result", self._act_paste_result),
-            ("show_result_text", self._act_show_result_text),
-            ("mini_bar_show_timer", self._act_mini_bar_timer),
-            ("hide_mini_window_when_idle", self._act_hide_idle_mini),
-            ("save_audio", self._act_save_audio),
-        ):
-            if field in changed:
-                if action is not None:
-                    _set_action_checked(action, getattr(self._config, field))
+        self._sync_bool_config_actions(changed)
 
-        if "autostart_enabled" in changed:
+        if "autostart_enabled" in changed and not self._ignore_autostart_config_echo:
             self._sync_autostart_state()
 
         if "play_sounds" in changed:
@@ -1634,14 +1636,8 @@ class VoiceTray(QSystemTrayIcon):
         if "api_key" in changed and self._faults is not None:
             self._faults.sync_credential_from_config()
 
-        if "hotkey" in changed:
-            self._act_hotkey.setText(
-                f"快捷键: {_hotkey_display(self._config.hotkey)}"
-            )
-
         if changed & {"mic_name", "mic_index"}:
-            self._dev_menu_dirty = True
-            if self._dev_refresh_ready:
+            if self._dev_refresh_ready and not self._dev_menu_dirty:
                 self._sync_device_menu_checks()
 
         if "tray_click_to_record" in changed:
@@ -2051,6 +2047,7 @@ class VoiceTray(QSystemTrayIcon):
         if self._engine.state == "recording":
             self._engine.cancel()
         self._device_watcher.stop()
+        self._autostart_watcher.stop()
         self._device_change_timer.stop()
         self._recordable_retry.stop()
         self._recorder_prepare_timer.stop()

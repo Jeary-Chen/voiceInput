@@ -188,9 +188,20 @@ do_publish() {
 do_rollback() {
     cd "$PROJECT_DIR"
     log_info "回滚发布文件..."
-    [[ -f "README.md" ]] && rm -f "README.md" && log_step "已删除 README.md"
-    [[ -f "LICENSE" ]]   && rm -f "LICENSE"   && log_step "已删除 LICENSE"
-    [[ -d "docs" ]]      && rm -rf "docs"     && log_step "已删除 docs/"
+    if [[ -d ".git" ]]; then
+        if git restore README.md LICENSE docs/ 2>/dev/null; then
+            log_step "已 git restore README.md LICENSE docs/"
+        else
+            log_warn "git restore 失败，尝试删除发布副本..."
+            [[ -f "README.md" ]] && rm -f "README.md" && log_step "已删除 README.md"
+            [[ -f "LICENSE" ]]   && rm -f "LICENSE"   && log_step "已删除 LICENSE"
+            [[ -d "docs" ]]      && rm -rf "docs"     && log_step "已删除 docs/"
+        fi
+    else
+        [[ -f "README.md" ]] && rm -f "README.md" && log_step "已删除 README.md"
+        [[ -f "LICENSE" ]]   && rm -f "LICENSE"   && log_step "已删除 LICENSE"
+        [[ -d "docs" ]]      && rm -rf "docs"     && log_step "已删除 docs/"
+    fi
     echo ""
     log_ok "已回滚"
 }

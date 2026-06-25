@@ -215,9 +215,22 @@ function Invoke-Rollback {
     Push-Location $ProjectDir
     try {
         Log-Info "回滚发布文件..."
-        if (Test-Path "README.md")  { Remove-Item "README.md" -Force;          Log-Step "已删除 README.md" }
-        if (Test-Path "LICENSE")    { Remove-Item "LICENSE" -Force;             Log-Step "已删除 LICENSE" }
-        if (Test-Path "docs")      { Remove-Item "docs" -Recurse -Force;       Log-Step "已删除 docs\" }
+        $gitDir = Join-Path $ProjectDir ".git"
+        if (Test-Path $gitDir) {
+            git -C $ProjectDir restore README.md LICENSE docs/ 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                Log-Step "已 git restore README.md LICENSE docs/"
+            } else {
+                Log-Warn "git restore 失败，尝试删除发布副本..."
+                if (Test-Path "README.md") { Remove-Item "README.md" -Force; Log-Step "已删除 README.md" }
+                if (Test-Path "LICENSE")   { Remove-Item "LICENSE" -Force;   Log-Step "已删除 LICENSE" }
+                if (Test-Path "docs")      { Remove-Item "docs" -Recurse -Force; Log-Step "已删除 docs\" }
+            }
+        } else {
+            if (Test-Path "README.md") { Remove-Item "README.md" -Force; Log-Step "已删除 README.md" }
+            if (Test-Path "LICENSE")   { Remove-Item "LICENSE" -Force;   Log-Step "已删除 LICENSE" }
+            if (Test-Path "docs")      { Remove-Item "docs" -Recurse -Force; Log-Step "已删除 docs\" }
+        }
         Write-Host ""
         Log-Ok "已回滚"
     }
