@@ -596,6 +596,15 @@ class UpdateChecker:
     def is_staging(self) -> bool:
         return self._stage_worker is not None and self._stage_worker.isRunning()
 
+    def background_workers(self) -> list[tuple[str, QThread]]:
+        """Live updater threads that quit must wait for (or declare stuck)."""
+        pairs = (
+            ("update check", self._check_worker),
+            ("update download", self._dl_worker),
+            ("update staging", self._stage_worker),
+        )
+        return [(label, worker) for label, worker in pairs if worker is not None]
+
     @property
     def is_ready_to_install(self) -> bool:
         return self._staged is not None and self._staged.staging_dir.exists()

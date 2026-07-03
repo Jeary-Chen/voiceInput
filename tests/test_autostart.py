@@ -25,7 +25,7 @@ class AutostartWatcherTests(unittest.TestCase):
         watcher = autostart.AutostartWatcher()
         watcher._last = False
         seen = []
-        watcher.changed.connect(seen.append)
+        watcher.changed.connect(lambda: seen.append(True))
         watcher._on_registry_changed()
         self.assertEqual(len(seen), 1)
         watcher.stop()

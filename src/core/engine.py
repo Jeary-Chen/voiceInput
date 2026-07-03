@@ -361,22 +361,22 @@ class VoiceEngine(QObject):
                 model=cfg.polish_model,
                 base_url=cfg.api_base_url,
             )
-        if changed & {"mic_name", "mic_index"} and self.state != "recording":
-            self.apply_mic_device()
+        # Mic fields are intentionally not handled here: the tray routes them
+        # through its background prepare worker (_schedule_recorder_device_apply)
+        # because applying a device enters native PortAudio and must stay off
+        # the GUI thread.
 
-    def apply_mic_device(self) -> None:
-        cfg = self.config
-        resolved = None
-        if cfg.mic_name:
-            resolved = VoiceRecorder.resolve_device(cfg.mic_name, cfg.mic_index)
-            if resolved != cfg.mic_index:
-                cfg.mic_index = resolved
-                cfg.save(touched=frozenset({"mic_index"}))
-        self.recorder.set_device(resolved, cfg.mic_name or "")
-        logger.info(
-            f"{_TAG} Mic device applied (name={cfg.mic_name or 'system default'}, "
-            f"index={resolved})"
+    def background_workers(self) -> list[tuple[str, QThread]]:
+        """Live pipeline threads that quit must wait for (or declare stuck)."""
+        pairs = (
+            ("audio pipeline", self._worker),
+            ("file load", self._file_worker),
+            ("polish", self._polish_worker),
+            ("recorder start", self._start_worker),
+            ("recorder stop", self._stop_worker),
+            ("finalize", self._finalize_worker),
         )
+        return [(label, worker) for label, worker in pairs if worker is not None]
 
     @property
     def state(self) -> str:

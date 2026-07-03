@@ -1227,17 +1227,18 @@ class VoiceTray(QSystemTrayIcon):
         self._hotkey_hold_active = False
         self._mini.stop_hotkey_hold()
 
-    def _stop_hotkey_listener(self) -> None:
+    def _stop_hotkey_listener(self) -> bool:
         """停止全局 ComboHotkeyThread 并等待 pynput 钩子退出。"""
         self._clear_hotkey_hold_state()
         self._hotkey.stop_hotkey()
         if self._hotkey.wait(2000):
             logger.info("[Hotkey] Listener stopped")
-        else:
-            logger.warning(
-                "[Hotkey] Listener thread did not exit within 2s — "
-                "old keyboard hook may linger"
-            )
+            return True
+        logger.warning(
+            "[Hotkey] Listener thread did not exit within 2s — "
+            "old keyboard hook may linger"
+        )
+        return False
 
     def _spawn_hotkey_thread(self, combo: str | None = None) -> None:
         """新建并启动 ComboHotkeyThread（替换 self._hotkey）。调用前应已 stop_hotkey_listener。"""
@@ -2066,26 +2067,28 @@ class VoiceTray(QSystemTrayIcon):
         self._device_change_timer.stop()
         self._recordable_retry.stop()
         self._recorder_prepare_timer.stop()
-        self._stop_hotkey_listener()
 
-        # Graceful path: let background workers finish so PortAudio tears down
-        # cleanly, then release the audio clients.  On a healthy machine both
-        # complete in well under a second and quit stays fully graceful.
+        # Graceful path: stop the hotkey hook, let background workers finish so
+        # PortAudio tears down cleanly, then release the audio clients.  On a
+        # healthy machine all three complete in well under a second and quit
+        # stays fully graceful.
+        hotkey_done = self._stop_hotkey_listener()
         workers_done = self._wait_for_background_workers()
         release_done = self._release_audio_bounded(_QUIT_RELEASE_WAIT_SEC)
 
-        if workers_done and release_done:
+        if hotkey_done and workers_done and release_done:
             QApplication.quit()
             return
 
-        # Last resort: a thread is stuck in an uninterruptible native audio
-        # call (wedged audio subsystem).  Qt cannot shut down while a QThread
-        # is still running, and waiting forever is what previously forced
-        # users to kill the process.  End the process cleanly instead; the OS
-        # reclaims the audio handles.
+        # Last resort: a thread is stuck in an uninterruptible native call
+        # (wedged audio subsystem or keyboard hook).  Qt cannot shut down while
+        # a QThread is still running, and waiting forever is what previously
+        # forced users to kill the process.  End the process cleanly instead;
+        # the OS reclaims the handles.
         logger.warning(
-            "[Tray] Audio subsystem unresponsive during quit "
-            f"(workers_done={workers_done}, release_done={release_done}); forcing exit"
+            "[Tray] Background threads unresponsive during quit "
+            f"(hotkey_done={hotkey_done}, workers_done={workers_done}, "
+            f"release_done={release_done}); forcing exit"
         )
         flush_log()
         os._exit(0)
@@ -2125,7 +2128,28 @@ class VoiceTray(QSystemTrayIcon):
         ok = self._wait_for_worker(self._recorder_prepare_worker, "recorder prepare", deadline)
         for worker in list(getattr(self, "_dev_refresh_workers", [])):
             ok = self._wait_for_worker(worker, "device refresh", deadline) and ok
+        # Engine pipeline threads (ASR/polish/finalize/…) and updater threads —
+        # letting them finish keeps in-flight results intact and avoids tearing
+        # down Qt while one of its QThreads is still alive.
+        for label, worker in self._engine.background_workers():
+            ok = self._wait_for_owned_worker(worker, label, deadline) and ok
+        if self._updater is not None:
+            for label, worker in self._updater.background_workers():
+                ok = self._wait_for_owned_worker(worker, label, deadline) and ok
         return ok
+
+    @staticmethod
+    def _wait_for_owned_worker(worker, label: str, deadline: float) -> bool:
+        # The owning component handles cleanup (finished → deleteLater), so only
+        # wait here — no forget/disconnect bookkeeping like tray-owned workers.
+        if not worker.isRunning():
+            return True
+        remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+        logger.info(f"[Tray] Waiting for {label} worker to finish")
+        if worker.wait(remaining_ms):
+            return True
+        logger.warning(f"[Tray] {label} worker still running during quit")
+        return False
 
     def _forget_background_worker(self, worker) -> None:
         if worker is None:
