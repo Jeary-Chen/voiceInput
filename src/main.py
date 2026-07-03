@@ -6,6 +6,13 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from core.platform_guard import apply_wmi_hang_guard
+
+# Must run before importing any library that calls platform.system()/uname() at
+# import time (e.g. aiohttp via dashscope): on Python 3.12 those go through WMI,
+# which hangs forever if the WMI service is wedged. See core/platform_guard.py.
+apply_wmi_hang_guard()
+
 from core.network import configure_direct_business_traffic
 
 # Ctrl+C 直接终止进程，不抛 KeyboardInterrupt 到随机线程
