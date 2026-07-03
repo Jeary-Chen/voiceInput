@@ -287,6 +287,11 @@ class AudioDeviceWatcher:
         self._enumerator = None
         self._client = None
 
+    @property
+    def is_listening(self) -> bool:
+        """True while device-change notifications are registered."""
+        return self._enumerator is not None
+
     def start(self):
         if self._enumerator is not None:
             return

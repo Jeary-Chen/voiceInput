@@ -522,6 +522,42 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             [("reset", "audio device changed"), "audio_reset", "enumerate"],
         )
 
+    def _menu_show_tray(self, *, watcher_listening: bool):
+        from ui.tray import VoiceTray
+
+        refreshes = []
+        tray = SimpleNamespace(
+            _sync_config_backed_menu_checks=lambda: None,
+            _device_watcher=SimpleNamespace(is_listening=watcher_listening),
+            _menu_refresh_min_interval=10.0,
+            _last_menu_refresh_time=0.0,
+            _start_async_refresh=lambda: refreshes.append(True),
+        )
+        tray._on_menu_about_to_show = (
+            lambda: VoiceTray._on_menu_about_to_show(tray)
+        )
+        return tray, refreshes
+
+    def test_menu_open_never_enumerates_while_watcher_listening(self):
+        # Regression: opening the tray menu used to trigger a device refresh
+        # whose open-probe flipped Bluetooth headsets into HFP/duplex mode.
+        tray, refreshes = self._menu_show_tray(watcher_listening=True)
+
+        tray._on_menu_about_to_show()
+        tray._on_menu_about_to_show()
+
+        self.assertEqual(refreshes, [])
+
+    def test_menu_open_polls_when_watcher_registration_failed(self):
+        tray, refreshes = self._menu_show_tray(watcher_listening=False)
+
+        tray._on_menu_about_to_show()
+        self.assertEqual(refreshes, [True])
+
+        # Immediately reopening stays throttled by the 10s minimum interval.
+        tray._on_menu_about_to_show()
+        self.assertEqual(refreshes, [True])
+
     def test_refresh_during_storm_only_updates_menu_cache(self):
         from ui.tray import VoiceTray
 

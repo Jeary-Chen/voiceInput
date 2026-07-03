@@ -633,6 +633,14 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_menu_about_to_show(self):
         self._sync_config_backed_menu_checks()
+        # Device-change notifications (hot-plug, default switch, state change)
+        # already drive refreshes, so opening the menu must not enumerate:
+        # the enumeration open-probe briefly opens every capture endpoint,
+        # which flips Bluetooth headsets into their HFP/duplex profile and
+        # audibly degrades playback while the menu is open.
+        if self._device_watcher.is_listening:
+            return
+        # Fallback: notification registration failed — poll on menu open.
         now = time.monotonic()
         if now - self._last_menu_refresh_time < self._menu_refresh_min_interval:
             return
