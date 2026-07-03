@@ -302,15 +302,14 @@ class VoiceEngine(QObject):
         super().__init__()
         self.config = config
 
-        resolved = None
-        if config.mic_name:
-            resolved = VoiceRecorder.resolve_device(config.mic_name, config.mic_index)
-            if resolved != config.mic_index:
-                config.mic_index = resolved
-                config.save(touched=frozenset({"mic_index"}))
-
+        # No native PortAudio calls here: device resolution and mic warm-up can
+        # block for tens of seconds when the audio subsystem is wedged, so they
+        # run in the tray's background prepare worker (and on demand in
+        # recorder.start()).  prepare() re-resolves the saved name to a current
+        # index, and the first device refresh persists any index drift back to
+        # config, so passing the possibly stale saved index is safe.
+        resolved = config.mic_index if config.mic_name else None
         self.recorder = VoiceRecorder(device_index=resolved, preferred_name=config.mic_name)
-        self.recorder.prepare()
         self.asr = DashScopeASR(
             api_key=config.api_key,
             model=config.asr_model,

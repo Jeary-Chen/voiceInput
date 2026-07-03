@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 import time
@@ -17,7 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from config import Config, enabled_polish_model_menu_items
-from core.log import logger, log_event
+from core.log import logger, log_event, flush_log
 from core.engine import VoiceEngine
 from core.config_sync import ConfigSync
 from core.faults import FaultKind
@@ -56,6 +57,11 @@ _DEVICE_STORM_WINDOW_SEC = 4.0
 _DEVICE_STORM_EVENT_LIMIT = 4
 _DEVICE_STORM_QUIET_SEC = 2.0
 _RECORDABLE_RETRY_DELAYS_MS = (1000, 2000, 4000)
+# Shutdown budgets: total grace for background workers to finish cleanly, then
+# for the PortAudio release helper thread.  Both waits return almost instantly
+# on a healthy machine; the budgets only matter when native audio is wedged.
+_QUIT_WORKER_WAIT_MS = 3000
+_QUIT_RELEASE_WAIT_SEC = 2.0
 _NO_DEVICE_CHANGE = object()
 _AUTOSTART_CONFIG_ECHO_MS = 500
 
@@ -335,6 +341,11 @@ class VoiceTray(QSystemTrayIcon):
         self._autostart_watcher.start()
 
         self._build_menu()
+
+        # Cold-start mic warm-up, off the GUI thread (a wedged audio subsystem
+        # once stalled prepare() for 42s).  Using the prepare worker also lets
+        # an early hotkey press queue recording until warm-up completes.
+        self._start_recorder_prepare_worker(**self._recorder_prepare_target())
 
         if config.tray_click_to_record:
             self.activated.connect(self._on_activated)
@@ -2047,6 +2058,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _quit(self):
         logger.info("[Tray] Quit requested")
+        self.hide()  # drop the tray icon right away so quitting feels instant
         if self._engine.state == "recording":
             self._engine.cancel()
         self._device_watcher.stop()
@@ -2054,19 +2066,65 @@ class VoiceTray(QSystemTrayIcon):
         self._device_change_timer.stop()
         self._recordable_retry.stop()
         self._recorder_prepare_timer.stop()
-        if not self._wait_for_background_workers():
-            logger.warning("[Tray] Quit deferred until background workers finish")
-            QTimer.singleShot(500, self._quit)
-            return
-        self._audio.release()
-        self._engine.recorder.release()
         self._stop_hotkey_listener()
-        QApplication.quit()
 
-    def _wait_for_background_workers(self) -> bool:
-        ok = self._wait_for_worker(self._recorder_prepare_worker, "recorder prepare")
+        # Graceful path: let background workers finish so PortAudio tears down
+        # cleanly, then release the audio clients.  On a healthy machine both
+        # complete in well under a second and quit stays fully graceful.
+        workers_done = self._wait_for_background_workers()
+        release_done = self._release_audio_bounded(_QUIT_RELEASE_WAIT_SEC)
+
+        if workers_done and release_done:
+            QApplication.quit()
+            return
+
+        # Last resort: a thread is stuck in an uninterruptible native audio
+        # call (wedged audio subsystem).  Qt cannot shut down while a QThread
+        # is still running, and waiting forever is what previously forced
+        # users to kill the process.  End the process cleanly instead; the OS
+        # reclaims the audio handles.
+        logger.warning(
+            "[Tray] Audio subsystem unresponsive during quit "
+            f"(workers_done={workers_done}, release_done={release_done}); forcing exit"
+        )
+        flush_log()
+        os._exit(0)
+
+    def _release_audio_bounded(self, timeout_sec: float) -> bool:
+        """Release PortAudio clients from a helper thread with a deadline.
+
+        release() blocks on the recorder lifecycle lock and on native PortAudio
+        teardown; either can hang indefinitely when the audio subsystem is
+        wedged.  Running it off the GUI thread keeps quit bounded — on timeout
+        the daemon thread is abandoned and the OS reclaims the handles at
+        process exit.
+        """
+        done = threading.Event()
+
+        def _release():
+            try:
+                self._audio.release()
+            except Exception:
+                logger.opt(exception=True).warning("[Tray] Output audio release failed")
+            try:
+                self._engine.recorder.release()
+            except Exception:
+                logger.opt(exception=True).warning("[Tray] Recorder release failed")
+            done.set()
+
+        threading.Thread(target=_release, name="QuitAudioRelease", daemon=True).start()
+        if done.wait(timeout_sec):
+            return True
+        logger.warning("[Tray] Audio release still blocked at quit deadline")
+        return False
+
+    def _wait_for_background_workers(self, budget_ms: int = _QUIT_WORKER_WAIT_MS) -> bool:
+        # Share one deadline across all workers so total quit latency is bounded
+        # even when several workers are pending.
+        deadline = time.monotonic() + budget_ms / 1000.0
+        ok = self._wait_for_worker(self._recorder_prepare_worker, "recorder prepare", deadline)
         for worker in list(getattr(self, "_dev_refresh_workers", [])):
-            ok = self._wait_for_worker(worker, "device refresh") and ok
+            ok = self._wait_for_worker(worker, "device refresh", deadline) and ok
         return ok
 
     def _forget_background_worker(self, worker) -> None:
@@ -2099,14 +2157,15 @@ class VoiceTray(QSystemTrayIcon):
         except (TypeError, RuntimeError):
             pass
 
-    def _wait_for_worker(self, worker, label: str, timeout_ms: int = 2500) -> bool:
+    def _wait_for_worker(self, worker, label: str, deadline: float) -> bool:
         if worker is None:
             return True
         is_running = getattr(worker, "isRunning", None)
         wait = getattr(worker, "wait", None)
         if is_running is not None and wait is not None and is_running():
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
             logger.info(f"[Tray] Waiting for {label} worker to finish")
-            if not wait(timeout_ms):
+            if not wait(remaining_ms):
                 logger.warning(f"[Tray] {label} worker still running during quit")
                 return False
         self._forget_background_worker(worker)
