@@ -2,6 +2,7 @@ import sys
 import os
 import signal
 import ctypes
+import threading
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -111,10 +112,29 @@ class _ShutdownBridge(QObject):
     shutdown_requested = pyqtSignal()
 
 
+def _preload_business_sdks():
+    """Import the ASR/polish SDKs off the critical path.
+
+    dashscope/openai/httpx together cost ~0.7 s to import, so asr.py and
+    polisher.py defer them to first use.  Warming them here (after the tray is
+    visible) means the first recording doesn't pay the import cost either —
+    Python's import lock makes a concurrent first use simply wait, never fail.
+    """
+    def _load():
+        try:
+            import dashscope  # noqa: F401
+            import httpx  # noqa: F401
+            import openai  # noqa: F401
+            logger.debug("[DEBUG] _preload_business_sdks | SDK imports warmed")
+        except Exception:
+            logger.opt(exception=True).warning("Business SDK preload failed")
+
+    threading.Thread(target=_load, name="SdkPreload", daemon=True).start()
+
+
 def _start_shutdown_watcher(quit_fn):
     """Background thread that waits for the shutdown event, then invokes quit on the main thread."""
     global _shutdown_bridge
-    import threading
 
     _shutdown_bridge = _ShutdownBridge()
     _shutdown_bridge.shutdown_requested.connect(quit_fn, Qt.ConnectionType.QueuedConnection)
@@ -191,6 +211,7 @@ def main():
     tray.reveal()
     mini.refresh_visibility()
     config_sync.start()
+    _preload_business_sdks()
 
     sys.exit(app.exec())
 

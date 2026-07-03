@@ -1,9 +1,6 @@
 """Text polisher — refines raw ASR output via OpenAI-compatible API."""
 import re
 
-import httpx
-from openai import OpenAI
-
 from core.log import logger
 from core.network import direct_business_network
 
@@ -53,12 +50,20 @@ def _to_compatible_url(base_url: str) -> str:
 
 
 class TextPolisher:
+    """The OpenAI client is built on demand (first polish / key update), not in
+    __init__: constructing it imports openai/httpx, which costs hundreds of
+    milliseconds and would otherwise delay startup before the tray icon
+    appears.  main() warms those imports in a background thread after UI is up.
+    """
+
     def __init__(self, api_key: str, model: str = "qwen3.6-flash",
                  base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"):
         self._model = model
         self._base_url = _to_compatible_url(base_url)
-        self._client: OpenAI | None = None
-        self.update_api_key(api_key)
+        self._api_key = (api_key or "").strip()
+        self._client = None
+        if not self._api_key:
+            logger.warning(f"{_TAG} API key not configured; client disabled")
         logger.info(f"{_TAG} Initialized (model={model}, url={self._base_url})")
 
     def _close_client(self):
@@ -71,23 +76,34 @@ class TextPolisher:
         finally:
             self._client = None
 
-    def update_api_key(self, api_key: str):
-        api_key = (api_key or "").strip()
-        self._close_client()
-        if not api_key:
-            logger.warning(f"{_TAG} API key not configured; client disabled")
+    def _ensure_client(self):
+        """Build the API client if a key is configured and none is live."""
+        if self._client is not None or not self._api_key:
             return
+        import httpx
+        from openai import OpenAI
+
         http_client = httpx.Client(trust_env=False)
         try:
             self._client = OpenAI(
-                api_key=api_key,
+                api_key=self._api_key,
                 base_url=self._base_url,
                 http_client=http_client,
             )
-            logger.info(f"{_TAG} API key updated")
+            logger.info(f"{_TAG} API client ready")
         except Exception as e:
             http_client.close()
             logger.error(f"{_TAG} API client init failed: {e}")
+
+    def update_api_key(self, api_key: str):
+        self._api_key = (api_key or "").strip()
+        self._close_client()
+        if not self._api_key:
+            logger.warning(f"{_TAG} API key not configured; client disabled")
+            return
+        self._ensure_client()
+        if self._client is not None:
+            logger.info(f"{_TAG} API key updated")
 
     def set_model(self, model: str):
         old = self._model
@@ -101,17 +117,14 @@ class TextPolisher:
         model: str | None = None,
         base_url: str | None = None,
     ) -> None:
-        base_changed = False
         if base_url is not None:
             new_base = _to_compatible_url(base_url)
             if new_base != self._base_url:
                 self._base_url = new_base
-                base_changed = True
+                # Rebuilt against the new base on next use.
+                self._close_client()
         if api_key is not None:
             self.update_api_key(api_key)
-        elif base_changed and self._client is not None:
-            current_key = getattr(self._client, "api_key", "") or ""
-            self.update_api_key(current_key)
         if model is not None:
             self.set_model(model)
 
@@ -119,6 +132,7 @@ class TextPolisher:
         """Returns (api_ok, text). api_ok is False only when the request raised."""
         if not raw_text.strip():
             return True, raw_text
+        self._ensure_client()
         if self._client is None:
             logger.warning(f"{_TAG} Skipped: API key not configured")
             return False, raw_text

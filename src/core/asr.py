@@ -3,8 +3,6 @@ import base64
 import io
 import wave
 
-import dashscope
-
 from core.log import logger
 from core.network import direct_business_network
 
@@ -12,13 +10,18 @@ _TAG = "[ASR]"
 
 
 class DashScopeASR:
-    """Batch ASR — records everything, then transcribes in one shot."""
+    """Batch ASR — records everything, then transcribes in one shot.
+
+    The dashscope SDK import is deferred to transcribe(): it costs hundreds of
+    milliseconds and would otherwise run before the tray icon appears.  main()
+    warms it in a background thread right after the UI is up.
+    """
 
     def __init__(self, api_key: str, model: str = "qwen3-asr-flash-2026-02-10",
                  base_url: str = "https://dashscope.aliyuncs.com/api/v1"):
         self.api_key = api_key
         self.model = model
-        dashscope.base_http_api_url = base_url
+        self.base_url = base_url
         logger.info(f"{_TAG} Initialized (model={model})")
 
     def update_settings(
@@ -33,11 +36,14 @@ class DashScopeASR:
         if model is not None:
             self.model = model
         if base_url is not None:
-            dashscope.base_http_api_url = base_url
+            self.base_url = base_url
         logger.info(f"{_TAG} Settings updated (model={self.model})")
 
     def transcribe(self, pcm_data: bytes,
                    sample_rate: int = 16000, channels: int = 1) -> str:
+        import dashscope
+        dashscope.base_http_api_url = self.base_url
+
         wav_buf = io.BytesIO()
         with wave.open(wav_buf, "wb") as wf:
             wf.setnchannels(channels)
