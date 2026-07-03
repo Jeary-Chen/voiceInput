@@ -239,6 +239,9 @@ class VoiceRecorder:
         asking PyAudio for the new device list.
         """
         with self._lifecycle_lock:
+            if self._recording:
+                logger.info(f"{_TAG} Skip PortAudio reset during active recording")
+                return False
             had_audio_client = self._pa is not None or self._stream is not None
             self._release_pa()
             self._prepared = False

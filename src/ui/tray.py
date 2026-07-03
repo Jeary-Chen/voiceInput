@@ -141,13 +141,37 @@ class _DeviceRefreshWorker(QThread):
     """Enumerate audio devices off the main thread."""
     result_ready = pyqtSignal(int, object)  # generation, InputDeviceSnapshot
 
-    def __init__(self, generation: int, *, open_probe: bool = True):
+    def __init__(
+        self,
+        generation: int,
+        *,
+        open_probe: bool = True,
+        recorder=None,
+        audio=None,
+    ):
         super().__init__()
         self._generation = generation
         self._open_probe = open_probe
+        # When provided, drop these PyAudio clients *before* enumerating so the
+        # probe sees the fresh process-wide device table.  Performed here (worker
+        # thread) instead of on the GUI thread so the tray/event loop never
+        # blocks inside native PortAudio teardown during audio-device churn.
+        self._recorder = recorder
+        self._audio = audio
 
     def run(self):
         from core.input_devices import get_input_device_snapshot
+
+        if self._recorder is not None:
+            try:
+                self._recorder.reset_portaudio("audio device changed")
+            except Exception:
+                logger.opt(exception=True).warning("[Tray] Input PortAudio reset failed")
+        if self._audio is not None:
+            try:
+                self._audio.reset_for_device_rescan()
+            except Exception:
+                logger.opt(exception=True).warning("[Tray] Output PortAudio reset failed")
 
         try:
             snapshot = get_input_device_snapshot(open_probe=self._open_probe)
@@ -604,24 +628,6 @@ class VoiceTray(QSystemTrayIcon):
         self._last_menu_refresh_time = now
         self._start_async_refresh()
 
-    def _reset_input_portaudio_before_rescan(self):
-        if not self._input_rescan_needs_portaudio_reset:
-            return
-        if self._engine.state == "recording":
-            return
-        self._input_rescan_needs_portaudio_reset = False
-        reset = getattr(self._engine.recorder, "reset_portaudio", None)
-        if reset is None:
-            return
-        changed = reset("audio device changed")
-        log_event(
-            "INFO",
-            "audio.input.portaudio.reset",
-            "Input PortAudio reset before device rescan",
-            changed=changed,
-            state=self._engine.state,
-        )
-
     def _retry_input_recordable_probe(self):
         self._input_rescan_needs_portaudio_reset = True
         self._start_async_refresh()
@@ -631,9 +637,12 @@ class VoiceTray(QSystemTrayIcon):
             self._dev_refresh_repeat = True
             return
         open_probe = self._engine.state != "recording"
-        if open_probe:
-            self._reset_input_portaudio_before_rescan()
-            self._reset_output_portaudio_before_rescan()
+        # Decide PortAudio resets on the GUI thread, but let the worker perform
+        # them (before enumerating) so native teardown never blocks the tray.
+        reset_input = open_probe and self._input_rescan_needs_portaudio_reset
+        reset_output = open_probe and self._output_reopen_after_device_rescan
+        if reset_input:
+            self._input_rescan_needs_portaudio_reset = False
         self._dev_refresh_running = True
         generation = self._device_change_generation
         self._active_refresh_generation = generation
@@ -644,26 +653,20 @@ class VoiceTray(QSystemTrayIcon):
             generation=generation,
             state=self._engine.state,
             open_probe=open_probe,
+            reset_input=reset_input,
+            reset_output=reset_output,
         )
-        worker = _DeviceRefreshWorker(generation, open_probe=open_probe)
+        worker = _DeviceRefreshWorker(
+            generation,
+            open_probe=open_probe,
+            recorder=self._engine.recorder if reset_input else None,
+            audio=self._audio if reset_output else None,
+        )
         worker.result_ready.connect(self._on_refresh_result)
         worker.finished.connect(self._on_device_refresh_worker_finished)
         self._dev_refresh_workers.append(worker)
         self._dev_refresh_worker = worker
         worker.start()
-
-    def _reset_output_portaudio_before_rescan(self):
-        if not self._output_reopen_after_device_rescan:
-            return
-        if self._engine.state == "recording":
-            return
-        self._audio.reset_for_device_rescan()
-        log_event(
-            "INFO",
-            "audio.output.portaudio.reset",
-            "Output PortAudio reset before device rescan",
-            state=self._engine.state,
-        )
 
     def _on_device_refresh_worker_finished(self):
         worker = self.sender() if hasattr(self, "sender") else None
