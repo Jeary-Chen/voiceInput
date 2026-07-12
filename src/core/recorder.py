@@ -361,25 +361,31 @@ class VoiceRecorder:
 
     def stop(self) -> bytes:
         with self._lifecycle_lock:
-            self._recording = False
+            # Stop the stream while _recording is still True: buffers the
+            # driver drains during Pa_StopStream belong to this take and
+            # must not be dropped (they carry the final spoken syllables).
             self._stop_stream()
+            self._recording = False
 
-            if not self._audio_chunks:
-                logger.warning(f"{_TAG} Stop: no audio chunks collected")
-                return b""
+            try:
+                if not self._audio_chunks:
+                    logger.warning(f"{_TAG} Stop: no audio chunks collected")
+                    return b""
 
-            pcm = b"".join(self._audio_chunks)
-            raw_duration = len(pcm) / (self._stream_rate * 2)
+                pcm = b"".join(self._audio_chunks)
+                raw_duration = len(pcm) / (self._stream_rate * 2)
 
-            if self._stream_rate != self.TARGET_RATE:
-                pcm = _resample(pcm, self._stream_rate, self.TARGET_RATE)
-                logger.debug(f"{_TAG} Resampled {self._stream_rate} → {self.TARGET_RATE} Hz")
+                if self._stream_rate != self.TARGET_RATE:
+                    pcm = _resample(pcm, self._stream_rate, self.TARGET_RATE)
+                    logger.debug(f"{_TAG} Resampled {self._stream_rate} → {self.TARGET_RATE} Hz")
 
-            duration = len(pcm) / (self.TARGET_RATE * 2)
-            logger.info(f"{_TAG} Stop: {self._chunk_count} chunks, "
-                        f"{raw_duration:.1f}s captured, {duration:.1f}s output, "
-                        f"peak={self._peak_amplitude}, errors={self._status_errors}")
-            return pcm
+                duration = len(pcm) / (self.TARGET_RATE * 2)
+                logger.info(f"{_TAG} Stop: {self._chunk_count} chunks, "
+                            f"{raw_duration:.1f}s captured, {duration:.1f}s output, "
+                            f"peak={self._peak_amplitude}, errors={self._status_errors}")
+                return pcm
+            finally:
+                self._recycle_stream()
 
     def cancel(self):
         with self._lifecycle_lock:
@@ -387,7 +393,30 @@ class VoiceRecorder:
             self._stop_stream()
             self._audio_chunks = []
             self._total_bytes = 0
+            self._recycle_stream()
             logger.info(f"{_TAG} Recording cancelled, chunks discarded")
+
+    def _recycle_stream(self):
+        """Replace the paused stream so stale audio cannot leak into the next take.
+
+        stop_stream() pauses capture but keeps frames that were recorded yet
+        not delivered (up to one ~200 ms callback block plus driver latency).
+        Restarting the same stream would hand that leftover audio to the next
+        recording as its first chunk(s) — the "previous tail bleeds into the
+        next take" bug.  Close + re-open (start=False) discards the leftover
+        while keeping start() near-instant and the mic indicator off.
+        """
+        if self._pa is None or self._no_device or self._stream is None:
+            return
+        t0 = time.perf_counter()
+        self._close_stream()
+        if self._try_open_at(self._stream_rate, self._stream_channels):
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.debug(f"{_TAG} Stream recycled ({elapsed_ms:.0f}ms)")
+        else:
+            self._prepared = False
+            logger.warning(f"{_TAG} Stream recycle failed; "
+                           f"next start will re-prepare")
 
     def _quick_reopen(self):
         """Re-query device info and reopen stream without recreating PyAudio.
