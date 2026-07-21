@@ -150,8 +150,8 @@ def _pyn_key(key) -> str | None:
 
 
 # KBDLLHOOKSTRUCT.flags 位：事件由 SendInput/keybd_event 合成（非物理按键）。
-# pynput Controller 使用 SendInput，TextInjector 的 Shift+Insert 粘贴会置此位；
-# 过滤器命中此位时直接放行，避免钩子拦截自家注入事件导致修饰键残留。
+# TextInjector 的 Unicode 键入会置此位；过滤器命中此位时直接放行，
+# 避免钩子拦截自家注入事件导致修饰键残留。
 _LLKHF_INJECTED = 0x10
 
 

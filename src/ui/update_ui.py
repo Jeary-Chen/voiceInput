@@ -1,11 +1,12 @@
 """Update-related UI widgets: release-notes dialog, restart dialog, and tray menu helpers."""
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTextBrowser, QMenu, QWidgetAction,
 )
 
-from core.updater import UpdateInfo
+from core.updater import RELEASES_PAGE_URL, UpdateInfo
 from ui import icons
 from ui.dialog_styles import (
     _DIALOG_BTN_SECONDARY,
@@ -19,6 +20,11 @@ from ui.dialog_styles import (
     apply_dialog_scroll_area,
     create_dialog_root_layout,
 )
+
+
+def open_releases_page() -> None:
+    """Open the GitHub Releases page in the system browser."""
+    QDesktopServices.openUrl(QUrl(RELEASES_PAGE_URL))
 
 
 def _format_update_size(size: int) -> str:

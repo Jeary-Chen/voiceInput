@@ -9,6 +9,7 @@ from pathlib import Path
 from config_upgrade_ops import apply_config_upgrade_rules, _parse_ver as _parse_upgrade_ver
 from core.log import logger
 from core.prompt_templates import default_prompt_templates
+from core.output_mode import DEFAULT_OUTPUT_MODE
 
 
 def _config_dir() -> Path:
@@ -352,8 +353,63 @@ def _normalize_loaded_config(
             changed.add("hotkey")
 
     changed |= set(_normalize_polish_models(cfg))
+    changed |= set(_migrate_output_mode(cfg, raw_data))
 
     return frozenset(changed)
+
+
+def _migrate_output_mode(cfg: "Config", raw_data: dict) -> frozenset[str]:
+    """Canonicalize output_mode; derive from legacy paste_result/restore_clipboard."""
+    from core.output_mode import (
+        LEGACY_OUTPUT_CONFIG_KEYS,
+        normalize_output_mode,
+        resolve_output_mode_from_raw,
+    )
+
+    changed: set[str] = set()
+    if raw_data and (
+        "output_mode" in raw_data
+        or (LEGACY_OUTPUT_CONFIG_KEYS & raw_data.keys())
+    ):
+        mode = resolve_output_mode_from_raw(raw_data)
+    else:
+        mode = normalize_output_mode(getattr(cfg, "output_mode", None))
+
+    if cfg.output_mode != mode:
+        cfg.output_mode = mode
+        changed.add("output_mode")
+    elif (
+        raw_data
+        and "output_mode" not in raw_data
+        and (LEGACY_OUTPUT_CONFIG_KEYS & raw_data.keys())
+    ):
+        # 模式值碰巧等于默认，仍需落盘 output_mode，便于剥离旧字段后可自描述。
+        changed.add("output_mode")
+    return frozenset(changed)
+
+
+def _strip_legacy_config_keys() -> bool:
+    """Remove retired keys from disk. Returns True if the file was rewritten."""
+    from core.output_mode import LEGACY_OUTPUT_CONFIG_KEYS
+
+    path = _config_path()
+    if not path.exists():
+        return False
+    try:
+        on_disk = _read_json_object(path) or {}
+    except Exception:
+        return False
+    removed = [key for key in LEGACY_OUTPUT_CONFIG_KEYS if key in on_disk]
+    if not removed:
+        return False
+    for key in removed:
+        del on_disk[key]
+    _backup_config_file(path)
+    _atomic_write_json(path, on_disk)
+    logger.info(
+        f"[Config] Stripped legacy field(s): {', '.join(sorted(removed))}"
+    )
+    return True
 
 
 def _apply_config_upgrades(
@@ -394,9 +450,8 @@ class Config:
     mic_index: int | None = None
     mic_name: str = ""
 
-    paste_result: bool = True
-    restore_clipboard: bool = False
-    simulate_keypresses: bool = False
+    # copy | paste | paste_copy — see core.output_mode
+    output_mode: str = DEFAULT_OUTPUT_MODE
     tray_click_to_record: bool = True
 
     play_sounds: bool = True
@@ -505,7 +560,14 @@ class Config:
         if outcome.migration_fields:
             cls.persist_migration(outcome.cfg, outcome.migration_fields)
 
+        cls.cleanup_legacy_disk_keys()
+
         return outcome.cfg
+
+    @classmethod
+    def cleanup_legacy_disk_keys(cls) -> bool:
+        """Strip retired config keys from disk (safe no-op if absent)."""
+        return _strip_legacy_config_keys()
 
     @classmethod
     def load(cls) -> "Config":

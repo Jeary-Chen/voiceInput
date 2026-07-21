@@ -82,9 +82,7 @@ python -u src\main.py
 | `enabled_polish_models` | 启用并显示在托盘菜单中的润色模型 ID 列表               | `qwen3.6-flash`、`qwen3.6-plus`、`qwen3.7-max` |
 | `polish_model`         | 当前选中的润色模型 ID                                    | `qwen3.6-flash`          |
 | `mic_index`            | 麦克风设备索引（自动随名称解析，无需手动修改）           | `null`（默认设备）       |
-| `paste_result`         | 识别后粘贴到光标                                         | `true`                   |
-| `restore_clipboard`    | 粘贴后还原剪贴板                                         | `false`                  |
-| `simulate_keypresses`  | 模拟按键（预留）                                         | `false`                  |
+| `output_mode`          | 有输入焦点时：`copy` / `paste` / `paste_copy`            | `paste_copy`             |
 | `tray_click_to_record` | 托盘左键即录音                                           | `true`                   |
 | `play_sounds`          | 音效                                                     | `true`                   |
 | `save_history`         | 保存历史                                                 | `true`                   |

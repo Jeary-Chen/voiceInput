@@ -99,7 +99,6 @@ def _engine_base(state: str):
     engine.effective_max_duration = 300
     engine._watchdog = SimpleNamespace(start=MagicMock(), stop=MagicMock())
     engine.state_changed = _Signal()
-    engine.live_text = _Signal()
     engine.error_occurred = _Signal()
     engine.mic_unavailable = _Signal()
     engine._on_audio_chunk = lambda data: None

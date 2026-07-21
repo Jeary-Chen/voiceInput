@@ -1,42 +1,187 @@
-import time
+"""Text delivery to the focused app / clipboard.
+
+Modes (config keys from core.output_mode):
+  copy        → copy_only()
+  paste       → paste_only()       — Unicode SendInput, no clipboard
+  paste_copy  → paste_and_copy()   — clipboard then type
+"""
+
+from __future__ import annotations
+
+import ctypes
+from ctypes import wintypes
 
 import pyperclip
-from pynput.keyboard import Controller, Key
+
+from core.log import logger
+from core.output_mode import (
+    DELIVER_COPIED,
+    DELIVER_FAILED,
+    DELIVER_PASTED,
+    DELIVER_PASTED_COPIED,
+    OUTPUT_MODE_COPY,
+    OUTPUT_MODE_PASTE,
+    normalize_output_mode,
+)
 
 
-_kb = Controller()
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+VK_RETURN = 0x0D
+VK_TAB = 0x09
+
+ULONG_PTR = ctypes.c_size_t
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+# MOUSEINPUT / HARDWAREINPUT：撑起 Win32 INPUT 联合体布局（SendInput 要求正确尺寸）。
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    )
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = (
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT),
+    )
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = (("type", wintypes.DWORD), ("union", _INPUTUNION))
+
+
+_SendInput = ctypes.windll.user32.SendInput
+_SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+_SendInput.restype = wintypes.UINT
+
+
+def _ki_event(*, vk: int = 0, scan: int = 0, flags: int = 0) -> INPUT:
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp.union.ki = KEYBDINPUT(
+        wVk=vk,
+        wScan=scan,
+        dwFlags=flags,
+        time=0,
+        dwExtraInfo=ULONG_PTR(0),
+    )
+    return inp
+
+
+def _events_for_text(text: str) -> list[INPUT]:
+    events: list[INPUT] = []
+    for ch in text:
+        if ch == "\r":
+            continue
+        if ch == "\n":
+            events.append(_ki_event(vk=VK_RETURN, flags=0))
+            events.append(_ki_event(vk=VK_RETURN, flags=KEYEVENTF_KEYUP))
+            continue
+        if ch == "\t":
+            events.append(_ki_event(vk=VK_TAB, flags=0))
+            events.append(_ki_event(vk=VK_TAB, flags=KEYEVENTF_KEYUP))
+            continue
+        encoded = ch.encode("utf-16-le")
+        for off in range(0, len(encoded), 2):
+            unit = int.from_bytes(encoded[off : off + 2], "little")
+            events.append(_ki_event(scan=unit, flags=KEYEVENTF_UNICODE))
+            events.append(
+                _ki_event(scan=unit, flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+            )
+    return events
+
+
+def type_unicode(text: str, *, chunk_chars: int = 64) -> bool:
+    """向当前键盘焦点键入文本。成功送出全部事件时返回 True。"""
+    events = _events_for_text(text)
+    if not events:
+        return True
+    size = ctypes.sizeof(INPUT)
+    step = max(2, chunk_chars * 2)
+    sent = 0
+    for start in range(0, len(events), step):
+        batch = events[start : start + step]
+        arr = (INPUT * len(batch))(*batch)
+        n = int(_SendInput(len(batch), arr, size))
+        sent += n
+        if n != len(batch):
+            logger.warning(
+                f"[Injector] SendInput partial failure: "
+                f"sent {sent}/{len(events)} events"
+            )
+            return False
+    return True
 
 
 class TextInjector:
-    def inject(self, text: str, restore_clipboard: bool = False) -> bool:
+    def deliver(self, text: str, mode: str) -> str:
+        """Dispatch by output_mode. Returns a DELIVER_* action token."""
+        if not text:
+            return DELIVER_FAILED
+        mode = normalize_output_mode(mode)
+        if mode == OUTPUT_MODE_COPY:
+            return DELIVER_COPIED if self.copy_only(text) else DELIVER_FAILED
+        if mode == OUTPUT_MODE_PASTE:
+            return DELIVER_PASTED if self.paste_only(text) else DELIVER_FAILED
+        return DELIVER_PASTED_COPIED if self.paste_and_copy(text) else DELIVER_FAILED
+
+    def copy_only(self, text: str) -> bool:
         if not text:
             return False
-
-        old_clip = None
-        if restore_clipboard:
-            try:
-                old_clip = pyperclip.paste()
-            except Exception:
-                old_clip = None
-
         try:
             pyperclip.copy(text)
-            time.sleep(0.05)
-            _kb.press(Key.shift)
-            _kb.press(Key.insert)
-            _kb.release(Key.insert)
-            _kb.release(Key.shift)
-            time.sleep(0.1)
-
-            if restore_clipboard and old_clip is not None:
-                time.sleep(0.3)
-                pyperclip.copy(old_clip)
-
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[Injector] copy_only failed: {exc}")
             return False
 
-    @staticmethod
-    def copy_only(text: str):
-        if text:
+    def paste_only(self, text: str) -> bool:
+        """键入到输入焦点，不读写剪贴板。"""
+        if not text:
+            return False
+        try:
+            return type_unicode(text)
+        except Exception as exc:
+            logger.warning(f"[Injector] paste_only failed: {exc}")
+            return False
+
+    def paste_and_copy(self, text: str) -> bool:
+        """写入剪贴板并键入到输入焦点（剪贴板保留文本）。"""
+        if not text:
+            return False
+        try:
             pyperclip.copy(text)
+        except Exception as exc:
+            logger.warning(f"[Injector] paste_and_copy clipboard failed: {exc}")
+            return False
+        try:
+            return type_unicode(text)
+        except Exception as exc:
+            logger.warning(f"[Injector] paste_and_copy type failed: {exc}")
+            return True

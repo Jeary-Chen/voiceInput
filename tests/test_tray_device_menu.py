@@ -48,6 +48,38 @@ def _bind_device_helpers(tray):
     return tray
 
 
+def _bind_menu_build(tray):
+    """绑定 _rebuild_device_menu 内部调用的拆分方法（spec 驱动重建）。"""
+    from ui.tray import VoiceTray
+
+    tray._connect_device_action = (
+        lambda act, key: VoiceTray._connect_device_action(tray, act, key)
+    )
+    tray._apply_device_menu_specs_in_place = (
+        lambda specs: VoiceTray._apply_device_menu_specs_in_place(tray, specs)
+    )
+    tray._add_device_menu_action = (
+        lambda spec: VoiceTray._add_device_menu_action(tray, spec)
+    )
+    return tray
+
+
+class _FakeTimer:
+    def __init__(self):
+        self.starts = []
+        self.stops = 0
+        self.timeout = SimpleNamespace(connect=lambda callback: None)
+
+    def setSingleShot(self, value):
+        self.single_shot = value
+
+    def start(self, delay):
+        self.starts.append(delay)
+
+    def stop(self):
+        self.stops += 1
+
+
 class _FakeRecordableProbeRetry:
     def __init__(self, active: bool = False, activate_on_schedule: bool = False):
         self.active = active
@@ -55,6 +87,7 @@ class _FakeRecordableProbeRetry:
         self.reset_calls = 0
         self.stop_calls = 0
         self.scheduled_snapshots = []
+        self.rearm_snapshots = []
 
     def reset(self):
         self.reset_calls += 1
@@ -67,6 +100,10 @@ class _FakeRecordableProbeRetry:
         self.scheduled_snapshots.append(snapshot)
         if self.activate_on_schedule:
             self.active = True
+
+    def rearm_if_needed(self, snapshot):
+        self.rearm_snapshots.append(snapshot)
+        return False
 
 
 def _bind_recordable_retry_state(
@@ -90,22 +127,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
     def test_recordable_probe_retry_schedules_transient_unrecordable_snapshot(self):
         from ui.tray import _RecordableProbeRetry
 
-        class FakeTimer:
-            def __init__(self):
-                self.starts = []
-                self.stops = 0
-                self.timeout = SimpleNamespace(connect=lambda callback: None)
-
-            def setSingleShot(self, value):
-                self.single_shot = value
-
-            def start(self, delay):
-                self.starts.append(delay)
-
-            def stop(self):
-                self.stops += 1
-
-        timer = FakeTimer()
+        timer = _FakeTimer()
         with patch("ui.tray.QTimer", return_value=timer):
             retry = _RecordableProbeRetry(lambda: None)
 
@@ -145,21 +167,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
     def test_recordable_probe_retry_schedules_when_default_is_unrecordable(self):
         from ui.tray import _RecordableProbeRetry
 
-        class FakeTimer:
-            def __init__(self):
-                self.starts = []
-                self.timeout = SimpleNamespace(connect=lambda callback: None)
-
-            def setSingleShot(self, value):
-                pass
-
-            def start(self, delay):
-                self.starts.append(delay)
-
-            def stop(self):
-                pass
-
-        timer = FakeTimer()
+        timer = _FakeTimer()
         with patch("ui.tray.QTimer", return_value=timer):
             retry = _RecordableProbeRetry(lambda: None)
 
@@ -185,6 +193,80 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         self.assertTrue(retry.active)
         self.assertEqual(timer.starts, [1000])
 
+    def test_recordable_probe_retry_ladder_then_stops_without_keep_alive(self):
+        from ui.tray import _RECORDABLE_RETRY_DELAYS_MS, _RecordableProbeRetry
+
+        timer = _FakeTimer()
+        with patch("ui.tray.QTimer", return_value=timer):
+            retry = _RecordableProbeRetry(lambda: None)
+
+        snap = _snapshot(
+            "Bluetooth Mic",
+            [{"name": "Bluetooth Mic", "display_name": "Bluetooth Mic", "index": None}],
+            recordable_default_name="",
+        )
+        for _ in _RECORDABLE_RETRY_DELAYS_MS:
+            retry.schedule_for(snap)
+            self.assertTrue(retry.active)
+
+        self.assertEqual(timer.starts, list(_RECORDABLE_RETRY_DELAYS_MS))
+
+        retry.schedule_for(snap)  # 梯度用尽且 keep_alive 为假 → 停止
+        self.assertFalse(retry.active)
+        self.assertEqual(timer.starts, list(_RECORDABLE_RETRY_DELAYS_MS))
+
+    def test_recordable_probe_retry_keeps_probing_while_menu_visible(self):
+        from ui.tray import _RECORDABLE_RETRY_DELAYS_MS, _RecordableProbeRetry
+
+        timer = _FakeTimer()
+        with patch("ui.tray.QTimer", return_value=timer):
+            retry = _RecordableProbeRetry(lambda: None, keep_alive=lambda: True)
+
+        snap = _snapshot(
+            "Bluetooth Mic",
+            [{"name": "Bluetooth Mic", "display_name": "Bluetooth Mic", "index": None}],
+            recordable_default_name="",
+        )
+        for _ in _RECORDABLE_RETRY_DELAYS_MS:
+            retry.schedule_for(snap)
+        retry.schedule_for(snap)
+        retry.schedule_for(snap)
+
+        self.assertTrue(retry.active)
+        expected = list(_RECORDABLE_RETRY_DELAYS_MS) + [_RECORDABLE_RETRY_DELAYS_MS[-1]] * 2
+        self.assertEqual(timer.starts, expected)
+
+    def test_recordable_probe_retry_rearms_on_menu_open_after_exhaustion(self):
+        from ui.tray import _RECORDABLE_RETRY_DELAYS_MS, _RecordableProbeRetry
+
+        timer = _FakeTimer()
+        with patch("ui.tray.QTimer", return_value=timer):
+            retry = _RecordableProbeRetry(lambda: None)
+
+        snap = _snapshot(
+            "Bluetooth Mic",
+            [{"name": "Bluetooth Mic", "display_name": "Bluetooth Mic", "index": None}],
+            recordable_default_name="",
+        )
+        for _ in _RECORDABLE_RETRY_DELAYS_MS:
+            retry.schedule_for(snap)
+        retry.schedule_for(snap)
+        self.assertFalse(retry.active)
+
+        self.assertTrue(retry.rearm_if_needed(snap))
+        self.assertTrue(retry.active)
+        self.assertEqual(timer.starts[-1], _RECORDABLE_RETRY_DELAYS_MS[0])
+
+        # 已在重试中 / 设备已恢复可录 → 不重复启动
+        self.assertFalse(retry.rearm_if_needed(snap))
+        retry.reset()
+        recovered = _snapshot(
+            "Bluetooth Mic",
+            [{"name": "Bluetooth Mic", "display_name": "Bluetooth Mic", "index": 1}],
+        )
+        self.assertFalse(retry.rearm_if_needed(recovered))
+        self.assertFalse(retry.active)
+
     def test_rebuild_updates_visible_submenu_in_place(self):
         from ui.tray import VoiceTray
 
@@ -200,6 +282,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             contextMenu=lambda: parent_menu,
         )
         _bind_recordable_retry_state(tray)
+        _bind_menu_build(tray)
 
         with patch.object(menu, "isVisible", return_value=True):
             with patch.object(menu, "close") as close:
@@ -210,6 +293,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
                                 VoiceTray._rebuild_device_menu(tray)
 
         close.assert_not_called()
+        # 空菜单 → 全量重建路径 → 复位悬停高亮
         set_active.assert_called_once_with(None)
         anchor.assert_called_once_with(menu, parent_menu)
         update_geometry.assert_called_once()
@@ -241,6 +325,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             contextMenu=lambda: parent_menu,
         )
         _bind_recordable_retry_state(tray)
+        _bind_menu_build(tray)
 
         VoiceTray._rebuild_device_menu(tray)
 
@@ -274,11 +359,132 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             contextMenu=lambda: None,
         )
         _bind_recordable_retry_state(tray, active=True)
+        _bind_menu_build(tray)
 
         VoiceTray._rebuild_device_menu(tray)
 
         labels = [action.text() for action in menu.actions() if not action.isSeparator()]
         self.assertIn("Bluetooth Mic（正在初始化）", labels)
+
+    def test_rebuild_reuses_actions_in_place_when_device_recovers(self):
+        from ui.tray import VoiceTray
+
+        menu = QMenu()
+        tray = SimpleNamespace(
+            _config=SimpleNamespace(mic_name=""),
+            _input_snapshot=_snapshot(
+                "Bluetooth Mic",
+                [
+                    {
+                        "name": "Bluetooth Mic",
+                        "display_name": "Bluetooth Mic",
+                        "index": None,
+                    },
+                ],
+                recordable_default_name="",
+            ),
+            _dev_menu_dirty=True,
+            _device_menu=menu,
+            contextMenu=lambda: None,
+        )
+        _bind_recordable_retry_state(tray, active=True)
+        _bind_menu_build(tray)
+
+        VoiceTray._rebuild_device_menu(tray)
+        ids_before = [id(action) for action in menu.actions()]
+        labels = [action.text() for action in menu.actions() if not action.isSeparator()]
+        self.assertIn("Bluetooth Mic（正在初始化）", labels)
+
+        # 设备恢复可录：前缀（默认行/分隔线/设备行）复用，仅尾部占位行消失
+        tray._input_snapshot = _snapshot(
+            "Bluetooth Mic",
+            [{"name": "Bluetooth Mic", "display_name": "Bluetooth Mic", "index": 3}],
+        )
+        tray._recordable_retry.active = False
+        tray._dev_menu_dirty = True
+
+        with patch.object(menu, "isVisible", return_value=True):
+            with patch.object(menu, "setActiveAction") as set_active:
+                VoiceTray._rebuild_device_menu(tray)
+
+        set_active.assert_not_called()
+        actions = menu.actions()
+        self.assertEqual([id(action) for action in actions], ids_before[:3])
+        device_action = next(a for a in actions if a.data() == "Bluetooth Mic")
+        self.assertEqual(device_action.text(), "Bluetooth Mic")
+        self.assertTrue(device_action.isEnabled())
+
+    def test_in_place_rebuild_reconnects_trigger_with_fresh_index(self):
+        from ui.tray import VoiceTray
+
+        calls = []
+        menu = QMenu()
+        tray = SimpleNamespace(
+            _config=SimpleNamespace(mic_name=""),
+            _input_snapshot=_snapshot(
+                "Bluetooth Mic",
+                [{"name": "Bluetooth Mic", "display_name": "Bluetooth Mic", "index": 7}],
+            ),
+            _dev_menu_dirty=True,
+            _device_menu=menu,
+            contextMenu=lambda: None,
+            _set_default_device=lambda: calls.append(("default",)),
+            _set_device=lambda name, idx: calls.append((name, idx)),
+        )
+        _bind_recordable_retry_state(tray)
+        _bind_menu_build(tray)
+
+        VoiceTray._rebuild_device_menu(tray)
+        device_action = next(a for a in menu.actions() if a.data() == "Bluetooth Mic")
+        device_action.trigger()
+        self.assertEqual(calls, [("Bluetooth Mic", 7)])
+
+        # PyAudio 重枚举后同名设备 index 变化 → 就地刷新须携带新 index 且不重复触发
+        tray._input_snapshot = _snapshot(
+            "Bluetooth Mic",
+            [{"name": "Bluetooth Mic", "display_name": "Bluetooth Mic", "index": 9}],
+        )
+        VoiceTray._rebuild_device_menu(tray)
+        reused_action = next(a for a in menu.actions() if a.data() == "Bluetooth Mic")
+        self.assertIs(reused_action, device_action)
+        reused_action.trigger()
+        self.assertEqual(calls, [("Bluetooth Mic", 7), ("Bluetooth Mic", 9)])
+
+    def test_device_menu_show_rearms_probe_when_stuck_unrecordable(self):
+        from ui.tray import (
+            _RECORDABLE_RETRY_DELAYS_MS,
+            VoiceTray,
+            _RecordableProbeRetry,
+        )
+
+        snap = _snapshot(
+            "Bluetooth Mic",
+            [{"name": "Bluetooth Mic", "display_name": "Bluetooth Mic", "index": None}],
+            recordable_default_name="",
+        )
+        timer = _FakeTimer()
+        with patch("ui.tray.QTimer", return_value=timer):
+            retry = _RecordableProbeRetry(lambda: None)
+        # 梯度用尽 → 卡在「不可录」
+        for _ in _RECORDABLE_RETRY_DELAYS_MS:
+            retry.schedule_for(snap)
+        retry.schedule_for(snap)
+        self.assertFalse(retry.active)
+
+        calls = []
+        tray = SimpleNamespace(
+            _dev_refresh_ready=True,
+            _dev_menu_dirty=False,
+            _input_snapshot=snap,
+            _recordable_retry=retry,
+            _rebuild_device_menu=lambda: calls.append("rebuild"),
+        )
+
+        VoiceTray._on_device_menu_show(tray)
+
+        self.assertTrue(retry.active)
+        self.assertEqual(timer.starts[-1], _RECORDABLE_RETRY_DELAYS_MS[0])
+        self.assertEqual(calls, ["rebuild"])
 
     def test_system_default_change_schedules_async_reopen(self):
         from ui.tray import VoiceTray
@@ -956,6 +1162,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             contextMenu=lambda: None,
         )
         _bind_recordable_retry_state(tray)
+        _bind_menu_build(tray)
         tray._sync_device_menu_checks = lambda: VoiceTray._sync_device_menu_checks(tray)
         tray._set_default_device = lambda: VoiceTray._set_default_device(tray)
         tray._set_device = lambda name, idx=None: VoiceTray._set_device(tray, name, idx)
@@ -992,6 +1199,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             contextMenu=lambda: None,
         )
         _bind_recordable_retry_state(tray)
+        _bind_menu_build(tray)
         tray._sync_device_menu_checks = lambda: VoiceTray._sync_device_menu_checks(tray)
         tray._set_default_device = lambda: VoiceTray._set_default_device(tray)
         tray._set_device = lambda name, idx=None: VoiceTray._set_device(tray, name, idx)

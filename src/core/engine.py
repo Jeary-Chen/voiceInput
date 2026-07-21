@@ -235,8 +235,7 @@ class _FinalizeWorker(QThread):
         original_pcm: bytes,
         mode: str,
         save_audio: bool,
-        paste_result: bool,
-        restore_clipboard: bool,
+        output_mode: str,
         raw_text: str = "",
         processing_info: dict | None = None,
         failed_entry: bool = False,
@@ -249,8 +248,7 @@ class _FinalizeWorker(QThread):
         self._original_pcm = original_pcm
         self._mode = mode
         self._save_audio = save_audio
-        self._paste_result = paste_result
-        self._restore_clipboard = restore_clipboard
+        self._output_mode = output_mode
         self._raw_text = raw_text
         self._processing_info = processing_info
         self._failed_entry = failed_entry
@@ -260,15 +258,7 @@ class _FinalizeWorker(QThread):
         try:
             action = "failed"
             if not self._failed_entry:
-                if self._paste_result:
-                    self._injector.inject(
-                        self._text,
-                        restore_clipboard=self._restore_clipboard,
-                    )
-                    action = "pasted"
-                else:
-                    self._injector.copy_only(self._text)
-                    action = "copied"
+                action = self._injector.deliver(self._text, self._output_mode)
 
             duration = len(self._original_pcm) / (VoiceRecorder.TARGET_RATE * 2)
             self._history.save_entry(
@@ -290,7 +280,6 @@ class _FinalizeWorker(QThread):
 class VoiceEngine(QObject):
     state_changed = pyqtSignal(str)       # "ready" | "recording" | "processing" | "cancelling"
     audio_data = pyqtSignal(bytes)         # raw PCM chunks for waveform
-    live_text = pyqtSignal(str)            # status text for expanded panel
     transcription_done = pyqtSignal(str)   # final text
     countdown_tick = pyqtSignal(int)       # seconds remaining before auto-stop
     error_occurred = pyqtSignal(str)
@@ -415,7 +404,6 @@ class VoiceEngine(QObject):
             return
         logger.info(f"{_TAG} transcribe_file: {file_path}")
         self._set_state("processing")
-        self.live_text.emit("正在读取音频文件…")
         worker = _AudioFileLoadWorker(file_path)
         worker.loaded.connect(self._on_audio_file_loaded)
         worker.failed.connect(self._on_audio_file_load_failed)
@@ -469,7 +457,6 @@ class VoiceEngine(QObject):
             on_mic_error=self._on_mic_error,
         )
         self._set_state("processing")
-        self.live_text.emit("正在准备录音…")
         worker = _RecorderStartWorker(self.recorder, rec_kwargs)
         worker.started.connect(self._on_recording_start_done)
         worker.failed.connect(self._on_recording_start_failed)
@@ -580,7 +567,6 @@ class VoiceEngine(QObject):
             return
         # 作废与正常停止区分上报：cancelling 不属于「处理中」，UI 不应显示处理指示。
         self._set_state("cancelling" if cancel else "processing")
-        self.live_text.emit("正在取消…" if cancel else "正在停止录音…")
         worker = _RecorderStopWorker(self.recorder, reason, cancel=cancel)
         worker.stopped.connect(self._on_recording_stop_done)
         worker.failed.connect(self._on_recording_stop_failed)
@@ -693,17 +679,16 @@ class VoiceEngine(QObject):
             logger.info(f"{_TAG} Entering polish pipeline")
             self._raw_text = text
             self._set_state("processing")
-            self.live_text.emit(f"[原文] {text}")
             self._polish_worker = _PolishWorker(self.polisher, text, self.config)
-            self._polish_worker.result_ready.connect(self._inject_and_save)
+            self._polish_worker.result_ready.connect(self._deliver_and_save)
             self._polish_worker.polish_failed.connect(self.error_occurred)
             self._polish_worker.finished.connect(self._cleanup_polish_worker)
             self._polish_worker.start()
         else:
             self._raw_text = ""
-            self._inject_and_save(text)
+            self._deliver_and_save(text)
 
-    def _inject_and_save(self, text: str):
+    def _deliver_and_save(self, text: str):
         self._start_finalize_worker(text=text)
 
     def _start_finalize_worker(
@@ -723,8 +708,7 @@ class VoiceEngine(QObject):
             original_pcm=self._original_pcm,
             mode=self.config.mode,
             save_audio=self.config.save_audio,
-            paste_result=self.config.paste_result,
-            restore_clipboard=self.config.restore_clipboard,
+            output_mode=self.config.output_mode,
             raw_text=self._raw_text,
             processing_info=self._processing_info if self._processing_info else None,
             failed_entry=failed_entry,
@@ -737,14 +721,25 @@ class VoiceEngine(QObject):
         worker.start()
 
     def _on_finalize_done(self, text: str, failed_entry: bool, action: str):
+        from core.output_mode import (
+            DELIVER_COPIED,
+            DELIVER_FAILED,
+            DELIVER_PASTED,
+            DELIVER_PASTED_COPIED,
+        )
+
         self._original_pcm = b""
         self._processing_info = None
         self._raw_text = ""
         if not failed_entry:
-            if action == "pasted":
+            if action == DELIVER_PASTED:
                 logger.info(f"{_TAG} Pasted {len(text)} chars")
-            elif action == "copied":
+            elif action == DELIVER_PASTED_COPIED:
+                logger.info(f"{_TAG} Pasted+copied {len(text)} chars")
+            elif action == DELIVER_COPIED:
                 logger.info(f"{_TAG} Copied {len(text)} chars to clipboard")
+            elif action == DELIVER_FAILED:
+                logger.warning(f"{_TAG} Delivery failed for {len(text)} chars")
             self.transcription_done.emit(text)
         self._set_state("ready")
 

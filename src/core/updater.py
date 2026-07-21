@@ -24,6 +24,7 @@ from core.network import open_update_url
 
 _REPO = "myuan19/voiceInput"
 _API_URL = f"https://api.github.com/repos/{_REPO}/releases?per_page=20"
+RELEASES_PAGE_URL = f"https://github.com/{_REPO}/releases"
 _CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000  # 4 hours
 
 

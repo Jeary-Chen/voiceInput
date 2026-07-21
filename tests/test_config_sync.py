@@ -48,7 +48,7 @@ class ConfigSyncTests(unittest.TestCase):
         path = _config_path()
         data = _base_config(
             polish_model="qwen3.6-flash",
-            paste_result=True,
+            output_mode="paste_copy",
             active_prompt_id="__tpl_translate_en",
         )
         _write_json(path, data)
@@ -112,7 +112,7 @@ class ConfigSyncTests(unittest.TestCase):
         cfg, sync, path = self._setup()
 
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["paste_result"] = False
+        disk["output_mode"] = "copy"
         disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
@@ -121,9 +121,9 @@ class ConfigSyncTests(unittest.TestCase):
 
         on_disk = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(on_disk["polish_model"], "qwen3.6-plus")
-        self.assertFalse(on_disk["paste_result"])
+        self.assertEqual(on_disk["output_mode"], "copy")
         self.assertEqual(cfg.polish_model, "qwen3.6-plus")
-        self.assertFalse(cfg.paste_result)
+        self.assertEqual(cfg.output_mode, "copy")
 
     def test_external_edit_during_write_guard_recovered_after_write(self):
         cfg, sync, path = self._setup()
@@ -147,15 +147,15 @@ class ConfigSyncTests(unittest.TestCase):
     def test_save_while_busy_writes_touched_only_and_queues_reload(self):
         cfg, sync, path = self._setup(idle=False)
         disk = json.loads(path.read_text(encoding="utf-8"))
-        disk["paste_result"] = False
+        disk["output_mode"] = "copy"
         disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
-        cfg.paste_result = True
-        cfg.save(touched=frozenset({"paste_result"}))
+        cfg.output_mode = "paste_copy"
+        cfg.save(touched=frozenset({"output_mode"}))
 
         on_disk = json.loads(path.read_text(encoding="utf-8"))
-        self.assertTrue(on_disk["paste_result"])
+        self.assertEqual(on_disk["output_mode"], "paste_copy")
         self.assertEqual(on_disk["polish_model"], "qwen3.7-max")
         self.assertTrue(sync.has_pending_reload)
 
@@ -176,11 +176,11 @@ class ConfigSyncTests(unittest.TestCase):
     def test_save_while_busy_without_disk_conflict_writes_immediately(self):
         """App -> disk is NOT deferred when disk has no pending external edits."""
         cfg, sync, path = self._setup(idle=False)
-        cfg.paste_result = False
-        cfg.save(touched=frozenset({"paste_result"}))
+        cfg.output_mode = "copy"
+        cfg.save(touched=frozenset({"output_mode"}))
 
         on_disk = json.loads(path.read_text(encoding="utf-8"))
-        self.assertFalse(on_disk["paste_result"])
+        self.assertEqual(on_disk["output_mode"], "copy")
         self.assertFalse(sync.has_pending_reload)
 
     def test_busy_conflict_save_leaves_memory_stale_until_flush(self):
@@ -190,8 +190,8 @@ class ConfigSyncTests(unittest.TestCase):
         disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
-        cfg.paste_result = False
-        cfg.save(touched=frozenset({"paste_result"}))
+        cfg.output_mode = "copy"
+        cfg.save(touched=frozenset({"output_mode"}))
 
         self.assertEqual(cfg.polish_model, "qwen3.6-flash")
         self.assertTrue(sync.has_pending_reload)
@@ -199,7 +199,7 @@ class ConfigSyncTests(unittest.TestCase):
         sync.bind_idle_checker(lambda: True)
         sync.flush_pending_reload()
         self.assertEqual(cfg.polish_model, "qwen3.7-max")
-        self.assertFalse(cfg.paste_result)
+        self.assertEqual(cfg.output_mode, "copy")
 
     def test_blocks_recording_while_pending_or_debouncing(self):
         cfg, sync, path = self._setup(idle=False)
@@ -237,8 +237,8 @@ class ConfigSyncTests(unittest.TestCase):
         disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
-        cfg.paste_result = False
-        cfg.save(touched=frozenset({"paste_result"}))
+        cfg.output_mode = "copy"
+        cfg.save(touched=frozenset({"output_mode"}))
         self.assertTrue(sync.has_pending_reload)
 
         sync._suppress_until = 0.0
@@ -300,8 +300,8 @@ class ConfigSyncTests(unittest.TestCase):
         disk["polish_model"] = "qwen3.7-max"
         _write_json(path, disk)
 
-        cfg.paste_result = False
-        cfg.save(touched=frozenset({"paste_result"}))
+        cfg.output_mode = "copy"
+        cfg.save(touched=frozenset({"output_mode"}))
 
         self.assertTrue(sync._suppress_until > 0)
         sync._on_file_changed(str(path))
@@ -318,12 +318,12 @@ class ConfigSyncTests(unittest.TestCase):
         }
         _write_json(path, disk)
 
-        cfg.paste_result = False
-        cfg.save(touched=frozenset({"paste_result"}))
+        cfg.output_mode = "copy"
+        cfg.save(touched=frozenset({"output_mode"}))
 
         on_disk = json.loads(path.read_text(encoding="utf-8"))
         keys = list(on_disk)
-        self.assertLess(keys.index("paste_result"), keys.index("z_unknown"))
+        self.assertLess(keys.index("output_mode"), keys.index("z_unknown"))
         self.assertEqual(keys[-2:], ["z_unknown", "upgraded_backup"])
 
 

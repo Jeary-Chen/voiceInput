@@ -343,6 +343,7 @@ class ConfigSync(QObject):
 
         if result.migration_fields:
             self._guarded_migration_persist(result.migration_fields)
+        Config.cleanup_legacy_disk_keys()
 
         self._capture_sync_token()
         changed = set(result.changed)

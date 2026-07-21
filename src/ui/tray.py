@@ -8,10 +8,10 @@ from contextlib import contextmanager
 import time
 from typing import TYPE_CHECKING, TypeVar
 
+from PyQt6.QtGui import QAction
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QCoreApplication, QObject, QEvent,
 )
-from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication,
     QDialog, QFileDialog,
@@ -23,6 +23,12 @@ from core.engine import VoiceEngine
 from core.config_sync import ConfigSync
 from core.faults import FaultKind
 from core.input_devices import InputDeviceSnapshot
+from core.output_mode import (
+    DEFAULT_OUTPUT_MODE,
+    OUTPUT_MODE_LABELS,
+    OUTPUT_MODES,
+    normalize_output_mode,
+)
 from core.autostart import (
     AutostartWatcher,
     read_enabled as read_autostart_enabled,
@@ -40,6 +46,7 @@ from ui.apikey_dialog import _ApiKeyDialog
 from ui.update_ui import (
     _UpdateNotesDialog, _UpdateReadyDialog, _UpdateFailedDialog, _UpdateMenuHelper,
     anchor_left_cascade_submenu, apply_tray_menu_style, install_left_cascade_submenu,
+    open_releases_page,
 )
 from ui.prompt_dialog import _PolishPromptDialog
 
@@ -56,7 +63,7 @@ _DEVICE_CHANGE_DEBOUNCE_MS = 500
 _DEVICE_STORM_WINDOW_SEC = 4.0
 _DEVICE_STORM_EVENT_LIMIT = 4
 _DEVICE_STORM_QUIET_SEC = 2.0
-_RECORDABLE_RETRY_DELAYS_MS = (1000, 2000, 4000)
+_RECORDABLE_RETRY_DELAYS_MS = (1000, 2000, 4000, 8000, 16000)
 # Shutdown budgets: total grace for background workers to finish cleanly, then
 # for the PortAudio release helper thread.  Both waits return almost instantly
 # on a healthy machine; the budgets only matter when native audio is wedged.
@@ -69,12 +76,14 @@ _AUTOSTART_CONFIG_ECHO_MS = 500
 _TRAY_BOOL_MENU_ACTIONS = (
     ("silence_trim", "_act_silence_trim"),
     ("show_countdown", "_act_show_countdown"),
-    ("paste_result", "_act_paste_result"),
     ("show_result_text", "_act_show_result_text"),
     ("mini_bar_show_timer", "_act_mini_bar_timer"),
     ("hide_mini_window_when_idle", "_act_hide_idle_mini"),
     ("save_audio", "_act_save_audio"),
 )
+
+# 有输入焦点时的写入偏好（三选一）——单一字段 config.output_mode
+#   copy / paste / paste_copy — 见 core.output_mode
 
 
 def _set_action_checked(action: QAction, checked: bool) -> None:
@@ -122,6 +131,67 @@ def _sync_device_menu_actions(actions, config, snapshot: InputDeviceSnapshot) ->
         _device_menu_selected_key(config, snapshot),
         fallback_key=_TRAY_MENU_DEFAULT_DEVICE,
     )
+
+
+def _device_menu_row_specs(
+    snapshot: InputDeviceSnapshot, retry_active: bool,
+) -> list[tuple]:
+    """声明式描述设备子菜单的行；全量重建与就地刷新共用同一份 spec。
+
+    行格式：
+      ("action", key, text, enabled)  可勾选行（系统默认 / 设备）
+      ("separator",)                  分隔线
+      ("placeholder", text)           禁用占位行
+    """
+    default_name = snapshot.default_name
+    label = f"系统默认 ({default_name})" if default_name else "系统默认"
+    specs: list[tuple] = [
+        ("action", _TRAY_MENU_DEFAULT_DEVICE, label, True),
+        ("separator",),
+    ]
+    devices = snapshot.devices
+    if not devices:
+        specs.append(("placeholder", "(未发现兼容设备)"))
+        return specs
+    for dev in devices:
+        if dev.is_recordable:
+            text = dev.display_name
+        elif retry_active:
+            text = f"{dev.display_name}（正在初始化）"
+        else:
+            text = f"{dev.display_name}（不可录）"
+        specs.append(("action", dev.name, text, dev.is_recordable))
+    if not snapshot.has_recordable_device:
+        specs.append(("separator",))
+        specs.append(("placeholder", "(未发现兼容设备)"))
+    return specs
+
+
+def _device_menu_structure(actions) -> list[tuple]:
+    """现有 QAction 列表的结构签名（行序列 + 身份 key）。"""
+    signature: list[tuple] = []
+    for action in actions:
+        if action.isSeparator():
+            signature.append(("separator",))
+        elif action.isCheckable():
+            signature.append(("action", action.data()))
+        else:
+            signature.append(("placeholder",))
+    return signature
+
+
+def _specs_structure(specs) -> list[tuple]:
+    """spec 列表的结构签名，与 _device_menu_structure 同构。"""
+    signature: list[tuple] = []
+    for spec in specs:
+        kind = spec[0]
+        if kind == "separator":
+            signature.append(("separator",))
+        elif kind == "action":
+            signature.append(("action", spec[1]))
+        else:
+            signature.append(("placeholder",))
+    return signature
 
 
 class _ForegroundHotkeyGateFilter(QObject):
@@ -223,11 +293,21 @@ class _RecorderPrepareWorker(QThread):
 
 
 class _RecordableProbeRetry:
-    """Retry while Windows sees an endpoint before PyAudio can open it."""
+    """Retry while Windows sees an endpoint before PyAudio can open it.
 
-    def __init__(self, refresh: Callable[[], None]):
+    梯度重试用尽后：若 keep_alive()（设备子菜单可见）为真，则按最长间隔继续
+    探测，保证用户盯着菜单等待时「正在初始化」能自动恢复；否则停止探测，等菜单
+    重新展开时由 rearm_if_needed() 重启梯度。
+    """
+
+    def __init__(
+        self,
+        refresh: Callable[[], None],
+        keep_alive: Callable[[], bool] | None = None,
+    ):
         self._attempt = 0
         self._active = False
+        self._keep_alive = keep_alive if keep_alive is not None else (lambda: False)
         self._timer = QTimer()
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(refresh)
@@ -249,6 +329,15 @@ class _RecordableProbeRetry:
             self.reset()
             return
         if self._attempt >= len(_RECORDABLE_RETRY_DELAYS_MS):
+            if self._keep_alive():
+                delay_ms = _RECORDABLE_RETRY_DELAYS_MS[-1]
+                self._active = True
+                logger.info(
+                    f"[Tray] Endpoint still not recordable after retry ladder; "
+                    f"device menu visible, keep probing every {delay_ms}ms"
+                )
+                self._timer.start(delay_ms)
+                return
             self._active = False
             return
         delay_ms = _RECORDABLE_RETRY_DELAYS_MS[self._attempt]
@@ -260,6 +349,16 @@ class _RecordableProbeRetry:
             f"({self._attempt}/{len(_RECORDABLE_RETRY_DELAYS_MS)})"
         )
         self._timer.start(delay_ms)
+
+    def rearm_if_needed(self, snapshot: InputDeviceSnapshot) -> bool:
+        """设备子菜单展开时调用：梯度已用尽但设备仍不可录 → 重启梯度探测。"""
+        if self._active:
+            return False
+        if not self.needs_retry(snapshot):
+            return False
+        self._attempt = 0
+        self.schedule_for(snapshot)
+        return self._active
 
     @staticmethod
     def needs_retry(snapshot: InputDeviceSnapshot) -> bool:
@@ -326,7 +425,10 @@ class VoiceTray(QSystemTrayIcon):
         self._device_change_timer.setSingleShot(True)
         self._device_change_timer.setInterval(_DEVICE_CHANGE_DEBOUNCE_MS)
         self._device_change_timer.timeout.connect(self._start_async_refresh)
-        self._recordable_retry = _RecordableProbeRetry(self._retry_input_recordable_probe)
+        self._recordable_retry = _RecordableProbeRetry(
+            self._retry_input_recordable_probe,
+            keep_alive=self._device_menu_keeps_probe_alive,
+        )
         self._input_rescan_needs_portaudio_reset = False
         self._output_reopen_after_device_rescan = False
         self._ignore_autostart_config_echo = False
@@ -502,11 +604,19 @@ class VoiceTray(QSystemTrayIcon):
         self._act_show_countdown.triggered.connect(self._toggle_show_countdown)
         menu.addAction(self._act_show_countdown)
 
-        self._act_paste_result = QAction("自动粘贴", menu)
-        self._act_paste_result.setCheckable(True)
-        self._act_paste_result.setChecked(self._config.paste_result)
-        self._act_paste_result.triggered.connect(self._toggle_paste_result)
-        menu.addAction(self._act_paste_result)
+        self._output_mode_menu = QMenu("有输入焦点时", menu)
+        apply_tray_menu_style(self._output_mode_menu)
+        install_left_cascade_submenu(self._output_mode_menu, menu)
+        selected_output_mode = normalize_output_mode(self._config.output_mode)
+        for mode_key, label in OUTPUT_MODE_LABELS:
+            act = QAction(label, self._output_mode_menu)
+            act.setCheckable(True)
+            act.setData(mode_key)
+            act.setChecked(selected_output_mode == mode_key)
+            act.triggered.connect(
+                lambda checked, k=mode_key: self._set_output_mode(k))
+            self._output_mode_menu.addAction(act)
+        menu.addMenu(self._output_mode_menu)
 
         self._mini_bar_menu = QMenu("磁吸栏", menu)
         apply_tray_menu_style(self._mini_bar_menu)
@@ -575,6 +685,10 @@ class VoiceTray(QSystemTrayIcon):
 
         self._update_widget = _UpdateMenuHelper(menu)
         self._update_widget.bind(self._on_update_click)
+
+        act_releases = QAction("GitHub 页面", menu)
+        act_releases.triggered.connect(open_releases_page)
+        menu.addAction(act_releases)
 
         act_quit = QAction("退出", menu)
         act_quit.triggered.connect(self._quit)
@@ -784,6 +898,11 @@ class VoiceTray(QSystemTrayIcon):
         )
         self._audio.refresh_output_device_async()
 
+    def _device_menu_keeps_probe_alive(self) -> bool:
+        """设备子菜单可见期间，允许重试梯度用尽后继续低频探测。"""
+        menu = getattr(self, "_device_menu", None)
+        return bool(menu is not None and menu.isVisible())
+
     def _on_device_menu_show(self):
         if not self._dev_refresh_ready:
             self._device_menu.clear()
@@ -791,6 +910,12 @@ class VoiceTray(QSystemTrayIcon):
             act.setEnabled(False)
             self._device_menu.addAction(act)
             return
+        if self._recordable_retry.rearm_if_needed(self._input_snapshot):
+            logger.info(
+                "[Tray] Device menu opened with unrecordable endpoint; "
+                "restarting probe retry"
+            )
+            self._dev_menu_dirty = True
         if self._dev_menu_dirty:
             self._rebuild_device_menu()
 
@@ -1029,46 +1154,86 @@ class VoiceTray(QSystemTrayIcon):
         self._recorder_prepare_pending_job = self._recorder_prepare_target()
         self._recorder_prepare_timer.start()
 
-    def _rebuild_device_menu(self):
-        menu_visible = self._device_menu.isVisible()
-        self._device_menu.clear()
-        self._dev_menu_dirty = False
+    def _connect_device_action(self, act: QAction, key) -> None:
+        if key == _TRAY_MENU_DEFAULT_DEVICE:
+            act.triggered.connect(lambda checked: self._set_default_device())
+            return
+        dev = self._input_snapshot.find_by_name(key)
+        idx = dev.index if dev is not None else None
+        act.triggered.connect(
+            lambda checked, name=key, idx=idx: self._set_device(name, idx)
+        )
 
-        default_name = self._input_snapshot.default_name
-        label = f"系统默认 ({default_name})" if default_name else "系统默认"
-        act_default = QAction(label, self._device_menu)
-        act_default.setCheckable(True)
-        act_default.setData(_TRAY_MENU_DEFAULT_DEVICE)
-        act_default.triggered.connect(lambda checked: self._set_default_device())
-        self._device_menu.addAction(act_default)
-        self._device_menu.addSeparator()
+    def _apply_device_menu_specs_in_place(self, specs: list[tuple]) -> bool:
+        """行结构的公共前缀就地更新、仅尾部增删，避免 clear() 重建闪烁。
 
-        devices = self._input_snapshot.devices
-        if not devices:
-            act = QAction("(未发现兼容设备)", self._device_menu)
+        覆盖两类平滑场景：
+          1. 行序列与身份完全一致 → 纯就地 setText/setEnabled；
+          2. 仅尾部行增删（如「(未发现兼容设备)」占位行随设备恢复可录而消失、
+             新设备追加在列表末尾）→ 前缀复用 + 尾部 add/remove。
+        中段结构变化（设备被移除/替换）仍回退全量重建。
+        """
+        actions = list(self._device_menu.actions())
+        if not actions:
+            return False
+        menu_sig = _device_menu_structure(actions)
+        spec_sig = _specs_structure(specs)
+        common = min(len(menu_sig), len(spec_sig))
+        if menu_sig[:common] != spec_sig[:common]:
+            return False
+        for act, spec in zip(actions[:common], specs[:common]):
+            kind = spec[0]
+            if kind == "separator":
+                continue
+            if kind == "placeholder":
+                act.setText(spec[1])
+                continue
+            _kind, key, text, enabled = spec
+            act.setText(text)
+            act.setEnabled(enabled)
+            # 复用旧 QAction 时须重连 triggered：旧闭包可能携带重枚举前的过期 index。
+            try:
+                act.triggered.disconnect()
+            except TypeError:
+                pass
+            self._connect_device_action(act, key)
+        for act in actions[common:]:
+            self._device_menu.removeAction(act)
+            act.deleteLater()
+        for spec in specs[common:]:
+            self._add_device_menu_action(spec)
+        return True
+
+    def _add_device_menu_action(self, spec: tuple) -> None:
+        kind = spec[0]
+        if kind == "separator":
+            self._device_menu.addSeparator()
+            return
+        if kind == "placeholder":
+            act = QAction(spec[1], self._device_menu)
             act.setEnabled(False)
             self._device_menu.addAction(act)
-        else:
-            for dev in devices:
-                if dev.is_recordable:
-                    label = dev.display_name
-                elif self._recordable_retry.active:
-                    label = f"{dev.display_name}（正在初始化）"
-                else:
-                    label = f"{dev.display_name}（不可录）"
-                act = QAction(label, self._device_menu)
-                act.setCheckable(True)
-                act.setData(dev.name)
-                act.setEnabled(dev.is_recordable)
-                act.triggered.connect(
-                    lambda checked, idx=dev.index, name=dev.name: self._set_device(name, idx)
-                )
-                self._device_menu.addAction(act)
-            if not self._input_snapshot.has_recordable_device:
-                self._device_menu.addSeparator()
-                act = QAction("(未发现兼容设备)", self._device_menu)
-                act.setEnabled(False)
-                self._device_menu.addAction(act)
+            return
+        _kind, key, text, enabled = spec
+        act = QAction(text, self._device_menu)
+        act.setCheckable(True)
+        act.setData(key)
+        act.setEnabled(enabled)
+        self._connect_device_action(act, key)
+        self._device_menu.addAction(act)
+
+    def _rebuild_device_menu(self):
+        menu_visible = self._device_menu.isVisible()
+        self._dev_menu_dirty = False
+
+        specs = _device_menu_row_specs(
+            self._input_snapshot, self._recordable_retry.active,
+        )
+        updated_in_place = self._apply_device_menu_specs_in_place(specs)
+        if not updated_in_place:
+            self._device_menu.clear()
+            for spec in specs:
+                self._add_device_menu_action(spec)
 
         _sync_device_menu_actions(
             self._device_menu.actions(),
@@ -1079,7 +1244,9 @@ class VoiceTray(QSystemTrayIcon):
         if menu_visible:
             # Keep the popup and its parent-hover relationship intact; only the action
             # list changes, so cursor-leave behavior remains owned by Qt's menu logic.
-            self._device_menu.setActiveAction(None)
+            if not updated_in_place:
+                # 就地刷新保留悬停高亮；全量重建后原高亮项已销毁，须复位。
+                self._device_menu.setActiveAction(None)
             parent_menu = self.contextMenu()
             if parent_menu is not None:
                 anchor_left_cascade_submenu(self._device_menu, parent_menu)
@@ -1121,6 +1288,7 @@ class VoiceTray(QSystemTrayIcon):
         if self._dev_refresh_ready and not self._dev_menu_dirty:
             self._sync_device_menu_checks()
         self._sync_bool_config_actions()
+        self._sync_output_mode_menu()
 
     def _sync_bool_config_actions(self, changed: set[str] | None = None) -> None:
         for field, attr in _TRAY_BOOL_MENU_ACTIONS:
@@ -1432,10 +1600,24 @@ class VoiceTray(QSystemTrayIcon):
             )
             self.refresh_idle_icon()
 
-    def _toggle_paste_result(self, checked: bool):
-        self._config.paste_result = checked
-        self._config.save()
-        logger.info(f"[Tray] Paste result → {'on' if checked else 'off'}")
+    def _set_output_mode(self, mode_key: str):
+        if mode_key not in OUTPUT_MODES:
+            self._sync_output_mode_menu()
+            return
+        if self._config.output_mode == mode_key:
+            self._sync_output_mode_menu()
+            return
+        self._config.output_mode = mode_key
+        self._config.save(touched=frozenset({"output_mode"}))
+        self._sync_output_mode_menu()
+        logger.info(f"[Tray] Output mode → {mode_key}")
+
+    def _sync_output_mode_menu(self):
+        _sync_checkable_actions(
+            self._output_mode_menu.actions(),
+            normalize_output_mode(self._config.output_mode),
+            fallback_key=DEFAULT_OUTPUT_MODE,
+        )
 
     def _toggle_save_audio(self, checked: bool):
         self._config.save_audio = checked
@@ -1647,6 +1829,9 @@ class VoiceTray(QSystemTrayIcon):
 
         if "smart_chunk_max_duration_sec" in changed:
             self._sync_duration_menu()
+
+        if "output_mode" in changed:
+            self._sync_output_mode_menu()
 
         self._sync_bool_config_actions(changed)
 
