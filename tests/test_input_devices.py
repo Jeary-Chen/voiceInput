@@ -11,34 +11,89 @@ if str(SRC) not in sys.path:
 
 
 class InputDeviceSnapshotTests(unittest.TestCase):
-    def test_snapshot_uses_pyaudio_as_recordable_source(self):
+    def test_snapshot_collapses_pyaudio_truncation_and_full_name(self):
+        from core.device_names import pyaudio_truncated_name
         from core.input_devices import get_input_device_snapshot
 
-        with patch("core.input_devices.VoiceRecorder.list_devices", return_value=[]):
+        full = "耳机 (HUAWEI FreeBuds SE 2 Hands-Free AG Audio)"
+        trunc = pyaudio_truncated_name(full)
+        with patch(
+            "core.input_devices.VoiceRecorder.list_devices",
+            return_value=[
+                {"name": trunc, "index": 1},
+                {"name": full, "index": 18},
+            ],
+        ):
             with patch(
                 "core.input_devices.get_default_capture_device_name",
-                return_value="耳机 (HUAWEI FreeBuds SE 2 Hands-Free AG Audio)",
+                return_value=full,
+            ):
+                with patch(
+                    "core.input_devices.get_full_device_names",
+                    return_value={trunc: full},
+                ):
+                    snapshot = get_input_device_snapshot()
+
+        self.assertEqual(len(snapshot.devices), 1)
+        self.assertEqual(snapshot.devices[0].name, trunc)
+        self.assertEqual(snapshot.devices[0].display_name, full)
+        self.assertEqual(snapshot.devices[0].index, 18)
+        self.assertTrue(snapshot.has_recordable_device)
+        self.assertIsNotNone(snapshot.find_by_name(full))
+        self.assertIsNotNone(snapshot.find_by_name(trunc))
+
+    def test_snapshot_keeps_two_distinct_endpoints_with_similar_brand(self):
+        from core.input_devices import get_input_device_snapshot
+
+        handsfree = "耳机 (HUAWEI FreeBuds SE 2 Hands-Free AG Audio)"
+        stereo = "耳机 (HUAWEI FreeBuds SE 2 Stereo)"
+        with patch(
+            "core.input_devices.VoiceRecorder.list_devices",
+            return_value=[
+                {"name": handsfree, "index": 2},
+                {"name": stereo, "index": 5},
+            ],
+        ):
+            with patch(
+                "core.input_devices.get_default_capture_device_name",
+                return_value=handsfree,
             ):
                 with patch(
                     "core.input_devices.get_full_device_names",
                     return_value={
-                        "耳机 (HUAWEI FreeBuds SE 2 Hand": (
-                            "耳机 (HUAWEI FreeBuds SE 2 Hands-Free AG Audio)"
-                        )
+                        handsfree[:31]: handsfree,
+                        stereo[:31]: stereo,
                     },
                 ):
                     snapshot = get_input_device_snapshot()
 
+        self.assertEqual(len(snapshot.devices), 2)
         self.assertEqual(
-            snapshot.default_name,
-            "耳机 (HUAWEI FreeBuds SE 2 Hands-Free AG Audio)",
+            {device.display_name for device in snapshot.devices},
+            {handsfree, stereo},
         )
+
+    def test_snapshot_uses_pyaudio_as_recordable_source(self):
+        from core.device_names import pyaudio_truncated_name
+        from core.input_devices import get_input_device_snapshot
+
+        full = "耳机 (HUAWEI FreeBuds SE 2 Hands-Free AG Audio)"
+        trunc = pyaudio_truncated_name(full)
+        with patch("core.input_devices.VoiceRecorder.list_devices", return_value=[]):
+            with patch(
+                "core.input_devices.get_default_capture_device_name",
+                return_value=full,
+            ):
+                with patch(
+                    "core.input_devices.get_full_device_names",
+                    return_value={trunc: full},
+                ):
+                    snapshot = get_input_device_snapshot()
+
+        self.assertEqual(snapshot.default_name, full)
         self.assertEqual(snapshot.recordable_default_name, "")
         self.assertEqual(len(snapshot.devices), 1)
-        self.assertEqual(
-            snapshot.devices[0].display_name,
-            "耳机 (HUAWEI FreeBuds SE 2 Hands-Free AG Audio)",
-        )
+        self.assertEqual(snapshot.devices[0].display_name, full)
         self.assertFalse(snapshot.devices[0].is_recordable)
         self.assertFalse(snapshot.has_recordable_device)
 

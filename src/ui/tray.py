@@ -144,16 +144,17 @@ def _device_menu_row_specs(
       ("separator",)                  分隔线
       ("placeholder", text)           禁用占位行
     """
+    devices = snapshot.devices
+    if not devices:
+        # 无采集端点：不展示「系统默认」，仅灰色占位（与「正在初始化」同为不可选）。
+        return [("placeholder", "(无)")]
+
     default_name = snapshot.default_name
     label = f"系统默认 ({default_name})" if default_name else "系统默认"
     specs: list[tuple] = [
         ("action", _TRAY_MENU_DEFAULT_DEVICE, label, True),
         ("separator",),
     ]
-    devices = snapshot.devices
-    if not devices:
-        specs.append(("placeholder", "(未发现兼容设备)"))
-        return specs
     for dev in devices:
         if dev.is_recordable:
             text = dev.display_name

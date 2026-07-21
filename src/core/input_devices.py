@@ -4,7 +4,9 @@ from dataclasses import dataclass
 
 from core.device_names import (
     device_identity_key,
+    is_pyaudio_name_truncation_pair,
     is_system_capture_alias,
+    pyaudio_truncated_name,
     same_device_name,
 )
 from core.device_watcher import get_default_capture_device_name, get_full_device_names
@@ -37,6 +39,9 @@ class InputDeviceSnapshot:
         visible = next((device for device in self.devices if device.name == name), None)
         if visible is not None:
             return visible
+        for device in self.devices:
+            if same_device_name(device.name, name) or same_device_name(device.display_name, name):
+                return device
         return next((device for device in self._recordable_candidates if device.name == name), None)
 
     @property
@@ -69,6 +74,10 @@ class _RawDeviceIndex:
                 device = self._by_identity.get(key)
                 if device is not None:
                     return device
+            # Trunc↔full are different identity keys; still the same endpoint.
+            for raw_name, device in self._exact.items():
+                if is_pyaudio_name_truncation_pair(name, raw_name):
+                    return device
         return None
 
     def iter_names(self):
@@ -89,7 +98,14 @@ class _FullNameIndex:
         if raw_name in self._by_trunc:
             return self._by_trunc[raw_name]
         key = device_identity_key(raw_name)
-        return self._by_identity.get(key, raw_name)
+        if key and key in self._by_identity:
+            return self._by_identity[key]
+        for trunc, full in self._by_trunc.items():
+            if is_pyaudio_name_truncation_pair(raw_name, trunc) or is_pyaudio_name_truncation_pair(
+                raw_name, full
+            ):
+                return full
+        return raw_name
 
 
 def get_input_device_snapshot(*, open_probe: bool = True) -> InputDeviceSnapshot:
@@ -126,16 +142,41 @@ def get_input_device_snapshot(*, open_probe: bool = True) -> InputDeviceSnapshot
     )
 
 
+def _remember_endpoint_names(seen: set[str], *names: str | None) -> None:
+    """Mark all known spellings of one endpoint so trunc/full cannot double-list."""
+    for name in names:
+        if not name:
+            continue
+        seen.add(name)
+        trunc = pyaudio_truncated_name(name)
+        if trunc:
+            seen.add(trunc)
+
+
+def _endpoint_already_listed(name: str, seen: set[str]) -> bool:
+    if name in seen:
+        return True
+    return any(is_pyaudio_name_truncation_pair(name, prior) for prior in seen)
+
+
 def _merge_visible_devices(
     raw_index: _RawDeviceIndex,
     full_names: dict[str, str],
     full_index: _FullNameIndex,
 ) -> tuple[InputDevice, ...]:
+    """One menu row per Windows capture endpoint.
+
+    COM friendly names are the row source of truth. PyAudio only supplies
+    openability / index. Truncated and full spellings of the same endpoint are
+    collapsed with :func:`is_pyaudio_name_truncation_pair` — never by loose
+    display-name similarity.
+    """
     devices: list[InputDevice] = []
     seen: set[str] = set()
 
     for trunc, full_name in full_names.items():
-        raw_device = raw_index.lookup(trunc, full_name)
+        # Prefer full name match first: WASAPI often keeps the untruncated form.
+        raw_device = raw_index.lookup(full_name, trunc)
         devices.append(
             InputDevice(
                 name=trunc,
@@ -143,12 +184,15 @@ def _merge_visible_devices(
                 index=raw_device["index"] if raw_device is not None else None,
             )
         )
-        seen.add(trunc)
-        if raw_device is not None:
-            seen.add(raw_device["name"])
+        _remember_endpoint_names(
+            seen,
+            trunc,
+            full_name,
+            raw_device["name"] if raw_device is not None else None,
+        )
 
     for raw_name in raw_index.iter_names():
-        if raw_name in seen or is_system_capture_alias(raw_name):
+        if _endpoint_already_listed(raw_name, seen) or is_system_capture_alias(raw_name):
             continue
         raw_device = raw_index.lookup(raw_name)
         if raw_device is None:
@@ -160,6 +204,7 @@ def _merge_visible_devices(
                 index=raw_device["index"],
             )
         )
+        _remember_endpoint_names(seen, raw_name, full_index.display_name(raw_name))
 
     return tuple(devices)
 

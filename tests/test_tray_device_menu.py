@@ -337,6 +337,28 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         unrecordable = next(action for action in actions if action.text() == "Bluetooth Mic（不可录）")
         self.assertFalse(unrecordable.isEnabled())
 
+    def test_rebuild_empty_devices_shows_none_placeholder_without_system_default(self):
+        from ui.tray import VoiceTray
+
+        menu = QMenu()
+        tray = SimpleNamespace(
+            _config=SimpleNamespace(mic_name=""),
+            _input_snapshot=_snapshot("", []),
+            _dev_menu_dirty=True,
+            _device_menu=menu,
+            contextMenu=lambda: None,
+        )
+        _bind_recordable_retry_state(tray)
+        _bind_menu_build(tray)
+
+        VoiceTray._rebuild_device_menu(tray)
+
+        actions = list(menu.actions())
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].text(), "(无)")
+        self.assertFalse(actions[0].isEnabled())
+        self.assertFalse(actions[0].isCheckable())
+
     def test_rebuild_shows_initializing_while_recordable_retry_active(self):
         from ui.tray import VoiceTray
 
@@ -738,6 +760,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _menu_refresh_min_interval=10.0,
             _last_menu_refresh_time=0.0,
             _start_async_refresh=lambda: refreshes.append(True),
+            contextMenu=lambda: None,
         )
         tray._on_menu_about_to_show = (
             lambda: VoiceTray._on_menu_about_to_show(tray)

@@ -13,6 +13,7 @@ from ctypes.wintypes import DWORD, LPCWSTR
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from core.device_names import pyaudio_truncated_name
 from core.log import logger, log_event
 
 _TAG = "[DeviceWatcher]"
@@ -137,8 +138,8 @@ class IMMDeviceEnumerator(comtypes.IUnknown):
 def get_full_device_names() -> dict[str, str]:
     """Get full (non-truncated) friendly names for all active capture devices.
 
-    Returns a dict mapping the first 31 chars (PyAudio truncation) to the
-    full name.  Runs in ~5ms via COM, no subprocess needed.
+    Returns a dict mapping the PyAudio-truncated form (first 31 chars) to the
+    full Windows friendly name.  Runs in ~5ms via COM, no subprocess needed.
     """
     try:
         comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
@@ -155,8 +156,7 @@ def get_full_device_names() -> dict[str, str]:
             pv = store.GetValue(_PKEY_Device_FriendlyName)
             if pv.pwszVal:
                 full = pv.pwszVal
-                trunc = full[:31]
-                result[trunc] = full
+                result[pyaudio_truncated_name(full)] = full
         return result
     except Exception:
         logger.opt(exception=True).warning(f"{_TAG} Failed to get full device names")
