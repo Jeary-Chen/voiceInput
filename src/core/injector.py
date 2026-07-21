@@ -28,8 +28,6 @@ from core.output_mode import (
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
-VK_RETURN = 0x0D
-VK_TAB = 0x09
 
 ULONG_PTR = ctypes.c_size_t
 
@@ -94,26 +92,32 @@ def _ki_event(*, vk: int = 0, scan: int = 0, flags: int = 0) -> INPUT:
     return inp
 
 
+def _unicode_char_events(ch: str) -> list[INPUT]:
+    """Emit one character as Unicode text (never as a virtual-key chord)."""
+    events: list[INPUT] = []
+    encoded = ch.encode("utf-16-le")
+    for off in range(0, len(encoded), 2):
+        unit = int.from_bytes(encoded[off : off + 2], "little")
+        events.append(_ki_event(scan=unit, flags=KEYEVENTF_UNICODE))
+        events.append(
+            _ki_event(scan=unit, flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+        )
+    return events
+
+
 def _events_for_text(text: str) -> list[INPUT]:
+    """Build SendInput events for *text*.
+
+    Newlines and tabs are injected as Unicode U+000A / U+0009 so host apps
+    treat them as characters (e.g. line break in an editor) instead of the
+    physical Enter/Tab keys that often mean "send" in chat UIs.
+    Lone ``\\r`` from Windows CRLF is dropped; ``\\n`` carries the break.
+    """
     events: list[INPUT] = []
     for ch in text:
         if ch == "\r":
             continue
-        if ch == "\n":
-            events.append(_ki_event(vk=VK_RETURN, flags=0))
-            events.append(_ki_event(vk=VK_RETURN, flags=KEYEVENTF_KEYUP))
-            continue
-        if ch == "\t":
-            events.append(_ki_event(vk=VK_TAB, flags=0))
-            events.append(_ki_event(vk=VK_TAB, flags=KEYEVENTF_KEYUP))
-            continue
-        encoded = ch.encode("utf-16-le")
-        for off in range(0, len(encoded), 2):
-            unit = int.from_bytes(encoded[off : off + 2], "little")
-            events.append(_ki_event(scan=unit, flags=KEYEVENTF_UNICODE))
-            events.append(
-                _ki_event(scan=unit, flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
-            )
+        events.extend(_unicode_char_events(ch))
     return events
 
 

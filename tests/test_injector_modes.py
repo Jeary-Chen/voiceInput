@@ -53,14 +53,30 @@ class TextInjectorModeTests(unittest.TestCase):
         copy_mock.assert_called_once_with("ONLY")
         typed.assert_not_called()
 
-    def test_type_unicode_encodes_cjk_and_newline(self):
-        from core.injector import KEYEVENTF_UNICODE, VK_RETURN, _events_for_text
+    def test_type_unicode_encodes_cjk_newline_and_tab_as_characters(self):
+        from core.injector import KEYEVENTF_UNICODE, _events_for_text
 
-        events = _events_for_text("啊\n")
-        self.assertEqual(len(events), 4)  # 啊 down/up + Enter down/up
-        self.assertTrue(events[0].union.ki.dwFlags & KEYEVENTF_UNICODE)
+        events = _events_for_text("啊\n\t")
+        # 啊 / LF / TAB — each as Unicode down+up (not VK_RETURN / VK_TAB).
+        self.assertEqual(len(events), 6)
+        for event in events:
+            self.assertTrue(event.union.ki.dwFlags & KEYEVENTF_UNICODE)
+            self.assertEqual(event.union.ki.wVk, 0)
         self.assertEqual(events[0].union.ki.wScan, ord("啊"))
-        self.assertEqual(events[2].union.ki.wVk, VK_RETURN)
+        self.assertEqual(events[2].union.ki.wScan, ord("\n"))
+        self.assertEqual(events[4].union.ki.wScan, ord("\t"))
+
+    def test_type_unicode_drops_cr_keeps_lf_from_crlf(self):
+        from core.injector import KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, _events_for_text
+
+        events = _events_for_text("a\r\nb")
+        scans = [
+            e.union.ki.wScan
+            for e in events
+            if (e.union.ki.dwFlags & KEYEVENTF_UNICODE)
+            and not (e.union.ki.dwFlags & KEYEVENTF_KEYUP)
+        ]
+        self.assertEqual(scans, [ord("a"), ord("\n"), ord("b")])
 
     def test_type_unicode_sendinput_full_batch(self):
         from core.injector import _events_for_text, type_unicode
