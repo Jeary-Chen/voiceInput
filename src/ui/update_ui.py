@@ -1,9 +1,9 @@
 """Update-related UI widgets: release-notes dialog, restart dialog, and tray menu helpers."""
 from PyQt6.QtCore import QTimer, Qt, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTextBrowser, QMenu, QWidgetAction,
+    QStyleOptionMenuItem, QTextBrowser, QMenu, QWidget, QWidgetAction,
 )
 
 from core.updater import RELEASES_PAGE_URL, UpdateInfo
@@ -208,20 +208,139 @@ class _UpdateFailedDialog(QDialog):
         root.addLayout(row)
 
 
-class _MenuLabel(QLabel):
-    """QLabel styled as a menu item with hover highlight, for QWidgetAction."""
+# Shared text column for QAction rows (icon gutter) and QWidgetAction rows.
+# QAction text starts at: item padding-left + style maxIconWidth (measured 12+20).
+_MENU_ICON_SIZE = 14
+_MENU_PAD_LEFT = 12
+_MENU_PAD_TOP = 7
+_MENU_PAD_RIGHT = 28
+_MENU_PAD_BOTTOM = 7
+_MENU_ITEM_PADDING = (
+    f"{_MENU_PAD_TOP}px {_MENU_PAD_RIGHT}px {_MENU_PAD_BOTTOM}px {_MENU_PAD_LEFT}px"
+)
+# Fallback when the menu has not been polished yet (Windows Fusion ≈ 20).
+_MENU_ICON_GUTTER_FALLBACK = 20
+
+_BLANK_MENU_ICON: QIcon | None = None
+_CHECK_MENU_ICON: QIcon | None = None
+
+
+def menu_blank_icon() -> QIcon:
+    """Transparent icon that reserves the tray-menu gutter."""
+    global _BLANK_MENU_ICON
+    if _BLANK_MENU_ICON is None:
+        pix = QPixmap(_MENU_ICON_SIZE, _MENU_ICON_SIZE)
+        pix.fill(Qt.GlobalColor.transparent)
+        _BLANK_MENU_ICON = QIcon(pix)
+    return _BLANK_MENU_ICON
+
+
+def menu_check_icon() -> QIcon:
+    """White checkmark painted into the same gutter as menu_blank_icon()."""
+    global _CHECK_MENU_ICON
+    if _CHECK_MENU_ICON is None:
+        pix = QPixmap(_MENU_ICON_SIZE, _MENU_ICON_SIZE)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor("#ffffff"))
+        font = QFont()
+        font.setPixelSize(12)
+        painter.setFont(font)
+        painter.drawText(pix.rect(), int(Qt.AlignmentFlag.AlignCenter), "\u2713")
+        painter.end()
+        _CHECK_MENU_ICON = QIcon(pix)
+    return _CHECK_MENU_ICON
+
+
+def menu_icon_gutter_width(menu: QMenu | None) -> int:
+    """Return the icon column width QMenu reserves for QAction rows."""
+    if menu is None:
+        return _MENU_ICON_GUTTER_FALLBACK
+    for action in menu.actions():
+        if action.isSeparator() or isinstance(action, QWidgetAction):
+            continue
+        if action.icon().isNull():
+            continue
+        opt = QStyleOptionMenuItem()
+        menu.initStyleOption(opt, action)
+        if opt.maxIconWidth > 0:
+            return int(opt.maxIconWidth)
+    return _MENU_ICON_GUTTER_FALLBACK
+
+
+def sync_menu_action_icon(action: QAction | None) -> None:
+    """Keep checkable/non-checkable rows on one text column via icons."""
+    if action is None or action.isSeparator():
+        return
+    if isinstance(action, QWidgetAction):
+        return
+    if action.isCheckable() and action.isChecked():
+        action.setIcon(menu_check_icon())
+    else:
+        action.setIcon(menu_blank_icon())
+
+
+def prepare_tray_menu_icons(menu: QMenu | None) -> None:
+    """Apply gutter icons and align QWidgetAction rows to the same text column."""
+    if menu is None:
+        return
+    for action in menu.actions():
+        sync_menu_action_icon(action)
+        submenu = action.menu()
+        if submenu is not None:
+            prepare_tray_menu_icons(submenu)
+    gutter = menu_icon_gutter_width(menu)
+    for action in menu.actions():
+        if not isinstance(action, QWidgetAction):
+            continue
+        widget = action.defaultWidget()
+        if isinstance(widget, _MenuLabel):
+            widget.set_icon_gutter_width(gutter)
+
+
+class _MenuLabel(QWidget):
+    """Menu-row widget for QWidgetAction: same left pad + icon gutter as QAction."""
 
     _BG_NORMAL = "transparent"
     _BG_HOVER = "#3a3a3a"
-    _PAD = "padding:7px 28px 7px 24px;"
 
     def __init__(self, text: str = "", parent=None):
-        super().__init__(text, parent)
+        super().__init__(parent)
         self.setMouseTracking(True)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
-        self._color_css = ""
+        self._color_css = "color:#ffffff;"
         self._hover_enabled = True
         self._swallow_clicks = False
+
+        self._gutter = QWidget(self)
+        self._gutter.setFixedWidth(_MENU_ICON_GUTTER_FALLBACK)
+
+        self._label = QLabel(text, self)
+        self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(
+            _MENU_PAD_LEFT, _MENU_PAD_TOP, _MENU_PAD_RIGHT, _MENU_PAD_BOTTOM,
+        )
+        root.setSpacing(0)
+        root.addWidget(self._gutter)
+        root.addWidget(self._label, 1)
+        self._apply(self._BG_NORMAL)
+
+    def set_icon_gutter_width(self, width: int) -> None:
+        width = max(0, int(width))
+        if self._gutter.width() != width:
+            self._gutter.setFixedWidth(width)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt API
+        self._label.setText(text)
+
+    def text(self) -> str:
+        return self._label.text()
+
+    def setTextFormat(self, fmt: Qt.TextFormat) -> None:  # noqa: N802 - Qt API
+        self._label.setTextFormat(fmt)
 
     def set_hover_enabled(self, on: bool):
         self._hover_enabled = on
@@ -237,9 +356,13 @@ class _MenuLabel(QLabel):
 
     def _apply(self, bg: str):
         self.setStyleSheet(
-            f"font-size:13px; {self._PAD} {self._color_css}"
-            f" background:{bg}; border:none; outline:none;"
+            f"background:{bg}; border:none; outline:none;"
         )
+        self._label.setStyleSheet(
+            f"font-size:13px; {self._color_css}"
+            f" background:transparent; border:none; outline:none;"
+        )
+        self._gutter.setStyleSheet("background:transparent; border:none;")
 
     def enterEvent(self, event):
         menu = self._find_parent_menu()
@@ -365,29 +488,35 @@ class _UpdateMenuHelper:
         self._set_action("已是最新版本", self._CLR_DIMMED, clickable=False)
 
 
-MENU_STYLE = """
-    QMenu {
+MENU_STYLE = f"""
+    QMenu {{
         background: #2a2a2a;
         color: #ffffff;
         border: 1px solid #444;
         border-radius: 8px;
         padding: 6px 0;
-    }
-    QMenu::item {
-        padding: 7px 28px 7px 16px;
+    }}
+    QMenu::item {{
+        padding: {_MENU_ITEM_PADDING};
         font-size: 13px;
-    }
-    QMenu::item:selected {
+        icon-size: {_MENU_ICON_SIZE}px;
+    }}
+    QMenu::item:selected {{
         background: #3a3a3a;
-    }
-    QMenu::item:disabled {
+    }}
+    QMenu::item:disabled {{
         color: #666;
-    }
-    QMenu::separator {
+    }}
+    QMenu::indicator {{
+        /* Checks are drawn via action icons so every row shares one gutter. */
+        width: 0px;
+        height: 0px;
+    }}
+    QMenu::separator {{
         height: 1px;
         background: #3a3a3a;
         margin: 4px 12px;
-    }
+    }}
 """
 
 

@@ -46,7 +46,7 @@ from ui.apikey_dialog import _ApiKeyDialog
 from ui.update_ui import (
     _UpdateNotesDialog, _UpdateReadyDialog, _UpdateFailedDialog, _UpdateMenuHelper,
     anchor_left_cascade_submenu, apply_tray_menu_style, install_left_cascade_submenu,
-    open_releases_page,
+    open_releases_page, prepare_tray_menu_icons, sync_menu_action_icon,
 )
 from ui.prompt_dialog import _PolishPromptDialog
 
@@ -90,6 +90,7 @@ def _set_action_checked(action: QAction, checked: bool) -> None:
     action.blockSignals(True)
     action.setChecked(checked)
     action.blockSignals(False)
+    sync_menu_action_icon(action)
 
 
 def _sync_checkable_actions(
@@ -657,14 +658,14 @@ class VoiceTray(QSystemTrayIcon):
         act_config.triggered.connect(self._open_config_file)
         menu.addAction(act_config)
 
+        # ── 系统设置 ──
+        menu.addSeparator()
+
         self._act_save_audio = QAction("保存录音文件", menu)
         self._act_save_audio.setCheckable(True)
         self._act_save_audio.setChecked(self._config.save_audio)
         self._act_save_audio.triggered.connect(self._toggle_save_audio)
         menu.addAction(self._act_save_audio)
-
-        # ── 系统设置 ──
-        menu.addSeparator()
 
         self._act_autostart = QAction("开机自启", menu)
         self._act_autostart.setCheckable(True)
@@ -700,6 +701,7 @@ class VoiceTray(QSystemTrayIcon):
         self.setContextMenu(menu)
 
         self._rebuild_prompt_menu()
+        prepare_tray_menu_icons(menu)
         self._start_async_refresh()
 
     # ── device refresh (background thread) ──
@@ -747,6 +749,7 @@ class VoiceTray(QSystemTrayIcon):
 
     def _on_menu_about_to_show(self):
         self._sync_config_backed_menu_checks()
+        prepare_tray_menu_icons(self.contextMenu())
         # Device-change notifications (hot-plug, default switch, state change)
         # already drive refreshes, so opening the menu must not enumerate:
         # the enumeration open-probe briefly opens every capture endpoint,
@@ -1240,6 +1243,7 @@ class VoiceTray(QSystemTrayIcon):
             self._config,
             self._input_snapshot,
         )
+        prepare_tray_menu_icons(self._device_menu)
 
         if menu_visible:
             # Keep the popup and its parent-hover relationship intact; only the action
@@ -1324,6 +1328,8 @@ class VoiceTray(QSystemTrayIcon):
             act.setChecked(self._config.active_prompt_id == pid)
             act.triggered.connect(lambda checked, _id=pid: self._set_active_prompt(_id))
             self._prompt_menu.addAction(act)
+
+        prepare_tray_menu_icons(self._prompt_menu)
 
     def _sync_prompt_menu_checks(self):
         """仅更新勾选，不在弹出时 clear 子菜单，避免 Windows 上首次展开几何错位。"""
@@ -1534,6 +1540,8 @@ class VoiceTray(QSystemTrayIcon):
             act.setChecked(model_id == current)
             act.triggered.connect(lambda checked, m=model_id: self._set_polish_model(m))
             self._polish_model_menu.addAction(act)
+
+        prepare_tray_menu_icons(self._polish_model_menu)
 
     def _sync_polish_model_menu_checks(self):
         _sync_checkable_actions(
