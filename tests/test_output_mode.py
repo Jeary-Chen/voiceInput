@@ -92,20 +92,19 @@ class OutputModeConfigMigrationTests(unittest.TestCase):
 
 
 class InjectorDeliverTests(unittest.TestCase):
-    def test_deliver_dispatches_by_mode(self):
+    def test_deliver_routes_by_normalized_mode(self):
         from core.injector import TextInjector
-        from unittest.mock import patch
 
-        inj = TextInjector()
-        with patch.object(inj, "copy_only", return_value=True) as c, \
-             patch.object(inj, "paste_only", return_value=True) as p, \
-             patch.object(inj, "paste_and_copy", return_value=True) as pc:
-            self.assertEqual(inj.deliver("t", "copy"), "copied")
-            self.assertEqual(inj.deliver("t", "paste"), "pasted")
-            self.assertEqual(inj.deliver("t", "paste_copy"), "pasted_copied")
-            c.assert_called_once_with("t")
-            p.assert_called_once_with("t")
-            pc.assert_called_once_with("t")
+        inj = TextInjector(
+            can_type=lambda: True,
+            type_text=lambda text: True,
+            copy_text=lambda text: True,
+        )
+        self.assertEqual(inj.deliver("t", "copy"), "copied")
+        self.assertEqual(inj.deliver("t", "paste"), "pasted")
+        self.assertEqual(inj.deliver("t", "paste_copy"), "pasted_copied")
+        # unknown → default paste_copy
+        self.assertEqual(inj.deliver("t", "nope"), "pasted_copied")
 
 
 if __name__ == "__main__":

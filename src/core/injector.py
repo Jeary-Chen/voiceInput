@@ -1,18 +1,33 @@
-"""Text delivery to the focused app / clipboard.
+"""Text delivery: policy (output_mode) over clipboard / Unicode typing.
 
-Modes (config keys from core.output_mode):
-  copy        → copy_only()
-  paste       → paste_only()       — Unicode SendInput, no clipboard
-  paste_copy  → paste_and_copy()   — clipboard then type
+Architecture
+------------
+* Mechanisms (no policy): ``write_clipboard``, ``type_unicode``
+* Focus probe: ``core.focus_target.can_accept_typed_text``
+* Policy entry: ``TextInjector.deliver`` — the only path engine uses
+
+Delivery policy (config.output_mode)
+------------------------------------
+``copy``
+    Always clipboard. Never type.
+
+``paste``  (「仅写入焦点处」)
+    If focus can accept typing and typing succeeds → done, no clipboard.
+    Otherwise (no focus, or typing failed) → clipboard fallback.
+
+``paste_copy``  (「写入焦点并复制」)
+    Always clipboard first; then type when focus can accept it (best-effort).
 """
 
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Callable
 from ctypes import wintypes
 
 import pyperclip
 
+from core.focus_target import can_accept_typed_text
 from core.log import logger
 from core.output_mode import (
     DELIVER_COPIED,
@@ -21,6 +36,7 @@ from core.output_mode import (
     DELIVER_PASTED_COPIED,
     OUTPUT_MODE_COPY,
     OUTPUT_MODE_PASTE,
+    OUTPUT_MODE_PASTE_COPY,
     normalize_output_mode,
 )
 
@@ -143,49 +159,66 @@ def type_unicode(text: str, *, chunk_chars: int = 64) -> bool:
     return True
 
 
+def write_clipboard(text: str) -> bool:
+    """Write *text* to the system clipboard."""
+    if not text:
+        return False
+    try:
+        pyperclip.copy(text)
+        return True
+    except Exception as exc:
+        logger.warning(f"[Injector] clipboard write failed: {exc}")
+        return False
+
+
 class TextInjector:
+    """Applies output_mode policy using clipboard + Unicode typing mechanisms."""
+
+    def __init__(
+        self,
+        *,
+        can_type: Callable[[], bool] | None = None,
+        type_text: Callable[[str], bool] | None = None,
+        copy_text: Callable[[str], bool] | None = None,
+    ):
+        self._can_type = can_type or can_accept_typed_text
+        self._type_text = type_text or type_unicode
+        self._copy_text = copy_text or write_clipboard
+
     def deliver(self, text: str, mode: str) -> str:
-        """Dispatch by output_mode. Returns a DELIVER_* action token."""
+        """Deliver *text* per *mode*. Returns a DELIVER_* action token."""
         if not text:
             return DELIVER_FAILED
         mode = normalize_output_mode(mode)
+
         if mode == OUTPUT_MODE_COPY:
-            return DELIVER_COPIED if self.copy_only(text) else DELIVER_FAILED
+            return self._deliver_copy(text)
         if mode == OUTPUT_MODE_PASTE:
-            return DELIVER_PASTED if self.paste_only(text) else DELIVER_FAILED
-        return DELIVER_PASTED_COPIED if self.paste_and_copy(text) else DELIVER_FAILED
+            return self._deliver_paste(text)
+        if mode == OUTPUT_MODE_PASTE_COPY:
+            return self._deliver_paste_copy(text)
+        return DELIVER_FAILED
 
-    def copy_only(self, text: str) -> bool:
-        if not text:
-            return False
-        try:
-            pyperclip.copy(text)
-            return True
-        except Exception as exc:
-            logger.warning(f"[Injector] copy_only failed: {exc}")
-            return False
+    def _deliver_copy(self, text: str) -> str:
+        return DELIVER_COPIED if self._copy_text(text) else DELIVER_FAILED
 
-    def paste_only(self, text: str) -> bool:
-        """键入到输入焦点，不读写剪贴板。"""
-        if not text:
-            return False
-        try:
-            return type_unicode(text)
-        except Exception as exc:
-            logger.warning(f"[Injector] paste_only failed: {exc}")
-            return False
+    def _deliver_paste(self, text: str) -> str:
+        """Type when possible; otherwise (or on type failure) clipboard."""
+        if self._can_type() and self._try_type(text):
+            return DELIVER_PASTED
+        return DELIVER_COPIED if self._copy_text(text) else DELIVER_FAILED
 
-    def paste_and_copy(self, text: str) -> bool:
-        """写入剪贴板并键入到输入焦点（剪贴板保留文本）。"""
-        if not text:
-            return False
+    def _deliver_paste_copy(self, text: str) -> str:
+        """Always clipboard; type into focus when available (best-effort)."""
+        if not self._copy_text(text):
+            return DELIVER_FAILED
+        if self._can_type():
+            self._try_type(text)
+        return DELIVER_PASTED_COPIED
+
+    def _try_type(self, text: str) -> bool:
         try:
-            pyperclip.copy(text)
+            return bool(self._type_text(text))
         except Exception as exc:
-            logger.warning(f"[Injector] paste_and_copy clipboard failed: {exc}")
+            logger.warning(f"[Injector] type into focus failed: {exc}")
             return False
-        try:
-            return type_unicode(text)
-        except Exception as exc:
-            logger.warning(f"[Injector] paste_and_copy type failed: {exc}")
-            return True

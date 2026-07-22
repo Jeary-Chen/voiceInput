@@ -1,9 +1,13 @@
-"""Recognition text delivery preferences when an input focus can accept typing.
+"""Recognition text delivery preferences (config.output_mode).
 
-Modes (tray submenu 「有输入焦点时」):
-  copy        — clipboard only, do not type
-  paste       — type into focus, never touch clipboard
-  paste_copy  — type into focus and keep text on clipboard
+Tray submenu 「有输入焦点时」 chooses the preference when typing is possible.
+``TextInjector.deliver`` owns the full policy, including no-focus / type-failure
+clipboard fallback — see ``core.injector``.
+
+Modes:
+  copy        — clipboard only, never type
+  paste       — type into focus when possible; else clipboard
+  paste_copy  — always clipboard, and type when focus can accept it
 """
 
 from __future__ import annotations

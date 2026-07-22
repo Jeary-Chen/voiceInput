@@ -83,7 +83,8 @@ _TRAY_BOOL_MENU_ACTIONS = (
 )
 
 # 有输入焦点时的写入偏好（三选一）——单一字段 config.output_mode
-#   copy / paste / paste_copy — 见 core.output_mode
+#   copy / paste / paste_copy — 见 core.output_mode / TextInjector.deliver
+#   无焦点或写入失败时：paste / paste_copy 都会落到剪贴板（paste_copy 则始终复制）
 
 
 def _set_action_checked(action: QAction, checked: bool) -> None:

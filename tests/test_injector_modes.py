@@ -1,9 +1,8 @@
-"""TextInjector: copy / paste_only / paste_and_copy."""
+"""TextInjector delivery policy + Unicode typing mechanisms."""
 
 from __future__ import annotations
 
 import sys
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,50 +13,80 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-class TextInjectorModeTests(unittest.TestCase):
-    def test_paste_only_does_not_touch_clipboard(self):
-        from core.injector import TextInjector
-        import pyperclip
+class DeliveryPolicyTests(unittest.TestCase):
+    """output_mode rules with injectable focus / type / clipboard."""
 
-        marker = f"KEEP_{time.time()}"
-        pyperclip.copy(marker)
-        with patch("core.injector.type_unicode", return_value=True) as typed:
-            ok = TextInjector().paste_only("hello 你好")
-        self.assertTrue(ok)
-        typed.assert_called_once_with("hello 你好")
-        self.assertEqual(pyperclip.paste(), marker)
-
-    def test_paste_and_copy_writes_clipboard_then_types(self):
+    def _inj(self, *, can_type: bool, typed_ok: bool = True, copy_ok: bool = True):
         from core.injector import TextInjector
 
-        order: list[str] = []
+        calls: list[str] = []
 
-        with patch("core.injector.pyperclip.copy",
-                   side_effect=lambda text: order.append(f"copy:{text}")), \
-             patch("core.injector.type_unicode",
-                   side_effect=lambda text, **kwargs: (
-                       order.append(f"type:{text}") or True
-                   )):
-            ok = TextInjector().paste_and_copy("RESULT")
+        def type_text(text: str) -> bool:
+            calls.append(f"type:{text}")
+            return typed_ok
 
-        self.assertTrue(ok)
-        self.assertEqual(order, ["copy:RESULT", "type:RESULT"])
+        def copy_text(text: str) -> bool:
+            calls.append(f"copy:{text}")
+            return copy_ok
 
-    def test_copy_only_writes_clipboard_without_typing(self):
-        from core.injector import TextInjector
+        inj = TextInjector(
+            can_type=lambda: can_type,
+            type_text=type_text,
+            copy_text=copy_text,
+        )
+        return inj, calls
 
-        with patch("core.injector.pyperclip.copy") as copy_mock, \
-             patch("core.injector.type_unicode") as typed:
-            ok = TextInjector().copy_only("ONLY")
-        self.assertTrue(ok)
-        copy_mock.assert_called_once_with("ONLY")
-        typed.assert_not_called()
+    def test_copy_always_clipboard_never_types(self):
+        inj, calls = self._inj(can_type=True)
+        self.assertEqual(inj.deliver("T", "copy"), "copied")
+        self.assertEqual(calls, ["copy:T"])
 
+    def test_paste_with_focus_types_without_clipboard(self):
+        inj, calls = self._inj(can_type=True, typed_ok=True)
+        self.assertEqual(inj.deliver("T", "paste"), "pasted")
+        self.assertEqual(calls, ["type:T"])
+
+    def test_paste_without_focus_falls_back_to_clipboard(self):
+        inj, calls = self._inj(can_type=False)
+        self.assertEqual(inj.deliver("T", "paste"), "copied")
+        self.assertEqual(calls, ["copy:T"])
+
+    def test_paste_type_failure_falls_back_to_clipboard(self):
+        inj, calls = self._inj(can_type=True, typed_ok=False)
+        self.assertEqual(inj.deliver("T", "paste"), "copied")
+        self.assertEqual(calls, ["type:T", "copy:T"])
+
+    def test_paste_copy_always_copies_and_types_when_focused(self):
+        inj, calls = self._inj(can_type=True, typed_ok=True)
+        self.assertEqual(inj.deliver("T", "paste_copy"), "pasted_copied")
+        self.assertEqual(calls, ["copy:T", "type:T"])
+
+    def test_paste_copy_without_focus_still_copies(self):
+        inj, calls = self._inj(can_type=False)
+        self.assertEqual(inj.deliver("T", "paste_copy"), "pasted_copied")
+        self.assertEqual(calls, ["copy:T"])
+
+    def test_paste_copy_type_failure_still_counts_as_pasted_copied(self):
+        inj, calls = self._inj(can_type=True, typed_ok=False)
+        self.assertEqual(inj.deliver("T", "paste_copy"), "pasted_copied")
+        self.assertEqual(calls, ["copy:T", "type:T"])
+
+    def test_paste_copy_clipboard_failure_is_failed(self):
+        inj, calls = self._inj(can_type=True, copy_ok=False)
+        self.assertEqual(inj.deliver("T", "paste_copy"), "failed")
+        self.assertEqual(calls, ["copy:T"])
+
+    def test_empty_text_fails(self):
+        inj, calls = self._inj(can_type=True)
+        self.assertEqual(inj.deliver("", "paste"), "failed")
+        self.assertEqual(calls, [])
+
+
+class TypeUnicodeMechanismTests(unittest.TestCase):
     def test_type_unicode_encodes_cjk_newline_and_tab_as_characters(self):
         from core.injector import KEYEVENTF_UNICODE, _events_for_text
 
         events = _events_for_text("啊\n\t")
-        # 啊 / LF / TAB — each as Unicode down+up (not VK_RETURN / VK_TAB).
         self.assertEqual(len(events), 6)
         for event in events:
             self.assertTrue(event.union.ki.dwFlags & KEYEVENTF_UNICODE)
@@ -85,14 +114,38 @@ class TextInjectorModeTests(unittest.TestCase):
         self.assertTrue(type_unicode(text))
         self.assertGreater(len(_events_for_text(text)), 0)
 
-    def test_paste_only_live_leaves_clipboard_alone(self):
-        from core.injector import TextInjector
+    def test_write_clipboard(self):
+        from core.injector import write_clipboard
         import pyperclip
+        import time
 
-        marker = f"LIVE_{time.time()}"
-        pyperclip.copy(marker)
-        TextInjector().paste_only("transient")
+        marker = f"CLIP_{time.time()}"
+        self.assertTrue(write_clipboard(marker))
         self.assertEqual(pyperclip.paste(), marker)
+
+
+class FocusTargetTests(unittest.TestCase):
+    def test_can_accept_typed_text_requires_external_focus(self):
+        from core.focus_target import FocusTarget, can_accept_typed_text
+
+        with patch("core.focus_target.probe_focus_target", return_value=None):
+            self.assertFalse(can_accept_typed_text())
+
+        no_focus = FocusTarget(1, 0, 0, 99)
+        with patch("core.focus_target.probe_focus_target", return_value=no_focus):
+            self.assertFalse(can_accept_typed_text())
+
+        with patch("core.focus_target.probe_focus_target",
+                   return_value=FocusTarget(1, 42, 0, 99)), \
+             patch("core.focus_target.ctypes.windll.kernel32.GetCurrentProcessId",
+                   return_value=7):
+            self.assertTrue(can_accept_typed_text())
+
+        with patch("core.focus_target.probe_focus_target",
+                   return_value=FocusTarget(1, 42, 0, 7)), \
+             patch("core.focus_target.ctypes.windll.kernel32.GetCurrentProcessId",
+                   return_value=7):
+            self.assertFalse(can_accept_typed_text())
 
 
 if __name__ == "__main__":
