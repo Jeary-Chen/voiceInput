@@ -138,12 +138,13 @@ class UpdateMetadataTests(unittest.TestCase):
             checker = UpdateChecker()
             checker._staged_store = StagedUpdateStore(temp_dir=root)
             calls = []
-            checker._cb_stage_done = lambda: calls.append("ready")
+            checker._cb_stage_done = lambda prompt: calls.append(("ready", prompt))
             checker._cb_available = lambda info: calls.append(("available", info.version))
 
             checker._on_check_result(_update_info("1.4.17"))
 
-            self.assertEqual(calls, ["ready"])
+            # Reused staging: ready UI yes, auto-prompt no.
+            self.assertEqual(calls, [("ready", False)])
             self.assertTrue(checker.is_ready_to_install)
             self.assertEqual(checker.staged_version, "1.4.17")
             self.assertTrue(staging.exists())
@@ -155,7 +156,7 @@ class UpdateMetadataTests(unittest.TestCase):
             checker = UpdateChecker()
             checker._staged_store = StagedUpdateStore(temp_dir=root)
             calls = []
-            checker._cb_stage_done = lambda: calls.append("ready")
+            checker._cb_stage_done = lambda prompt: calls.append(("ready", prompt))
             checker._cb_available = lambda info: calls.append(("available", info.version))
 
             checker._on_check_result(_update_info("1.4.18"))
@@ -172,12 +173,12 @@ class UpdateMetadataTests(unittest.TestCase):
             checker = UpdateChecker()
             checker._staged_store = StagedUpdateStore(temp_dir=root)
             calls = []
-            checker._cb_stage_done = lambda: calls.append("ready")
+            checker._cb_stage_done = lambda prompt: calls.append(("ready", prompt))
             checker._cb_check_failed = lambda: calls.append("failed")
 
             checker._on_check_result(_CHECK_ERROR)
 
-            self.assertEqual(calls, ["ready"])
+            self.assertEqual(calls, [("ready", False)])
             self.assertTrue(checker.is_ready_to_install)
             self.assertEqual(checker.staged_version, "1.4.17")
 
@@ -188,7 +189,7 @@ class UpdateMetadataTests(unittest.TestCase):
             checker = UpdateChecker()
             checker._staged_store = StagedUpdateStore(temp_dir=root)
             calls = []
-            checker._cb_stage_done = lambda: calls.append("ready")
+            checker._cb_stage_done = lambda prompt: calls.append(("ready", prompt))
             checker._cb_no_update = lambda: calls.append("no-update")
 
             checker._on_check_result(_NO_UPDATE)

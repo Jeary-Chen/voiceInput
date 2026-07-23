@@ -2077,11 +2077,14 @@ class VoiceTray(QSystemTrayIcon):
     def _on_stage_progress(self, percent: int):
         self._update_widget.set_extracting(percent)
 
-    def _on_stage_done(self):
-        logger.debug("[DEBUG] _on_stage_done | staging complete, ready to install")
+    def _on_stage_done(self, prompt: bool = True):
+        logger.debug(
+            f"[DEBUG] _on_stage_done | staging ready, prompt={prompt}"
+        )
         self._update_widget.set_ready()
         self._set_update_status("ready")
-        self._show_update_ready_dialog()
+        if prompt:
+            self._show_update_ready_dialog()
 
     def _on_stage_failed(self, msg: str):
         logger.debug(f"[DEBUG] _on_stage_failed | msg={msg}")

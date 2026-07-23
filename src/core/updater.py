@@ -815,8 +815,8 @@ class UpdateChecker:
 
         logger.info(f"[Updater] Reusing existing staging directory for v{version}")
         self._staged = staged
-        if self._cb_stage_done:
-            self._cb_stage_done()
+        # Reuse must not auto-prompt — user already saw (or dismissed) the dialog.
+        self._emit_stage_done(prompt=False)
         return True
 
     def _restore_staging_after_check_failure(self) -> bool:
@@ -832,9 +832,18 @@ class UpdateChecker:
             f"keeping staged v{staged.version}"
         )
         self._staged = staged
-        if self._cb_stage_done:
-            self._cb_stage_done()
+        self._emit_stage_done(prompt=False)
         return True
+
+    def _emit_stage_done(self, *, prompt: bool) -> None:
+        """Notify UI that a staged payload is ready.
+
+        ``prompt=True`` only after a fresh download/extract. Restoring an
+        already-staged package on later checks must use ``prompt=False`` so the
+        ready dialog does not keep popping open.
+        """
+        if self._cb_stage_done:
+            self._cb_stage_done(prompt)
 
     def _clear_staging_when_no_update(self) -> None:
         self._staged = None
@@ -884,8 +893,7 @@ class UpdateChecker:
                     f"[DEBUG] UpdateChecker._on_stage_done | cleanup_zip failed, path={self._downloaded_path}"
                 )
                 pass
-        if self._cb_stage_done:
-            self._cb_stage_done()
+        self._emit_stage_done(prompt=True)
 
     def _on_stage_failed(self, msg: str):
         logger.error(f"[Updater] Staging failed: {msg}")
