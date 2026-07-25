@@ -874,6 +874,48 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertEqual((target.width(), target.height()), (REC_W, REC_H))
         self.assertEqual(window._anchor_x, 640)
 
+    def test_drag_during_recording_expand_follows_cursor_without_dock_yank(self):
+        """Expand may keep running while dragging; position must not snap to top."""
+        screen = _Screen(QRect(0, 0, 1200, 900))
+        engine = _Engine()
+        engine.state = "recording"
+
+        with patch("ui.mini_window.QApplication.primaryScreen",
+                   return_value=screen):
+            window = MiniRecordingWindow(engine)
+        self.addCleanup(window.close)
+        window._apply_recording()
+        window._geom_anim.stop()
+        window._reveal_anim.stop()
+        window._hovered = True
+        window._top_bar.setVisible(True)
+        window._btn_rec_stop.setVisible(True)
+        window._show_recording_status()
+        window.setFixedSize(REC_W, REC_H)
+        window.move(560, 4)
+        window.show()
+        window._unlock_geometry()
+        window._target_size = (REC_HOVER_W, REC_H)
+        window._geom_anim.setDuration(MiniBarAnim.RECORD_HOVER_PANEL_MS)
+        window._geom_anim.setStartValue(QRect(560, 4, REC_W, REC_H))
+        window._geom_anim.setEndValue(QRect(545, 4, REC_HOVER_W, REC_H))
+        window._geom_anim.start()
+
+        window.mousePressEvent(_MouseEvent(QPoint(600, 14)))
+        window.mouseMoveEvent(_MouseEvent(QPoint(640, 200)))
+        # Simulate an in-flight expand frame that still targets the dock top.
+        window._on_geometry_anim_value_changed(QRect(545, 4, 95, REC_H))
+
+        self.assertTrue(window._is_dragging())
+        self.assertEqual(window.y(), 190)
+        self.assertEqual(window.height(), REC_H)
+        self.assertGreaterEqual(window.width(), REC_W)
+        # Expand anim is allowed to keep running in parallel with drag.
+        end = window._geom_anim.endValue()
+        if isinstance(end, QRect):
+            self.assertEqual(end.y(), window.y())
+            self.assertEqual(end.height(), REC_H)
+
 
 if __name__ == "__main__":
     unittest.main()
