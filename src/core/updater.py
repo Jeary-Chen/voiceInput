@@ -4,7 +4,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import subprocess
 import tempfile
 import time
@@ -18,7 +17,18 @@ from typing import NamedTuple
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer
 
 from _version import VERSION
-from core.app_paths import install_root, installed_exe_path
+from core.app_paths import (
+    LAUNCHER_NEW_NAME,
+    PARTIAL_SUFFIX,
+    install_root,
+    installed_exe_path,
+    launcher_new_path,
+    partial_version_dir,
+    read_current_version,
+    read_version_py,
+    version_dir,
+    versions_dir,
+)
 from core.log import logger
 from core.network import open_update_url
 
@@ -43,56 +53,54 @@ _WAIT_PROCESS_TIMEOUT_SEC = 15
 _START_HEALTH_POLL_MS = 800
 _START_HEALTH_POLL_MAX = 3
 
-# Canonical staging dir name under TEMP. After a successful apply the install
-# script renames it to "{name}.applied-{version}-{pid}" so the new process can
-# never load it as Ready, then deletes the trash best-effort.
-_STAGING_DIR_NAME = "VoiceInput_update_staging"
-_STAGING_APPLIED_MARKER = ".applied-"
+# Legacy TEMP staging names (pre-1.6.2). Sweep still cleans leftovers.
+_LEGACY_STAGING_DIR_NAME = "VoiceInput_update_staging"
+_LEGACY_STAGING_APPLIED_MARKER = ".applied-"
+# Marker written into versions/{ver}/ when extract-once staging completes.
 _STAGE_VERSION_FILE = ".update_version"
-_MANAGED_MIRROR_DIRS = ("python", "src")
+_ZIP_PAYLOAD_PREFIX = "VoiceInput/"
 
 
 def _build_install_script(
     *,
-    source: Path,
     app_dir: Path,
     exe_path: Path,
-    staged: Path,
     log_path: Path,
     old_pid: int,
     target_version: str,
 ) -> str:
-    """Build the out-of-process apply script.
+    """Build the out-of-process apply script (pointer flip only).
 
-    Apply semantics match wipe-managed-then-copy:
-    - ``python/`` and ``src/`` are mirrored (``/MIR``): add, update, delete extras.
-    - Remaining root files are copied with ``/E /XD python src``.
-    Staging handoff is rename-before-start so the new process never races the
-    installer for Ready visibility.
+    The new version tree is already extracted under ``versions\\{target}``.
+    Critical path after the old process exits:
+    1. Verify prepared ``versions\\{target}``
+    2. Flip ``current.txt`` + refresh stable launcher from ``.new``
+    3. Start the stable exe
+    4. Delete other version dirs / flat leftovers in the background
     """
-    python_dir = app_dir / "python"
-    src_dir = app_dir / "src"
-    version_file = src_dir / "_version.py"
-    source_python = source / "python"
-    source_src = source / "src"
-    applied_name = (
-        f"{_STAGING_DIR_NAME}{_STAGING_APPLIED_MARKER}{target_version}-{old_pid}"
-    )
+    versions_root = app_dir / "versions"
+    version_path = versions_root / target_version
+    current_file = app_dir / "current.txt"
+    version_file = version_path / "src" / "_version.py"
+    exe_new = app_dir / LAUNCHER_NEW_NAME
     return (
         f'$ErrorActionPreference = "Continue"\n'
         f'$LogPath = "{log_path}"\n'
         f'$OldPid = {old_pid}\n'
         f'$TargetVersion = "{target_version}"\n'
-        f'$StagingPath = "{staged}"\n'
-        f'$AppliedName = "{applied_name}"\n'
-        f'$AppliedPath = Join-Path (Split-Path -Parent $StagingPath) $AppliedName\n'
+        f'$ProductRoot = "{app_dir}"\n'
+        f'$VersionsRoot = "{versions_root}"\n'
+        f'$VersionDir = "{version_path}"\n'
+        f'$CurrentFile = "{current_file}"\n'
+        f'$ExeNew = "{exe_new}"\n'
+        f'$ExePath = "{exe_path}"\n'
         f'function Write-DebugLog([string]$Message) {{\n'
         f'  $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"\n'
         f'  Add-Content -Path $LogPath -Encoding UTF8 -Value "$ts | [DEBUG] update_install.ps1 | $Message"\n'
         f'}}\n'
         f'function Abort-Install([string]$Reason) {{\n'
         f'  Write-DebugLog "abort reason=$Reason"\n'
-        f'  Write-DebugLog "staging_preserved path=$StagingPath"\n'
+        f'  Write-DebugLog "prepared_preserved path=$VersionDir"\n'
         f'  Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\n'
         f'  exit 1\n'
         f'}}\n'
@@ -109,24 +117,27 @@ def _build_install_script(
         f'    Abort-Install "wait_process_timeout pid=$OldPid timeout_sec={_WAIT_PROCESS_TIMEOUT_SEC}"\n'
         f'  }}\n'
         f'}}\n'
-        f'function Invoke-Robocopy([string]$From, [string]$To, [string[]]$ExtraArgs) {{\n'
-        f'  $rcArgs = @($From, $To) + $ExtraArgs + @("/NFL", "/NDL", "/NJH", "/NJS", "/R:3", "/W:1")\n'
-        f'  & robocopy @rcArgs | Out-Null\n'
-        f'  return $LASTEXITCODE\n'
-        f'}}\n'
-        f'function Copy-AppTree {{\n'
-        f'  if (-not (Test-Path "{source_python}") -or -not (Test-Path "{source_src}")) {{\n'
-        f'    Abort-Install "staging_tree_incomplete source={source}"\n'
+        f'function Switch-ToPreparedVersion {{\n'
+        f'  if (-not (Test-Path -LiteralPath (Join-Path $VersionDir "python"))) {{\n'
+        f'    Abort-Install "prepared_python_missing path=$VersionDir"\n'
         f'  }}\n'
-        f'  $code = Invoke-Robocopy "{source_python}" "{python_dir}" @("/MIR")\n'
-        f'  Write-DebugLog "robocopy_python exit_code=$code"\n'
-        f'  if ($code -ge 8) {{ Abort-Install "robocopy_failed target=python exit_code=$code" }}\n'
-        f'  $code = Invoke-Robocopy "{source_src}" "{src_dir}" @("/MIR")\n'
-        f'  Write-DebugLog "robocopy_src exit_code=$code"\n'
-        f'  if ($code -ge 8) {{ Abort-Install "robocopy_failed target=src exit_code=$code" }}\n'
-        f'  $code = Invoke-Robocopy "{source}" "{app_dir}" @("/E", "/XD", "python", "src")\n'
-        f'  Write-DebugLog "robocopy_root exit_code=$code"\n'
-        f'  if ($code -ge 8) {{ Abort-Install "robocopy_failed target=root exit_code=$code" }}\n'
+        f'  if (-not (Test-Path -LiteralPath (Join-Path $VersionDir "src"))) {{\n'
+        f'    Abort-Install "prepared_src_missing path=$VersionDir"\n'
+        f'  }}\n'
+        f'  Set-Content -LiteralPath $CurrentFile -Value $TargetVersion -Encoding ASCII -NoNewline\n'
+        f'  Write-DebugLog "current_switched version=$TargetVersion path=$CurrentFile"\n'
+        f'  if (Test-Path -LiteralPath $ExeNew) {{\n'
+        f'    Copy-Item -LiteralPath $ExeNew -Destination $ExePath -Force\n'
+        f'    Remove-Item -LiteralPath $ExeNew -Force -ErrorAction SilentlyContinue\n'
+        f'    Write-DebugLog "launcher_refreshed path=$ExePath"\n'
+        f'  }} else {{\n'
+        f'    Write-DebugLog "launcher_new_missing path=$ExeNew"\n'
+        f'  }}\n'
+        f'  $marker = Join-Path $VersionDir "{_STAGE_VERSION_FILE}"\n'
+        f'  if (Test-Path -LiteralPath $marker) {{\n'
+        f'    Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue\n'
+        f'    Write-DebugLog "stage_marker_cleared path=$marker"\n'
+        f'  }}\n'
         f'}}\n'
         f'function Test-InstalledVersion {{\n'
         f'  $VersionFile = "{version_file}"\n'
@@ -142,27 +153,14 @@ def _build_install_script(
         f'  if ($installedVersion -ne $TargetVersion) {{\n'
         f'    Abort-Install "version_mismatch installed=$installedVersion target=$TargetVersion"\n'
         f'  }}\n'
-        f'}}\n'
-        f'function Hand-OffStaging {{\n'
-        # Rename away from the canonical path before Start-Process so the new
-        # app can never load this payload as Ready, even if delete is slow.
-        f'  if (-not (Test-Path -LiteralPath $StagingPath)) {{\n'
-        f'    Abort-Install "staging_missing_before_handoff path=$StagingPath"\n'
+        f'  $pointer = (Get-Content -LiteralPath $CurrentFile -Raw -ErrorAction SilentlyContinue)\n'
+        f'  if ($null -eq $pointer) {{ Abort-Install "current_missing path=$CurrentFile" }}\n'
+        f'  if ($pointer.Trim() -ne $TargetVersion) {{\n'
+        f'    Abort-Install "current_mismatch pointer=$($pointer.Trim()) target=$TargetVersion"\n'
         f'  }}\n'
-        f'  if (Test-Path -LiteralPath $AppliedPath) {{\n'
-        f'    Remove-Item -LiteralPath $AppliedPath -Recurse -Force -ErrorAction SilentlyContinue\n'
-        f'  }}\n'
-        f'  try {{\n'
-        f'    Rename-Item -LiteralPath $StagingPath -NewName $AppliedName -ErrorAction Stop\n'
-        f'  }} catch {{\n'
-        f'    Abort-Install "staging_rename_failed error=$($_.Exception.Message)"\n'
-        f'  }}\n'
-        f'  Write-DebugLog "staging_handed_off applied=$AppliedPath"\n'
         f'}}\n'
         f'function Update-UninstallRegistration {{\n'
-        # In-app updates only mirror files; Windows Apps list reads DisplayVersion
-        # from the Inno uninstall key. Refresh it so Settings stays in sync.
-        f'  $AppDirNorm = [System.IO.Path]::GetFullPath("{app_dir}").TrimEnd(\'\\\\\')\n'
+        f'  $AppDirNorm = [System.IO.Path]::GetFullPath($ProductRoot).TrimEnd(\'\\\\\')\n'
         f'  $DisplayName = "VoiceInput version $TargetVersion"\n'
         f'  $roots = @(\n'
         f'    "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",\n'
@@ -194,14 +192,52 @@ def _build_install_script(
         f'    Write-DebugLog "uninstall_reg_not_found app_dir=$AppDirNorm"\n'
         f'  }}\n'
         f'}}\n'
+        f'function Remove-ObsoleteVersions {{\n'
+        f'  if (Test-Path -LiteralPath (Join-Path $ProductRoot "python")) {{\n'
+        f'    Remove-Item -LiteralPath (Join-Path $ProductRoot "python") -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'    Write-DebugLog "flat_python_removed"\n'
+        f'  }}\n'
+        f'  if (Test-Path -LiteralPath (Join-Path $ProductRoot "src")) {{\n'
+        f'    Remove-Item -LiteralPath (Join-Path $ProductRoot "src") -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'    Write-DebugLog "flat_src_removed"\n'
+        f'  }}\n'
+        f'  if (Test-Path -LiteralPath (Join-Path $ProductRoot "VoiceInput")) {{\n'
+        f'    $orphan = Join-Path $ProductRoot "VoiceInput"\n'
+        f'    if ((Test-Path -LiteralPath (Join-Path $orphan "python")) -or (Test-Path -LiteralPath (Join-Path $orphan "src"))) {{\n'
+        f'      Remove-Item -LiteralPath $orphan -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'      Write-DebugLog "orphan_payload_removed path=$orphan"\n'
+        f'    }}\n'
+        f'  }}\n'
+        f'  if (Test-Path -LiteralPath $ExeNew) {{\n'
+        f'    Remove-Item -LiteralPath $ExeNew -Force -ErrorAction SilentlyContinue\n'
+        f'  }}\n'
+        f'  if (-not (Test-Path -LiteralPath $VersionsRoot)) {{ return }}\n'
+        f'  Get-ChildItem -LiteralPath $VersionsRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {{\n'
+        f'    if ($_.Name -ne $TargetVersion) {{\n'
+        f'      Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'      Write-DebugLog "old_version_removed name=$($_.Name)"\n'
+        f'    }}\n'
+        f'  }}\n'
+        f'  $legacyStaging = Join-Path $env:TEMP "{_LEGACY_STAGING_DIR_NAME}"\n'
+        f'  if (Test-Path -LiteralPath $legacyStaging) {{\n'
+        f'    Remove-Item -LiteralPath $legacyStaging -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'    Write-DebugLog "legacy_temp_staging_removed"\n'
+        f'  }}\n'
+        f'  Get-ChildItem -LiteralPath $env:TEMP -Directory -ErrorAction SilentlyContinue | Where-Object {{\n'
+        f'    $_.Name.StartsWith("{_LEGACY_STAGING_DIR_NAME}{_LEGACY_STAGING_APPLIED_MARKER}")\n'
+        f'  }} | ForEach-Object {{\n'
+        f'    Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'    Write-DebugLog "legacy_applied_staging_removed name=$($_.Name)"\n'
+        f'  }}\n'
+        f'}}\n'
         f'$TotalStart = Get-Date\n'
-        f'Write-DebugLog "start source={source} app_dir={app_dir} exe={exe_path} staged=$StagingPath old_pid=$OldPid target=$TargetVersion"\n'
+        f'Write-DebugLog "start mode=flip_pointer app_dir=$ProductRoot exe=$ExePath old_pid=$OldPid target=$TargetVersion version_dir=$VersionDir"\n'
         f'$StepStart = Get-Date\n'
         f'Wait-ForOldInstance\n'
         f'Write-DebugLog "wait_old_instance elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'$StepStart = Get-Date\n'
-        f'Copy-AppTree\n'
-        f'Write-DebugLog "copy_app_tree elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'Switch-ToPreparedVersion\n'
+        f'Write-DebugLog "switch_prepared elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'$StepStart = Get-Date\n'
         f'Test-InstalledVersion\n'
         f'Write-DebugLog "verify_version elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
@@ -209,11 +245,8 @@ def _build_install_script(
         f'Update-UninstallRegistration\n'
         f'Write-DebugLog "update_uninstall_reg elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'$StepStart = Get-Date\n'
-        f'Hand-OffStaging\n'
-        f'Write-DebugLog "handoff_staging elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
-        f'$StepStart = Get-Date\n'
         f'try {{\n'
-        f'  $NewProc = Start-Process "{exe_path}" -PassThru -ErrorAction Stop\n'
+        f'  $NewProc = Start-Process $ExePath -PassThru -ErrorAction Stop\n'
         f'}} catch {{\n'
         f'  Abort-Install "start_process_failed error=$($_.Exception.Message)"\n'
         f'}}\n'
@@ -232,8 +265,8 @@ def _build_install_script(
         f'  Abort-Install "new_process_not_running pid=$($NewProc.Id) polls=$poll"\n'
         f'}}\n'
         f'$StepStart = Get-Date\n'
-        f'Remove-Item -LiteralPath $AppliedPath -Recurse -Force -ErrorAction SilentlyContinue\n'
-        f'Write-DebugLog "cleanup_applied_staging elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'Remove-ObsoleteVersions\n'
+        f'Write-DebugLog "cleanup_old_versions elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'Write-DebugLog "install_success version=$TargetVersion new_pid=$($NewProc.Id)"\n'
         f'Write-DebugLog "total elapsed_ms=$([int]((Get-Date) - $TotalStart).TotalMilliseconds)"\n'
         f'Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\n'
@@ -269,45 +302,13 @@ def _is_newer(remote_tag: str, local_version: str) -> bool:
 def can_self_update() -> bool:
     """Return True if the current launch mode supports in-app updates.
 
-    Portable and installer builds have VoiceInput.exe alongside python/ and
-    src/.  PyInstaller onefile extracts to a temp dir (_MEIPASS), and dev-mode
-    (run.ps1 / .venv) has no VoiceInput.exe — neither can self-update.
+    Shipped builds expose a stable ``VoiceInput.exe`` at the product root.
+    PyInstaller onefile and bare dev checkouts cannot self-update.
     """
     try:
         return installed_exe_path() is not None
     except Exception:
         return False
-
-
-def _is_installed_version() -> bool:
-    """Detect if running from an Inno Setup installed location.
-
-    Checks the directory of the running code (not sys.frozen, which may be
-    False for embedded-Python builds) against known install paths.
-    """
-    try:
-        code_dir = install_root()
-    except Exception:
-        return False
-    install_bases = []
-    local_app = os.environ.get("LOCALAPPDATA", "")
-    if local_app:
-        install_bases.append(Path(local_app) / "Programs")
-    pf = os.environ.get("PROGRAMFILES", "")
-    if pf:
-        install_bases.append(Path(pf))
-    pf86 = os.environ.get("PROGRAMFILES(X86)", "")
-    if pf86:
-        install_bases.append(Path(pf86))
-    for base in install_bases:
-        try:
-            if base.exists() and code_dir.is_relative_to(base):
-                logger.debug(f"[DEBUG] _is_installed_version | code_dir={code_dir} is under {base}")
-                return True
-        except (ValueError, OSError):
-            pass
-    logger.debug(f"[DEBUG] _is_installed_version | code_dir={code_dir} not under any install base")
-    return False
 
 
 def _pick_asset(assets: list[dict], version: str) -> tuple[str, str, int] | None:
@@ -504,39 +505,81 @@ def _rmtree_best_effort(path: Path) -> None:
 
 
 class StagedUpdateStore:
-    """Owns update staging metadata, validation, and cleanup.
+    """Owns prepared version payloads under ``{product}/versions/``.
 
-    Ready invariant: a payload is installable only when ``load()`` succeeds and
-    its version is strictly newer than the running app (see ``load_applicable``).
+    Ready invariant: ``versions/{ver}/`` contains ``.update_version``, matching
+    ``src/_version.py``, and ``python/`` + ``src/``. Extract writes to
+    ``versions/{ver}.partial`` then renames into place.
     """
 
-    def __init__(self, *, temp_dir: Path | None = None):
-        root = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
-        self.temp_dir = root
-        self.staging_dir = root / _STAGING_DIR_NAME
+    def __init__(self, *, product_root: Path | None = None, temp_dir: Path | None = None):
+        # ``temp_dir`` kept as a test alias for a fake product root.
+        if product_root is not None:
+            self.product_root = Path(product_root)
+        elif temp_dir is not None:
+            self.product_root = Path(temp_dir)
+        else:
+            self.product_root = install_root()
+        self.versions_root = versions_dir(self.product_root)
+        self.temp_dir = Path(tempfile.gettempdir())
+
+    @property
+    def staging_dir(self) -> Path:
+        """Directory of the loaded staged version, or a non-existent sentinel."""
+        staged = self.load()
+        if staged is not None:
+            return staged.staging_dir
+        return self.versions_root / "__none__"
 
     def clear(self) -> None:
-        """Best-effort delete of the canonical staging directory."""
-        _rmtree_best_effort(self.staging_dir)
+        """Remove non-active staged / partial payloads and legacy TEMP leftovers."""
+        current = read_current_version(self.product_root)
+        if self.versions_root.is_dir():
+            for child in list(self.versions_root.iterdir()):
+                if not child.is_dir():
+                    continue
+                name = child.name
+                if name.endswith(PARTIAL_SUFFIX):
+                    _rmtree_best_effort(child)
+                    continue
+                if name == current:
+                    # Never delete the active version; drop a leftover stage marker.
+                    marker = child / _STAGE_VERSION_FILE
+                    if marker.is_file():
+                        try:
+                            marker.unlink()
+                        except OSError:
+                            pass
+                    continue
+                if (child / _STAGE_VERSION_FILE).is_file():
+                    _rmtree_best_effort(child)
+        exe_new = launcher_new_path(self.product_root)
+        if exe_new.is_file():
+            try:
+                exe_new.unlink()
+            except OSError as exc:
+                logger.warning(f"[Updater] Failed to remove {exe_new}: {exc}")
+        self._clear_legacy_temp_staging()
 
-    def write_version(self, version: str) -> None:
-        (self.staging_dir / _STAGE_VERSION_FILE).write_text(version, encoding="utf-8")
+    def write_version(self, version: str, *, version_path: Path | None = None) -> None:
+        target = version_path if version_path is not None else version_dir(version, self.product_root)
+        (target / _STAGE_VERSION_FILE).write_text(version, encoding="utf-8")
 
     def load(self) -> StagedUpdate | None:
-        """Load a structurally valid staging payload, regardless of version age."""
-        if not self.staging_dir.is_dir():
+        """Load the newest structurally valid staged version payload."""
+        candidates: list[StagedUpdate] = []
+        if not self.versions_root.is_dir():
             return None
-        version = self._read_staged_version()
-        if not version:
+        for child in self.versions_root.iterdir():
+            if not child.is_dir() or child.name.endswith(PARTIAL_SUFFIX):
+                continue
+            staged = self._load_version_dir(child)
+            if staged is not None:
+                candidates.append(staged)
+        if not candidates:
             return None
-        source = self._source_dir()
-        if self._read_source_version(source) != version:
-            logger.warning(
-                f"[Updater] Staged update version mismatch; marker={version}, "
-                f"source={source}"
-            )
-            return None
-        return StagedUpdate(version=version, staging_dir=self.staging_dir, source_dir=source)
+        candidates.sort(key=lambda item: _parse_version(item.version))
+        return candidates[-1]
 
     def load_applicable(self, *, newer_than: str) -> StagedUpdate | None:
         """Return staging only when valid and strictly newer than ``newer_than``."""
@@ -548,7 +591,7 @@ class StagedUpdateStore:
         return staged
 
     def validate(self, expected_version: str) -> StagedUpdate | None:
-        staged = self.load()
+        staged = self._load_version_dir(version_dir(expected_version, self.product_root))
         if staged is None:
             return None
         if staged.version != expected_version:
@@ -559,21 +602,41 @@ class StagedUpdateStore:
         """Best-effort disk cleanup of non-Ready leftovers. Never raises."""
         try:
             if self.load_applicable(newer_than=newer_than) is None:
-                if self.staging_dir.exists():
-                    logger.info(
-                        f"[Updater] Sweeping non-applicable staging at {self.staging_dir}"
-                    )
-                    self.clear()
-            prefix = f"{_STAGING_DIR_NAME}{_STAGING_APPLIED_MARKER}"
-            for child in self.temp_dir.iterdir():
-                if child.is_dir() and child.name.startswith(prefix):
-                    logger.info(f"[Updater] Sweeping applied staging trash {child}")
-                    _rmtree_best_effort(child)
+                logger.info(
+                    f"[Updater] Sweeping non-applicable staged versions under "
+                    f"{self.versions_root}"
+                )
+                self.clear()
+            else:
+                # Still remove abandoned .partial dirs and legacy TEMP trash.
+                if self.versions_root.is_dir():
+                    for child in list(self.versions_root.iterdir()):
+                        if child.is_dir() and child.name.endswith(PARTIAL_SUFFIX):
+                            logger.info(f"[Updater] Sweeping partial staging {child}")
+                            _rmtree_best_effort(child)
+                self._clear_legacy_temp_staging()
         except Exception:
             logger.opt(exception=True).warning("[Updater] Staging sweep failed")
 
-    def _read_staged_version(self) -> str:
-        ver_file = self.staging_dir / _STAGE_VERSION_FILE
+    def _load_version_dir(self, path: Path) -> StagedUpdate | None:
+        if not path.is_dir():
+            return None
+        version = self._read_staged_version(path)
+        if not version:
+            return None
+        if not (path / "python").is_dir() or not (path / "src").is_dir():
+            return None
+        source_version = read_version_py(path / "src" / "_version.py")
+        if source_version != version:
+            logger.warning(
+                f"[Updater] Staged update version mismatch; marker={version}, "
+                f"source={path}"
+            )
+            return None
+        return StagedUpdate(version=version, staging_dir=path, source_dir=path)
+
+    def _read_staged_version(self, version_path: Path) -> str:
+        ver_file = version_path / _STAGE_VERSION_FILE
         if not ver_file.is_file():
             return ""
         try:
@@ -581,60 +644,99 @@ class StagedUpdateStore:
         except OSError:
             return ""
 
-    def _source_dir(self) -> Path:
-        inner = self.staging_dir / "VoiceInput"
-        return inner if inner.is_dir() else self.staging_dir
-
-    def _read_source_version(self, source: Path) -> str:
-        version_file = source / "src" / "_version.py"
+    def _clear_legacy_temp_staging(self) -> None:
+        legacy = self.temp_dir / _LEGACY_STAGING_DIR_NAME
+        if legacy.exists():
+            logger.info(f"[Updater] Sweeping legacy TEMP staging at {legacy}")
+            _rmtree_best_effort(legacy)
+        prefix = f"{_LEGACY_STAGING_DIR_NAME}{_LEGACY_STAGING_APPLIED_MARKER}"
         try:
-            content = version_file.read_text(encoding="utf-8")
+            for child in self.temp_dir.iterdir():
+                if child.is_dir() and child.name.startswith(prefix):
+                    logger.info(f"[Updater] Sweeping legacy applied staging trash {child}")
+                    _rmtree_best_effort(child)
         except OSError:
-            return ""
-        match = re.search(r'VERSION\s*=\s*"([^"]+)"', content)
-        return match.group(1) if match else ""
+            pass
+
+
+def _zip_member_relpath(member: str) -> str | None:
+    """Map a zip member path to a relative path under the version payload."""
+    name = member.replace("\\", "/")
+    if not name or name.endswith("/"):
+        return None
+    if name.startswith(_ZIP_PAYLOAD_PREFIX):
+        rel = name[len(_ZIP_PAYLOAD_PREFIX):]
+    elif name == "VoiceInput":
+        return None
+    else:
+        rel = name
+    return rel or None
 
 
 class _StageWorker(QThread):
-    """Extract a downloaded zip to a staging directory."""
+    """Extract a downloaded zip once into ``versions/{ver}`` under the product root."""
     progress = pyqtSignal(int)   # percent 0-100
-    finished_ok = pyqtSignal(str)  # staging directory path
+    finished_ok = pyqtSignal(str)  # ready version directory path
     failed = pyqtSignal(str)
 
-    def __init__(self, zip_path: str, version: str):
+    def __init__(self, zip_path: str, version: str, *, product_root: Path | None = None):
         super().__init__()
         self._zip_path = zip_path
         self._version = version
+        self._product_root = product_root
 
     def run(self):
         started = time.perf_counter()
-        store = StagedUpdateStore()
-        staging_dir = store.staging_dir
-        logger.debug(f"[DEBUG] _StageWorker.run | zip={self._zip_path}, staging={staging_dir}")
+        store = StagedUpdateStore(product_root=self._product_root)
+        version = self._version
+        partial = partial_version_dir(version, store.product_root)
+        ready = version_dir(version, store.product_root)
+        logger.debug(
+            f"[DEBUG] _StageWorker.run | zip={self._zip_path}, partial={partial}, ready={ready}"
+        )
         try:
-            if staging_dir.exists():
+            if not version:
+                raise ValueError("missing target version for staging")
+            store.versions_root.mkdir(parents=True, exist_ok=True)
+            if partial.exists():
                 clean_started = time.perf_counter()
-                store.clear()
+                _rmtree_best_effort(partial)
                 logger.debug(
-                    f"[DEBUG] _StageWorker.run | clean_existing_staging elapsed_ms={_elapsed_ms(clean_started)}"
+                    f"[DEBUG] _StageWorker.run | clean_existing_partial "
+                    f"elapsed_ms={_elapsed_ms(clean_started)}"
                 )
             mkdir_started = time.perf_counter()
-            staging_dir.mkdir(parents=True, exist_ok=True)
+            partial.mkdir(parents=True, exist_ok=True)
             logger.debug(
-                f"[DEBUG] _StageWorker.run | mkdir_staging elapsed_ms={_elapsed_ms(mkdir_started)}"
+                f"[DEBUG] _StageWorker.run | mkdir_partial elapsed_ms={_elapsed_ms(mkdir_started)}"
             )
             extract_started = time.perf_counter()
+            staged_exe: Path | None = None
             with zipfile.ZipFile(self._zip_path, "r") as zf:
-                members = zf.namelist()
+                members = [m for m in zf.namelist() if _zip_member_relpath(m) is not None]
                 total = len(members)
-                total_uncompressed = sum(info.file_size for info in zf.infolist())
+                total_uncompressed = sum(
+                    info.file_size for info in zf.infolist()
+                    if _zip_member_relpath(info.filename) is not None
+                )
                 logger.debug(
                     f"[DEBUG] _StageWorker.run | zip_opened members={total}, "
                     f"uncompressed_bytes={total_uncompressed}"
                 )
                 last_progress_log = 0
                 for i, member in enumerate(members, 1):
-                    zf.extract(member, staging_dir)
+                    rel = _zip_member_relpath(member)
+                    assert rel is not None
+                    if rel == "VoiceInput.exe":
+                        staged_exe = launcher_new_path(store.product_root)
+                        staged_exe.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(member) as src, open(staged_exe, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    else:
+                        dest = partial / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(member) as src, open(dest, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
                     percent = int(i * 100 / total) if total else 100
                     self.progress.emit(percent)
                     if percent >= last_progress_log + 25:
@@ -646,22 +748,38 @@ class _StageWorker(QThread):
             logger.debug(
                 f"[DEBUG] _StageWorker.run | extract_complete elapsed_ms={_elapsed_ms(extract_started)}"
             )
+            if not (partial / "python").is_dir() or not (partial / "src").is_dir():
+                raise RuntimeError(f"staging tree incomplete under {partial}")
             version_started = time.perf_counter()
-            store.write_version(self._version)
+            store.write_version(version, version_path=partial)
             logger.debug(
                 f"[DEBUG] _StageWorker.run | write_version elapsed_ms={_elapsed_ms(version_started)}"
             )
-            logger.info(f"[Updater] Staged {total} files to {staging_dir} (v{self._version})")
+            current = read_current_version(store.product_root)
+            if ready.exists():
+                if ready.name == current:
+                    raise RuntimeError(
+                        f"refusing to replace active version directory {ready}"
+                    )
+                _rmtree_best_effort(ready)
+            rename_started = time.perf_counter()
+            partial.rename(ready)
+            logger.debug(
+                f"[DEBUG] _StageWorker.run | rename_ready elapsed_ms={_elapsed_ms(rename_started)}, "
+                f"exe_new={staged_exe}"
+            )
+            logger.info(f"[Updater] Staged {total} files to {ready} (v{version})")
             logger.debug(
                 f"[DEBUG] _StageWorker.run | total_elapsed_ms={_elapsed_ms(started)}"
             )
-            self.finished_ok.emit(str(staging_dir))
+            self.finished_ok.emit(str(ready))
         except Exception as e:
             logger.error(f"[Updater] Staging failed: {e}")
             logger.debug(
                 f"[DEBUG] _StageWorker.run | exception={type(e).__name__}: {e}, "
                 f"total_elapsed_ms={_elapsed_ms(started)}"
             )
+            _rmtree_best_effort(partial)
             self.failed.emit(str(e))
 
 
@@ -677,7 +795,6 @@ class UpdateChecker:
         self._stage_worker: _StageWorker | None = None
         self._latest: UpdateInfo | None = None
         self._downloaded_path: str | None = None
-        self._downloaded_expected_size: int = 0
         self._staged: StagedUpdate | None = None
         self._staged_store = StagedUpdateStore()
         # callbacks
@@ -691,6 +808,7 @@ class UpdateChecker:
         self._cb_stage_done = None
         self._cb_stage_failed = None
         self._last_install_error: str | None = None
+        self._idle_maintenance_scheduled = False
 
     @property
     def last_install_error(self) -> str | None:
@@ -752,10 +870,17 @@ class UpdateChecker:
         self._cb_stage_done = on_stage_done
         self._cb_stage_failed = on_stage_failed
         self._reconcile_staging()
-        # Disk cleanup is deferred so startup never races the install script.
-        QTimer.singleShot(0, self._sweep_staging)
+        # Staging trash cleanup runs after recorder prepare finishes (see
+        # ``schedule_idle_maintenance``), not on a blind timer.
         self._timer.start()
         self.check_now()
+
+    def schedule_idle_maintenance(self):
+        """Best-effort staging sweep once startup-critical work has finished."""
+        if getattr(self, "_idle_maintenance_scheduled", False):
+            return
+        self._idle_maintenance_scheduled = True
+        QTimer.singleShot(0, self._sweep_staging)
 
     def check_now(self):
         if self._check_worker is not None and self._check_worker.isRunning():
@@ -804,12 +929,11 @@ class UpdateChecker:
             )
 
         self._staged = None
-        if self._staged_store.staging_dir.exists():
-            self._staged_store.clear()
+        self._staged_store.clear()
         return self._fail_install(f"已下载的 v{version} 更新包无效或已损坏，请重新下载")
 
     def install(self, *, quit_fn=None) -> bool:
-        """Copy staged files over the app directory and restart."""
+        """Flip current.txt to the prepared version and restart."""
         started = time.perf_counter()
         if self._staged is None:
             logger.debug("[DEBUG] UpdateChecker.install | no staged update, returning")
@@ -823,26 +947,23 @@ class UpdateChecker:
         exe_path = installed_exe_path()
         if exe_path is None:
             return self._fail_install("当前运行方式无法确定安装目录")
-        source = staged_update.source_dir
         old_pid = os.getpid()
         target_version = staged_update.version
         logger.info(
-            f"[Updater] Installing v{target_version} from staged: {source} → {app_dir} "
-            f"(old_pid={old_pid})"
+            f"[Updater] Switching to prepared v{target_version} at "
+            f"{app_dir / 'versions' / target_version} (old_pid={old_pid})"
         )
         script = Path(tempfile.gettempdir()) / "voiceinput_update.ps1"
         install_log = _update_install_log_path()
         logger.debug(
-            f"[DEBUG] UpdateChecker.install | source={source}, app_dir={app_dir}, "
-            f"exe_path={exe_path}, staged={staged}, script={script}, "
+            f"[DEBUG] UpdateChecker.install | app_dir={app_dir}, "
+            f"exe_path={exe_path}, version_dir={staged}, script={script}, "
             f"install_log={install_log}, old_pid={old_pid}, target_version={target_version}"
         )
         build_started = time.perf_counter()
         ps_content = _build_install_script(
-            source=source,
             app_dir=app_dir,
             exe_path=exe_path,
-            staged=staged,
             log_path=install_log,
             old_pid=old_pid,
             target_version=target_version,
@@ -914,7 +1035,6 @@ class UpdateChecker:
             f"actual_size={actual_size}"
         )
         self._downloaded_path = path
-        self._downloaded_expected_size = expected_size
         if self._cb_dl_done:
             self._cb_dl_done()
         self._start_staging(path)
@@ -990,7 +1110,7 @@ class UpdateChecker:
 
     def _clear_staging_when_no_update(self) -> None:
         self._staged = None
-        if self._staged_store.staging_dir.exists():
+        if self._staged_store.load() is not None:
             logger.info("[Updater] Discarding staged update because no newer release is available")
             self._staged_store.clear()
 

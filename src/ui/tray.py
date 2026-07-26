@@ -1050,6 +1050,8 @@ class VoiceTray(QSystemTrayIcon):
             f"[Tray] Deferred recorder prepare finished "
             f"(gen={generation}, action={action}, ok={ok})"
         )
+        if self._updater is not None:
+            self._updater.schedule_idle_maintenance()
         self._sync_device_fault_after_prepare(ok)
         if self._recorder_prepare_pending and self._engine.state != "recording":
             self._recorder_prepare_pending = False

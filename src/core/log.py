@@ -4,7 +4,7 @@ Logs to:
   - Console (colorized, INFO level)
   - Session file (~/.voiceinput/logs/voiceinput_YYYY-MM-DD_HH-MM-SS.log, DEBUG level)
     One file per process run, from startup through exit; all levels in the same file.
-    File sink uses enqueue=True so hot UI/audio paths never block on disk I/O.
+    File sink stays synchronous (enqueue=False) for Windows stability with ctypes UI.
 
 Crash capture:
   - sys.excepthook / threading.excepthook / sys.unraisablehook
@@ -314,9 +314,11 @@ logger.add(
     level="DEBUG",
     format=_LOG_FMT,
     encoding="utf-8",
-    # Keep file I/O off the GUI/audio threads. Without this, hot-path
-    # DEBUG (drag moves, hover poll, mask ticks) stalls the event loop.
-    enqueue=True,
+    # Keep False on Windows: enqueue=True uses a multiprocessing queue writer
+    # that has faulted (access violation) alongside Win32/ctypes UI setup and
+    # faulthandler writing the same session file. Hot UI paths must stay quiet
+    # instead of relying on async sinks.
+    enqueue=False,
 )
 
 logger.info(format_event(

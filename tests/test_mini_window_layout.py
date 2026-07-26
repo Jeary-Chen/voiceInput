@@ -30,6 +30,7 @@ from ui.mini_window import (  # noqa: E402
     _ResultPopup,
 )
 from ui.native_idle_pill import NativeIdlePillWindow  # noqa: E402
+from ui.theme import Theme  # noqa: E402
 
 
 class _Config:
@@ -746,6 +747,22 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertEqual((target.width(), target.height()), (REC_W, REC_H))
         self.assertTrue(window._waveform.isVisible())
         self.assertTrue(window._dot_status.isVisible())
+        self.assertEqual(window._waveform._color, Theme.WAVEFORM_FROZEN)
+
+    def test_cancelling_reuses_same_frozen_waveform_color(self):
+        engine = _Engine()
+        engine.state = "recording"
+
+        window = MiniRecordingWindow(engine)
+        self.addCleanup(window.close)
+        window._mode = "recording"
+        window._waveform.reset()
+        self.assertEqual(window._waveform._color, Theme.WAVEFORM_ACTIVE)
+
+        window._apply_cancelling()
+
+        self.assertEqual(window._waveform._color, Theme.WAVEFORM_FROZEN)
+        self.assertFalse(window._dot_status.isVisible())
 
     def test_next_recording_after_hovered_stop_starts_collapsed(self):
         engine = _Engine()

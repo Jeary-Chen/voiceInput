@@ -89,6 +89,9 @@ class WaveformWidget(QWidget):
         self._frozen = True
         self._color = Theme.WAVEFORM_FROZEN
         self.set_active(False)
+        # Timer is stopped above; without an explicit repaint the last ACTIVE
+        # frame stays on screen when geometry does not change (common on stop).
+        self.update()
 
     def reset(self):
         self._levels = np.zeros(self.BAR_COUNT)

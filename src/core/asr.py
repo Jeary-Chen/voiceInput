@@ -13,8 +13,7 @@ class DashScopeASR:
     """Batch ASR — records everything, then transcribes in one shot.
 
     The dashscope SDK import is deferred to transcribe(): it costs hundreds of
-    milliseconds and would otherwise run before the tray icon appears.  main()
-    warms it in a background thread right after the UI is up.
+    milliseconds and would otherwise delay startup before the tray icon appears.
     """
 
     def __init__(self, api_key: str, model: str = "qwen3-asr-flash-2026-02-10",

@@ -52,8 +52,7 @@ def _to_compatible_url(base_url: str) -> str:
 class TextPolisher:
     """The OpenAI client is built on demand (first polish / key update), not in
     __init__: constructing it imports openai/httpx, which costs hundreds of
-    milliseconds and would otherwise delay startup before the tray icon
-    appears.  main() warms those imports in a background thread after UI is up.
+    milliseconds and would otherwise delay startup before the tray icon appears.
     """
 
     def __init__(self, api_key: str, model: str = "qwen3.6-flash",
