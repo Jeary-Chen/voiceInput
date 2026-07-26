@@ -24,7 +24,6 @@ class WaveformWidget(QWidget):
 
     def __init__(self, parent=None, compact: bool = False):
         super().__init__(parent)
-        self._compact = compact
         if compact:
             self.BAR_COUNT = 14
             self.BAR_GAP = 2.0
@@ -45,7 +44,14 @@ class WaveformWidget(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(1000 // self.FPS)
+        # Start only while recording; idle 24 FPS burns CPU for a hidden bar.
+
+    def set_active(self, active: bool):
+        if active:
+            if not self._timer.isActive():
+                self._timer.start(1000 // self.FPS)
+        else:
+            self._timer.stop()
 
     def update_data(self, pcm_chunk: bytes):
         if self._frozen:
@@ -77,19 +83,12 @@ class WaveformWidget(QWidget):
         r = self.AGC_RATIO
         scale = self.AGC_BASE_GAIN * (1 - r) + agc_scale * r
 
-        self._raw_target = np.clip(raw * scale, 0.0, 1.0)
+        np.clip(raw * scale, 0.0, 1.0, out=self._raw_target)
 
     def freeze(self):
         self._frozen = True
         self._color = Theme.WAVEFORM_FROZEN
-
-    def unfreeze(self):
-        self._frozen = False
-        self._color = Theme.WAVEFORM_ACTIVE
-        self._raw_target = np.zeros(self.BAR_COUNT)
-        self._peak_buf = np.zeros(self.AGC_WINDOW)
-        self._peak_idx = 0
-        self._agc_primed = False
+        self.set_active(False)
 
     def reset(self):
         self._levels = np.zeros(self.BAR_COUNT)
@@ -99,6 +98,7 @@ class WaveformWidget(QWidget):
         self._peak_buf = np.zeros(self.AGC_WINDOW)
         self._peak_idx = 0
         self._agc_primed = False
+        self.set_active(True)
         self.update()
 
     _IDLE_THRESHOLD = 0.005

@@ -4,6 +4,7 @@ Logs to:
   - Console (colorized, INFO level)
   - Session file (~/.voiceinput/logs/voiceinput_YYYY-MM-DD_HH-MM-SS.log, DEBUG level)
     One file per process run, from startup through exit; all levels in the same file.
+    File sink uses enqueue=True so hot UI/audio paths never block on disk I/O.
 
 Crash capture:
   - sys.excepthook / threading.excepthook / sys.unraisablehook
@@ -313,7 +314,9 @@ logger.add(
     level="DEBUG",
     format=_LOG_FMT,
     encoding="utf-8",
-    enqueue=False,
+    # Keep file I/O off the GUI/audio threads. Without this, hot-path
+    # DEBUG (drag moves, hover poll, mask ticks) stalls the event loop.
+    enqueue=True,
 )
 
 logger.info(format_event(

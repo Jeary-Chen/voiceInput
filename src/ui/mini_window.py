@@ -425,6 +425,7 @@ class MiniRecordingWindow(QWidget):
         self._mode = "idle"
         self._drag_pos = None
         self._drag_global = None
+        self._mask_key: tuple | None = None
         self._hovered = False
         self._show_result = engine.config.show_result_text
         self._anchor_x: int | None = engine.config.mini_window_x
@@ -525,21 +526,13 @@ class MiniRecordingWindow(QWidget):
                 my_hwnd, -1, 0, 0, 0, 0, self._SWP_FLAGS,
             )
 
-    def _apply_windows_surface_tweaks(self, source: str):
+    def _apply_windows_surface_tweaks(self, _source: str):
         if sys.platform != "win32":
             return
         hwnd = int(self.winId())
-        logger.debug(
-            f"[DEBUG] _apply_windows_surface_tweaks | source={source}, "
-            f"hwnd={hwnd}, flags={int(self.windowFlags())}"
-        )
         try:
             dwmapi = ctypes.windll.dwmapi
-        except Exception as e:
-            logger.debug(
-                f"[DEBUG] _apply_windows_surface_tweaks | "
-                f"DWM unavailable, error={e!r}"
-            )
+        except Exception:
             return
 
         attrs = [
@@ -550,23 +543,16 @@ class MiniRecordingWindow(QWidget):
         for attr, value in attrs:
             c_value = ctypes.c_int(value)
             try:
-                result = dwmapi.DwmSetWindowAttribute(
+                dwmapi.DwmSetWindowAttribute(
                     ctypes.c_void_p(hwnd),
                     ctypes.c_uint(attr),
                     ctypes.byref(c_value),
                     ctypes.sizeof(c_value),
                 )
-                logger.debug(
-                    f"[DEBUG] _apply_windows_surface_tweaks | "
-                    f"attr={attr}, value={value}, result={result}"
-                )
-            except Exception as e:
-                logger.debug(
-                    f"[DEBUG] _apply_windows_surface_tweaks | "
-                    f"attr={attr}, value={value}, error={e!r}"
-                )
+            except Exception:
+                pass
 
-    def _apply_capsule_mask(self, source: str):
+    def _apply_capsule_mask(self, _source: str):
         if self.width() <= 0 or self.height() <= 0:
             return
         progress = (
@@ -577,13 +563,16 @@ class MiniRecordingWindow(QWidget):
         mask_w = round(IDLE_W + (self.width() - IDLE_W) * progress)
         mask_h = round(IDLE_H + (self.height() - IDLE_H) * progress)
         mask_x = round((self.width() - mask_w) / 2)
-        mask_y = 0
         mask_pad = 1
         region_x = mask_x - mask_pad
-        region_y = mask_y - mask_pad
+        region_y = -mask_pad
         region_w = mask_w + mask_pad * 2
         region_h = mask_h + mask_pad * 2
         radius = min(RADIUS, mask_h // 2)
+        key = (region_x, region_y, region_w, region_h, radius)
+        if key == self._mask_key:
+            return
+        self._mask_key = key
         region = QRegion(region_x, region_y, region_w, region_h,
                          QRegion.RegionType.Rectangle)
         mask = QRegion(region_x, region_y, region_w, region_h,
@@ -599,11 +588,6 @@ class MiniRecordingWindow(QWidget):
                             QRegion.RegionType.Ellipse)
             mask = region.united(left).united(right)
         self.setMask(mask)
-        logger.debug(
-            f"[DEBUG] _apply_capsule_mask | source={source}, "
-            f"size=({self.width()}, {self.height()}), "
-            f"mask=({mask_x}, 0, {mask_w}, {mask_h}), radius={radius}"
-        )
 
     def _install_screen_watchers(self):
         app = QApplication.instance()
@@ -885,17 +869,27 @@ class MiniRecordingWindow(QWidget):
 
     def _reposition_popups(self):
         """Reposition visible popups to follow the mini bar during drag."""
-        for popup in (self._status_popup, self._countdown_popup):
-            if popup.isVisible():
-                pos = self.mapToGlobal(self.rect().bottomLeft())
-                screen = QApplication.primaryScreen()
-                if screen:
-                    geo = screen.availableGeometry()
-                    x = pos.x() + (self.width() - popup.width()) // 2
-                    x = max(geo.x(), min(x, geo.x() + geo.width() - popup.width()))
-                else:
-                    x = pos.x()
-                popup.move(x, pos.y() + 3)
+        status_vis = self._status_popup.isVisible()
+        countdown_vis = self._countdown_popup.isVisible()
+        if not status_vis and not countdown_vis:
+            return
+        pos = self.mapToGlobal(self.rect().bottomLeft())
+        screen = QApplication.primaryScreen()
+        geo = screen.availableGeometry() if screen else None
+        bar_w = self.width()
+        y = pos.y() + 3
+        for popup, visible in (
+            (self._status_popup, status_vis),
+            (self._countdown_popup, countdown_vis),
+        ):
+            if not visible:
+                continue
+            if geo is not None:
+                x = pos.x() + (bar_w - popup.width()) // 2
+                x = max(geo.x(), min(x, geo.x() + geo.width() - popup.width()))
+            else:
+                x = pos.x()
+            popup.move(x, y)
 
     def _cancel_deferred_shrink(self):
         self._deferred_shrink_timer.stop()
@@ -1078,28 +1072,28 @@ class MiniRecordingWindow(QWidget):
             origin = self.pos() if fallback is None else fallback
         return QRect(origin.x(), origin.y(), w, h)
 
+    def _with_drag_origin(self, rect: QRect) -> QRect:
+        """Keep width/height, pin top-left to the active drag origin."""
+        origin = self._drag_origin()
+        if origin is None:
+            return rect
+        return QRect(origin.x(), origin.y(), rect.width(), rect.height())
+
     def _glue_geom_anim_to_drag(self):
         """Keep a running size animation's end position stuck to the drag origin."""
         if self._geom_anim.state() != QPropertyAnimation.State.Running:
             return
-        origin = self._drag_origin()
         end = self._geom_anim.endValue()
-        if origin is None or not isinstance(end, QRect):
+        if not isinstance(end, QRect):
             return
-        if end.x() != origin.x() or end.y() != origin.y():
-            self._geom_anim.setEndValue(
-                QRect(origin.x(), origin.y(), end.width(), end.height())
-            )
+        glued = self._with_drag_origin(end)
+        if glued != end:
+            self._geom_anim.setEndValue(glued)
 
     def _poll_hover_state(self):
         cursor = QCursor.pos()
         geom = self.geometry()
         inside = geom.contains(cursor)
-        logger.debug(
-            f"[DEBUG] _poll_hover_state | mode={self._mode}, "
-            f"hovered={self._hovered}, cursor=({cursor.x()}, {cursor.y()}), "
-            f"geom={geom.getRect()}, inside={inside}"
-        )
         # Fast drag can briefly leave the HWND; keep expand/collapse judgment
         # deferred until mouse release (same rules, just not mid-drag).
         if self._is_dragging():
@@ -1117,10 +1111,6 @@ class MiniRecordingWindow(QWidget):
             return
         if self._mode == "recording":
             if self._hovered and not inside:
-                logger.debug(
-                    "[DEBUG] _poll_hover_state | recording hover lost, "
-                    "collapsing capsule"
-                )
                 self._collapse_recording_hover("hover-poll")
             return
         self._stop_hover_polling("mode-not-hoverable")
@@ -1430,12 +1420,6 @@ class MiniRecordingWindow(QWidget):
             y = geo.y() + 4
             target = QRect(x, y, w, h)
         self.setGeometry(start)
-        logger.debug(
-            f"[DEBUG] _animate_to | mode={self._mode}, dragging={self._is_dragging()}, "
-            f"start={start.getRect()}, target={target.getRect()}, "
-            f"screen={self._current_screen_geometry()}, duration={duration}"
-        )
-
         self._geom_anim.setEasingCurve(easing)
         self._geom_anim.setDuration(duration)
         self._geom_anim.setStartValue(start)
@@ -1466,16 +1450,30 @@ class MiniRecordingWindow(QWidget):
             self.update()
             self._show_idle_surface()
 
+    def setGeometry(self, *args):
+        """Keep drag position authoritative while size animations still run.
+
+        QPropertyAnimation(geometry) writes x/y every tick; without this, the
+        capsule visibly fights the cursor (PowerPoint-style stutter).
+        """
+        if self._drag_pos is not None and self._drag_origin() is not None:
+            if len(args) == 1 and isinstance(args[0], QRect):
+                args = (self._with_drag_origin(args[0]),)
+            elif len(args) == 4:
+                _x, _y, w, h = args
+                args = (self._rect_at_drag(w, h),)
+        super().setGeometry(*args)
+
     def _on_geometry_anim_value_changed(self, value):
         if not isinstance(value, QRect):
             return
-        # Expand/collapse may run during drag: keep animated size, glue position.
+        # Expand/collapse may run during drag: size from anim, position from cursor.
         if self._is_dragging():
-            origin = self._drag_origin()
-            if origin is not None:
-                if self.x() != origin.x() or self.y() != origin.y():
-                    self.move(origin)
-                value = QRect(origin.x(), origin.y(), value.width(), value.height())
+            value = self._with_drag_origin(value)
+            # Bypass override (already corrected). Keeps size in sync when anim
+            # frames arrive, and when tests call this without setGeometry.
+            if self.geometry() != value:
+                super().setGeometry(value)
         if self._mode == "hover" and self._shape_target == "hover":
             progress = self._hover_expand_progress(value.width())
             if abs(progress - self._reveal_progress) > 0.001:
@@ -1489,12 +1487,6 @@ class MiniRecordingWindow(QWidget):
             self._hover_timer.stop()
         elif not self._hover_timer.isActive():
             self._hover_timer.start(MiniBarAnim.HOVER_COLLAPSE_DELAY_MS)
-        self._log_anim(
-            "geometry_hover_track",
-            cursor=(cursor.x(), cursor.y()),
-            anim_geom=value.getRect(),
-            in_region=self._hovered,
-        )
 
     def _position_at(self, w, h, *, apply_mask: bool = True, fixed: bool = True):
         screen = QApplication.primaryScreen()
@@ -1651,6 +1643,7 @@ class MiniRecordingWindow(QWidget):
         if self._mode in ("idle", "shrinking"):
             return
         self._stop_hover_polling("shrink_to_idle")
+        self._waveform.set_active(False)
         if self._using_native_idle():
             self._log_anim("shrink_start")
             self._mode = "shrinking"
@@ -1721,7 +1714,7 @@ class MiniRecordingWindow(QWidget):
                 return
             self._shrink_to_idle()
 
-    def _collapse_recording_hover(self, source: str):
+    def _collapse_recording_hover(self, _source: str = ""):
         if self._mode != "recording":
             return
         if self._is_dragging():
@@ -1730,11 +1723,6 @@ class MiniRecordingWindow(QWidget):
         self._hide_recording_status()
         self._btn_rec_stop.setVisible(False)
         self._animate_to(REC_W, REC_H, MiniBarAnim.RECORD_HOVER_PANEL_MS)
-        logger.debug(
-            f"[DEBUG] _collapse_recording_hover | source={source}, "
-            f"countdown_active={self._engine._countdown_active}, "
-            f"show_countdown={self._engine.config.show_countdown}"
-        )
         if self._engine._countdown_active and self._engine.config.show_countdown:
             self._countdown_popup.show_countdown(
                 self._engine._countdown_secs, self
@@ -1771,11 +1759,6 @@ class MiniRecordingWindow(QWidget):
     # ── hover / drag ──
 
     def enterEvent(self, event):
-        logger.debug(
-            f"[DEBUG] enterEvent | mode={self._mode}, "
-            f"cursor={QCursor.pos().x(), QCursor.pos().y()}, "
-            f"geom={self.geometry().getRect()}"
-        )
         if self._mode in ("idle", "shrinking"):
             self._apply_hover()
         elif self._mode == "recording":
@@ -1790,11 +1773,6 @@ class MiniRecordingWindow(QWidget):
         self.update()
 
     def leaveEvent(self, event):
-        logger.debug(
-            f"[DEBUG] leaveEvent | mode={self._mode}, "
-            f"cursor={QCursor.pos().x(), QCursor.pos().y()}, "
-            f"geom={self.geometry().getRect()}"
-        )
         if self._is_dragging():
             return
         if self._mode == "hover":
@@ -1812,18 +1790,16 @@ class MiniRecordingWindow(QWidget):
             self._glue_geom_anim_to_drag()
 
     def mouseMoveEvent(self, event):
-        if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
-            self._drag_global = event.globalPosition().toPoint()
-            new_pos = self._drag_global - self._drag_pos
-            self.move(new_pos)
-            self._anchor_x = new_pos.x() + self.width() // 2
-            self._glue_geom_anim_to_drag()
-            self._reposition_popups()
-            logger.debug(
-                f"[DEBUG] mouseMoveEvent | drag_pos=({new_pos.x()}, "
-                f"{new_pos.y()}), anchor_x={self._anchor_x}, "
-                f"size=({self.width()}, {self.height()})"
-            )
+        if not (self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        self._drag_global = event.globalPosition().toPoint()
+        new_pos = self._drag_global - self._drag_pos
+        if new_pos == self.pos():
+            return
+        self.move(new_pos)
+        self._anchor_x = new_pos.x() + self.width() // 2
+        self._glue_geom_anim_to_drag()
+        self._reposition_popups()
 
     def mouseReleaseEvent(self, event):
         if self._drag_pos is None:
@@ -1835,9 +1811,6 @@ class MiniRecordingWindow(QWidget):
         if should_persist:
             self._engine.config.mini_window_x = self._anchor_x
             self._engine.config.save(touched=frozenset({"mini_window_x"}))
-            logger.debug(
-                f"[DEBUG] mouseReleaseEvent | saved anchor_x={self._anchor_x}"
-            )
         self._drag_pos = None
         self._drag_global = None
         if should_snap:

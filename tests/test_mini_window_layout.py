@@ -214,7 +214,6 @@ class MiniWindowLayoutTests(unittest.TestCase):
         self.assertEqual(window._mode, "hover")
 
     def test_hover_expand_grows_width_with_configured_duration(self):
-        app = QApplication.instance()
         screen = _Screen(QRect(0, 0, 1200, 900))
         window = MiniRecordingWindow(_Engine())
         self.addCleanup(window.close)
@@ -223,24 +222,17 @@ class MiniWindowLayoutTests(unittest.TestCase):
         with patch("ui.mini_window.QApplication.primaryScreen", return_value=screen):
             MiniBarAnim.HOVER_EXPAND_MS = 400
             window._apply_hover()
+            self.assertEqual(
+                window._geom_anim.state(),
+                window._geom_anim.State.Running,
+            )
+            self.assertEqual(window._geom_anim.duration(), 400)
+            window._geom_anim.setCurrentTime(200)
 
-            widths = []
-
-            def sample():
-                widths.append(window.width())
-                if len(widths) < 8:
-                    QTimer.singleShot(40, sample)
-
-            QTimer.singleShot(40, sample)
-
-            deadline = time.time() + 0.5
-            while len(widths) < 8 and time.time() < deadline:
-                app.processEvents()
-                time.sleep(0.01)
-
-        self.assertGreater(max(widths), IDLE_W)
-        self.assertLess(widths[0], HOVER_W)
-        self.assertGreater(window._hover_expand_progress(max(widths)), 0.0)
+        self.assertGreater(window.width(), IDLE_W)
+        self.assertLess(window.width(), HOVER_W)
+        self.assertGreater(window._hover_expand_progress(window.width()), 0.0)
+        self.assertLess(window._hover_expand_progress(window.width()), 1.0)
 
     def test_recording_enter_animates_reveal_from_zero(self):
         window = MiniRecordingWindow(_Engine())

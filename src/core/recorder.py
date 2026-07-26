@@ -702,7 +702,8 @@ class VoiceRecorder:
     def _chunk_peak_amplitude(data: bytes) -> int:
         if len(data) < 2:
             return 0
-        return int(np.max(np.abs(np.frombuffer(data, dtype=np.int16).astype(np.int32))))
+        samples = np.frombuffer(data, dtype=np.int16)
+        return int(np.max(np.abs(samples.astype(np.int32))))
 
     # ── device enumeration ──
 
