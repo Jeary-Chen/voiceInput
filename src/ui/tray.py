@@ -2081,6 +2081,10 @@ class VoiceTray(QSystemTrayIcon):
         logger.debug(
             f"[DEBUG] _on_stage_done | staging ready, prompt={prompt}"
         )
+        if not self._updater.is_ready_to_install:
+            self._set_update_status("idle")
+            self._update_widget.set_idle()
+            return
         self._update_widget.set_ready()
         self._set_update_status("ready")
         if prompt:

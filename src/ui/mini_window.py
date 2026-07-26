@@ -1100,6 +1100,10 @@ class MiniRecordingWindow(QWidget):
             f"hovered={self._hovered}, cursor=({cursor.x()}, {cursor.y()}), "
             f"geom={geom.getRect()}, inside={inside}"
         )
+        # Fast drag can briefly leave the HWND; keep expand/collapse judgment
+        # deferred until mouse release (same rules, just not mid-drag).
+        if self._is_dragging():
+            return
         if self._mode == "hover":
             if self._is_hover_expanding():
                 self._hover_timer.stop()
@@ -1720,6 +1724,8 @@ class MiniRecordingWindow(QWidget):
     def _collapse_recording_hover(self, source: str):
         if self._mode != "recording":
             return
+        if self._is_dragging():
+            return
         self._hovered = False
         self._hide_recording_status()
         self._btn_rec_stop.setVisible(False)
@@ -1789,6 +1795,8 @@ class MiniRecordingWindow(QWidget):
             f"cursor={QCursor.pos().x(), QCursor.pos().y()}, "
             f"geom={self.geometry().getRect()}"
         )
+        if self._is_dragging():
+            return
         if self._mode == "hover":
             self._sync_hover_tracking("leave")
         elif self._mode == "recording":

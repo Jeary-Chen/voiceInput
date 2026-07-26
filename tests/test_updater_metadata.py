@@ -2,6 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -141,7 +142,8 @@ class UpdateMetadataTests(unittest.TestCase):
             checker._cb_stage_done = lambda prompt: calls.append(("ready", prompt))
             checker._cb_available = lambda info: calls.append(("available", info.version))
 
-            checker._on_check_result(_update_info("1.4.17"))
+            with patch("core.updater.VERSION", "1.4.16"):
+                checker._on_check_result(_update_info("1.4.17"))
 
             # Reused staging: ready UI yes, auto-prompt no.
             self.assertEqual(calls, [("ready", False)])
@@ -159,7 +161,8 @@ class UpdateMetadataTests(unittest.TestCase):
             checker._cb_stage_done = lambda prompt: calls.append(("ready", prompt))
             checker._cb_available = lambda info: calls.append(("available", info.version))
 
-            checker._on_check_result(_update_info("1.4.18"))
+            with patch("core.updater.VERSION", "1.4.16"):
+                checker._on_check_result(_update_info("1.4.18"))
 
             self.assertEqual(calls, [("available", "1.4.18")])
             self.assertFalse(checker.is_ready_to_install)
@@ -176,11 +179,29 @@ class UpdateMetadataTests(unittest.TestCase):
             checker._cb_stage_done = lambda prompt: calls.append(("ready", prompt))
             checker._cb_check_failed = lambda: calls.append("failed")
 
-            checker._on_check_result(_CHECK_ERROR)
+            with patch("core.updater.VERSION", "1.4.16"):
+                checker._on_check_result(_CHECK_ERROR)
 
             self.assertEqual(calls, [("ready", False)])
             self.assertTrue(checker.is_ready_to_install)
             self.assertEqual(checker.staged_version, "1.4.17")
+
+    def test_check_failure_discards_staging_already_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = _write_staged_update(root, "1.5.6")
+            checker = UpdateChecker()
+            checker._staged_store = StagedUpdateStore(temp_dir=root)
+            calls = []
+            checker._cb_stage_done = lambda prompt: calls.append(("ready", prompt))
+            checker._cb_check_failed = lambda: calls.append("failed")
+
+            with patch("core.updater.VERSION", "1.5.6"):
+                checker._on_check_result(_CHECK_ERROR)
+
+            self.assertEqual(calls, ["failed"])
+            self.assertFalse(checker.is_ready_to_install)
+            self.assertFalse(staging.exists())
 
     def test_no_update_clears_stale_staging(self):
         with tempfile.TemporaryDirectory() as tmp:

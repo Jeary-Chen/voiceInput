@@ -134,6 +134,11 @@ def _build_install_script(
         f'Test-InstalledVersion\n'
         f'Write-DebugLog "verify_version elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'$StepStart = Get-Date\n'
+        # Clear staging before launching the new process so its first update
+        # check cannot revive an already-installed payload as "ready".
+        f'Remove-Item "{staged}" -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'Write-DebugLog "cleanup_staging elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'$StepStart = Get-Date\n'
         f'try {{\n'
         f'  $NewProc = Start-Process "{exe_path}" -PassThru -ErrorAction Stop\n'
         f'}} catch {{\n'
@@ -154,9 +159,6 @@ def _build_install_script(
         f'  Abort-Install "new_process_not_running pid=$($NewProc.Id) polls=$poll"\n'
         f'}}\n'
         f'Write-DebugLog "install_success version=$TargetVersion new_pid=$($NewProc.Id)"\n'
-        f'$StepStart = Get-Date\n'
-        f'Remove-Item "{staged}" -Recurse -Force -ErrorAction SilentlyContinue\n'
-        f'Write-DebugLog "cleanup_staging elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'Write-DebugLog "total elapsed_ms=$([int]((Get-Date) - $TotalStart).TotalMilliseconds)"\n'
         f'Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\n'
     )
@@ -626,6 +628,7 @@ class UpdateChecker:
         self._cb_stage_progress = on_stage_progress
         self._cb_stage_done = on_stage_done
         self._cb_stage_failed = on_stage_failed
+        self._discard_obsolete_staging()
         self._timer.start()
         self.check_now()
 
@@ -794,14 +797,32 @@ class UpdateChecker:
 
     # ── staging ──
 
-    def _sync_staging_for_latest(self, version: str) -> bool:
-        """Keep only the staging payload that matches the latest release."""
+    def _discard_obsolete_staging(self) -> bool:
+        """Clear staging that is not newer than the running app. True if cleared."""
         staged = self._staged_store.load()
         if staged is None:
             self._staged = None
             if self._staged_store.staging_dir.exists():
                 logger.info("[Updater] Discarding invalid staged update")
                 self._staged_store.clear()
+            return True
+        if not _is_newer(staged.version, VERSION):
+            logger.info(
+                f"[Updater] Discarding staged v{staged.version}; "
+                f"already running v{VERSION}"
+            )
+            self._staged_store.clear()
+            self._staged = None
+            return True
+        return False
+
+    def _sync_staging_for_latest(self, version: str) -> bool:
+        """Keep only the staging payload that matches the latest release."""
+        if self._discard_obsolete_staging():
+            return False
+        staged = self._staged_store.load()
+        if staged is None:
+            self._staged = None
             return False
 
         if staged.version != version:
@@ -820,12 +841,11 @@ class UpdateChecker:
         return True
 
     def _restore_staging_after_check_failure(self) -> bool:
+        if self._discard_obsolete_staging():
+            return False
         staged = self._staged_store.load()
         if staged is None:
             self._staged = None
-            if self._staged_store.staging_dir.exists():
-                logger.info("[Updater] Discarding invalid staged update after check failure")
-                self._staged_store.clear()
             return False
         logger.info(
             f"[Updater] Update check did not find a newer release; "

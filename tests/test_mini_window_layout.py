@@ -905,11 +905,16 @@ class MiniWindowLayoutTests(unittest.TestCase):
         window.mouseMoveEvent(_MouseEvent(QPoint(640, 200)))
         # Simulate an in-flight expand frame that still targets the dock top.
         window._on_geometry_anim_value_changed(QRect(545, 4, 95, REC_H))
+        # Fast drag can emit leave; chrome must stay until release.
+        window.leaveEvent(type("E", (), {})())
+        window._poll_hover_state()
 
         self.assertTrue(window._is_dragging())
         self.assertEqual(window.y(), 190)
         self.assertEqual(window.height(), REC_H)
         self.assertGreaterEqual(window.width(), REC_W)
+        self.assertTrue(window._btn_rec_stop.isVisible())
+        self.assertTrue(window._status_popup.isVisible())
         # Expand anim is allowed to keep running in parallel with drag.
         end = window._geom_anim.endValue()
         if isinstance(end, QRect):
