@@ -471,16 +471,33 @@ end;
 
 function InitializeSetup: Boolean;
 begin
+  {{ Do not quit the running app just because the wizard opened. }}
   Result := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  {{ Quit only when the user actually starts copying files. }}
+  Result := '';
+  NeedsRestart := False;
   if IsAppRunning then
     SignalAndWaitForExit;
+  if IsAppRunning then
+    Result := 'VoiceInput 仍在运行，请先退出后再继续安装。';
 end;
 
 function InitializeUninstall: Boolean;
 begin
   Result := True;
-  if IsAppRunning then
-    SignalAndWaitForExit;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    if IsAppRunning then
+      SignalAndWaitForExit;
+  end;
 end;
 
 [Run]

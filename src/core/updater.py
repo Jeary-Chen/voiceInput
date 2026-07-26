@@ -40,10 +40,16 @@ def _update_install_log_path() -> Path:
 
 
 _WAIT_PROCESS_TIMEOUT_SEC = 15
-_MANAGED_DELETE_RETRIES = 8
-_MANAGED_DELETE_DELAY_MS = 400
 _START_HEALTH_POLL_MS = 800
 _START_HEALTH_POLL_MAX = 3
+
+# Canonical staging dir name under TEMP. After a successful apply the install
+# script renames it to "{name}.applied-{version}-{pid}" so the new process can
+# never load it as Ready, then deletes the trash best-effort.
+_STAGING_DIR_NAME = "VoiceInput_update_staging"
+_STAGING_APPLIED_MARKER = ".applied-"
+_STAGE_VERSION_FILE = ".update_version"
+_MANAGED_MIRROR_DIRS = ("python", "src")
 
 
 def _build_install_script(
@@ -56,21 +62,37 @@ def _build_install_script(
     old_pid: int,
     target_version: str,
 ) -> str:
+    """Build the out-of-process apply script.
+
+    Apply semantics match wipe-managed-then-copy:
+    - ``python/`` and ``src/`` are mirrored (``/MIR``): add, update, delete extras.
+    - Remaining root files are copied with ``/E /XD python src``.
+    Staging handoff is rename-before-start so the new process never races the
+    installer for Ready visibility.
+    """
     python_dir = app_dir / "python"
     src_dir = app_dir / "src"
     version_file = src_dir / "_version.py"
+    source_python = source / "python"
+    source_src = source / "src"
+    applied_name = (
+        f"{_STAGING_DIR_NAME}{_STAGING_APPLIED_MARKER}{target_version}-{old_pid}"
+    )
     return (
         f'$ErrorActionPreference = "Continue"\n'
         f'$LogPath = "{log_path}"\n'
         f'$OldPid = {old_pid}\n'
         f'$TargetVersion = "{target_version}"\n'
+        f'$StagingPath = "{staged}"\n'
+        f'$AppliedName = "{applied_name}"\n'
+        f'$AppliedPath = Join-Path (Split-Path -Parent $StagingPath) $AppliedName\n'
         f'function Write-DebugLog([string]$Message) {{\n'
         f'  $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"\n'
         f'  Add-Content -Path $LogPath -Encoding UTF8 -Value "$ts | [DEBUG] update_install.ps1 | $Message"\n'
         f'}}\n'
         f'function Abort-Install([string]$Reason) {{\n'
         f'  Write-DebugLog "abort reason=$Reason"\n'
-        f'  Write-DebugLog "staging_preserved path={staged}"\n'
+        f'  Write-DebugLog "staging_preserved path=$StagingPath"\n'
         f'  Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\n'
         f'  exit 1\n'
         f'}}\n'
@@ -87,18 +109,24 @@ def _build_install_script(
         f'    Abort-Install "wait_process_timeout pid=$OldPid timeout_sec={_WAIT_PROCESS_TIMEOUT_SEC}"\n'
         f'  }}\n'
         f'}}\n'
-        f'function Remove-ManagedPaths {{\n'
-        f'  foreach ($ManagedPath in @("{python_dir}", "{src_dir}")) {{\n'
-        f'    for ($attempt = 1; $attempt -le {_MANAGED_DELETE_RETRIES}; $attempt++) {{\n'
-        f'      if (-not (Test-Path $ManagedPath)) {{ break }}\n'
-        f'      Remove-Item $ManagedPath -Recurse -Force -ErrorAction SilentlyContinue\n'
-        f'      Start-Sleep -Milliseconds {_MANAGED_DELETE_DELAY_MS}\n'
-        f'    }}\n'
-        f'    if (Test-Path $ManagedPath) {{\n'
-        f'      Abort-Install "managed_path_still_exists path=$ManagedPath"\n'
-        f'    }}\n'
+        f'function Invoke-Robocopy([string]$From, [string]$To, [string[]]$ExtraArgs) {{\n'
+        f'  $rcArgs = @($From, $To) + $ExtraArgs + @("/NFL", "/NDL", "/NJH", "/NJS", "/R:3", "/W:1")\n'
+        f'  & robocopy @rcArgs | Out-Null\n'
+        f'  return $LASTEXITCODE\n'
+        f'}}\n'
+        f'function Copy-AppTree {{\n'
+        f'  if (-not (Test-Path "{source_python}") -or -not (Test-Path "{source_src}")) {{\n'
+        f'    Abort-Install "staging_tree_incomplete source={source}"\n'
         f'  }}\n'
-        f'  Write-DebugLog "managed_paths_removed"\n'
+        f'  $code = Invoke-Robocopy "{source_python}" "{python_dir}" @("/MIR")\n'
+        f'  Write-DebugLog "robocopy_python exit_code=$code"\n'
+        f'  if ($code -ge 8) {{ Abort-Install "robocopy_failed target=python exit_code=$code" }}\n'
+        f'  $code = Invoke-Robocopy "{source_src}" "{src_dir}" @("/MIR")\n'
+        f'  Write-DebugLog "robocopy_src exit_code=$code"\n'
+        f'  if ($code -ge 8) {{ Abort-Install "robocopy_failed target=src exit_code=$code" }}\n'
+        f'  $code = Invoke-Robocopy "{source}" "{app_dir}" @("/E", "/XD", "python", "src")\n'
+        f'  Write-DebugLog "robocopy_root exit_code=$code"\n'
+        f'  if ($code -ge 8) {{ Abort-Install "robocopy_failed target=root exit_code=$code" }}\n'
         f'}}\n'
         f'function Test-InstalledVersion {{\n'
         f'  $VersionFile = "{version_file}"\n'
@@ -115,29 +143,74 @@ def _build_install_script(
         f'    Abort-Install "version_mismatch installed=$installedVersion target=$TargetVersion"\n'
         f'  }}\n'
         f'}}\n'
+        f'function Hand-OffStaging {{\n'
+        # Rename away from the canonical path before Start-Process so the new
+        # app can never load this payload as Ready, even if delete is slow.
+        f'  if (-not (Test-Path -LiteralPath $StagingPath)) {{\n'
+        f'    Abort-Install "staging_missing_before_handoff path=$StagingPath"\n'
+        f'  }}\n'
+        f'  if (Test-Path -LiteralPath $AppliedPath) {{\n'
+        f'    Remove-Item -LiteralPath $AppliedPath -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'  }}\n'
+        f'  try {{\n'
+        f'    Rename-Item -LiteralPath $StagingPath -NewName $AppliedName -ErrorAction Stop\n'
+        f'  }} catch {{\n'
+        f'    Abort-Install "staging_rename_failed error=$($_.Exception.Message)"\n'
+        f'  }}\n'
+        f'  Write-DebugLog "staging_handed_off applied=$AppliedPath"\n'
+        f'}}\n'
+        f'function Update-UninstallRegistration {{\n'
+        # In-app updates only mirror files; Windows Apps list reads DisplayVersion
+        # from the Inno uninstall key. Refresh it so Settings stays in sync.
+        f'  $AppDirNorm = [System.IO.Path]::GetFullPath("{app_dir}").TrimEnd(\'\\\\\')\n'
+        f'  $DisplayName = "VoiceInput version $TargetVersion"\n'
+        f'  $roots = @(\n'
+        f'    "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",\n'
+        f'    "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",\n'
+        f'    "HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"\n'
+        f'  )\n'
+        f'  $updated = 0\n'
+        f'  foreach ($root in $roots) {{\n'
+        f'    if (-not (Test-Path $root)) {{ continue }}\n'
+        f'    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {{\n'
+        f'      $keyPath = $_.PSPath\n'
+        f'      $props = Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue\n'
+        f'      if ($null -eq $props) {{ return }}\n'
+        f'      $name = [string]$props.DisplayName\n'
+        f'      $loc = [string]$props.InstallLocation\n'
+        f'      $keyId = $_.PSChildName\n'
+        f'      $locNorm = if ($loc) {{ [System.IO.Path]::GetFullPath($loc).TrimEnd(\'\\\\\') }} else {{ "" }}\n'
+        f'      $match = ($keyId -eq "VoiceInput_is1") -or\n'
+        f'        ($locNorm -and ($locNorm -eq $AppDirNorm)) -or\n'
+        f'        ($name -like "VoiceInput*")\n'
+        f'      if (-not $match) {{ return }}\n'
+        f'      Set-ItemProperty -LiteralPath $keyPath -Name "DisplayVersion" -Value $TargetVersion -ErrorAction SilentlyContinue\n'
+        f'      Set-ItemProperty -LiteralPath $keyPath -Name "DisplayName" -Value $DisplayName -ErrorAction SilentlyContinue\n'
+        f'      $script:updated++\n'
+        f'      Write-DebugLog "uninstall_reg_updated key=$keyId display_version=$TargetVersion"\n'
+        f'    }}\n'
+        f'  }}\n'
+        f'  if ($updated -eq 0) {{\n'
+        f'    Write-DebugLog "uninstall_reg_not_found app_dir=$AppDirNorm"\n'
+        f'  }}\n'
+        f'}}\n'
         f'$TotalStart = Get-Date\n'
-        f'Write-DebugLog "start source={source} app_dir={app_dir} exe={exe_path} staged={staged} old_pid=$OldPid target=$TargetVersion"\n'
+        f'Write-DebugLog "start source={source} app_dir={app_dir} exe={exe_path} staged=$StagingPath old_pid=$OldPid target=$TargetVersion"\n'
         f'$StepStart = Get-Date\n'
         f'Wait-ForOldInstance\n'
         f'Write-DebugLog "wait_old_instance elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'$StepStart = Get-Date\n'
-        f'Remove-ManagedPaths\n'
-        f'Write-DebugLog "cleanup_managed_paths elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
-        f'$StepStart = Get-Date\n'
-        f'robocopy "{source}" "{app_dir}" /E /IS /IT /NFL /NDL /NJH /NJS /R:3 /W:1\n'
-        f'$CopyExitCode = $LASTEXITCODE\n'
-        f'Write-DebugLog "robocopy_copy exit_code=$CopyExitCode elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
-        f'if ($CopyExitCode -ge 8 -or $CopyExitCode -eq 0) {{\n'
-        f'  Abort-Install "robocopy_failed exit_code=$CopyExitCode"\n'
-        f'}}\n'
+        f'Copy-AppTree\n'
+        f'Write-DebugLog "copy_app_tree elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'$StepStart = Get-Date\n'
         f'Test-InstalledVersion\n'
         f'Write-DebugLog "verify_version elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'$StepStart = Get-Date\n'
-        # Clear staging before launching the new process so its first update
-        # check cannot revive an already-installed payload as "ready".
-        f'Remove-Item "{staged}" -Recurse -Force -ErrorAction SilentlyContinue\n'
-        f'Write-DebugLog "cleanup_staging elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'Update-UninstallRegistration\n'
+        f'Write-DebugLog "update_uninstall_reg elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
+        f'$StepStart = Get-Date\n'
+        f'Hand-OffStaging\n'
+        f'Write-DebugLog "handoff_staging elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'$StepStart = Get-Date\n'
         f'try {{\n'
         f'  $NewProc = Start-Process "{exe_path}" -PassThru -ErrorAction Stop\n'
@@ -158,6 +231,9 @@ def _build_install_script(
         f'if (-not $alive) {{\n'
         f'  Abort-Install "new_process_not_running pid=$($NewProc.Id) polls=$poll"\n'
         f'}}\n'
+        f'$StepStart = Get-Date\n'
+        f'Remove-Item -LiteralPath $AppliedPath -Recurse -Force -ErrorAction SilentlyContinue\n'
+        f'Write-DebugLog "cleanup_applied_staging elapsed_ms=$([int]((Get-Date) - $StepStart).TotalMilliseconds)"\n'
         f'Write-DebugLog "install_success version=$TargetVersion new_pid=$($NewProc.Id)"\n'
         f'Write-DebugLog "total elapsed_ms=$([int]((Get-Date) - $TotalStart).TotalMilliseconds)"\n'
         f'Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\n'
@@ -404,12 +480,6 @@ class _DownloadWorker(QThread):
             self.failed.emit(str(e))
 
 
-_STAGING_DIR_NAME = "VoiceInput_update_staging"
-
-
-_STAGE_VERSION_FILE = ".update_version"
-
-
 @dataclass(frozen=True)
 class StagedUpdate:
     version: str
@@ -417,21 +487,43 @@ class StagedUpdate:
     source_dir: Path
 
 
+def _rmtree_onexc(func, path, exc):
+    """Tolerate missing/locked entries during best-effort cleanup."""
+    if isinstance(exc, (FileNotFoundError, NotADirectoryError, PermissionError)):
+        return
+    raise exc
+
+
+def _rmtree_best_effort(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path, onexc=_rmtree_onexc)
+    except OSError as exc:
+        logger.warning(f"[Updater] Failed to remove {path}: {exc}")
+
+
 class StagedUpdateStore:
-    """Owns update staging metadata, validation, and cleanup."""
+    """Owns update staging metadata, validation, and cleanup.
+
+    Ready invariant: a payload is installable only when ``load()`` succeeds and
+    its version is strictly newer than the running app (see ``load_applicable``).
+    """
 
     def __init__(self, *, temp_dir: Path | None = None):
         root = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
+        self.temp_dir = root
         self.staging_dir = root / _STAGING_DIR_NAME
 
     def clear(self) -> None:
-        if self.staging_dir.exists():
-            shutil.rmtree(self.staging_dir)
+        """Best-effort delete of the canonical staging directory."""
+        _rmtree_best_effort(self.staging_dir)
 
     def write_version(self, version: str) -> None:
         (self.staging_dir / _STAGE_VERSION_FILE).write_text(version, encoding="utf-8")
 
     def load(self) -> StagedUpdate | None:
+        """Load a structurally valid staging payload, regardless of version age."""
         if not self.staging_dir.is_dir():
             return None
         version = self._read_staged_version()
@@ -446,6 +538,15 @@ class StagedUpdateStore:
             return None
         return StagedUpdate(version=version, staging_dir=self.staging_dir, source_dir=source)
 
+    def load_applicable(self, *, newer_than: str) -> StagedUpdate | None:
+        """Return staging only when valid and strictly newer than ``newer_than``."""
+        staged = self.load()
+        if staged is None:
+            return None
+        if not _is_newer(staged.version, newer_than):
+            return None
+        return staged
+
     def validate(self, expected_version: str) -> StagedUpdate | None:
         staged = self.load()
         if staged is None:
@@ -453,6 +554,23 @@ class StagedUpdateStore:
         if staged.version != expected_version:
             return None
         return staged
+
+    def sweep(self, *, newer_than: str) -> None:
+        """Best-effort disk cleanup of non-Ready leftovers. Never raises."""
+        try:
+            if self.load_applicable(newer_than=newer_than) is None:
+                if self.staging_dir.exists():
+                    logger.info(
+                        f"[Updater] Sweeping non-applicable staging at {self.staging_dir}"
+                    )
+                    self.clear()
+            prefix = f"{_STAGING_DIR_NAME}{_STAGING_APPLIED_MARKER}"
+            for child in self.temp_dir.iterdir():
+                if child.is_dir() and child.name.startswith(prefix):
+                    logger.info(f"[Updater] Sweeping applied staging trash {child}")
+                    _rmtree_best_effort(child)
+        except Exception:
+            logger.opt(exception=True).warning("[Updater] Staging sweep failed")
 
     def _read_staged_version(self) -> str:
         ver_file = self.staging_dir / _STAGE_VERSION_FILE
@@ -610,7 +728,12 @@ class UpdateChecker:
 
     @property
     def is_ready_to_install(self) -> bool:
-        return self._staged is not None and self._staged.staging_dir.exists()
+        """True only when an applicable (newer-than-running) staging payload is held."""
+        return (
+            self._staged is not None
+            and _is_newer(self._staged.version, VERSION)
+            and self._staged.staging_dir.exists()
+        )
 
     @property
     def staged_version(self) -> str:
@@ -628,7 +751,9 @@ class UpdateChecker:
         self._cb_stage_progress = on_stage_progress
         self._cb_stage_done = on_stage_done
         self._cb_stage_failed = on_stage_failed
-        self._discard_obsolete_staging()
+        self._reconcile_staging()
+        # Disk cleanup is deferred so startup never races the install script.
+        QTimer.singleShot(0, self._sweep_staging)
         self._timer.start()
         self.check_now()
 
@@ -665,19 +790,23 @@ class UpdateChecker:
 
     def install_ready(self, version: str, *, quit_fn=None) -> bool:
         self._last_install_error = None
-        if self._staged is None or self._staged.version != version:
+        applicable = self._staged_store.load_applicable(newer_than=VERSION)
+        if applicable is not None and applicable.version == version:
+            self._staged = applicable
+            return self.install(quit_fn=quit_fn)
+
+        loaded = self._staged_store.load()
+        if loaded is not None and loaded.version != version:
+            self._staged = applicable
             return self._fail_install(
                 f"安装请求已过期：请求 v{version}，"
-                f"当前 staging 为 v{self.staged_version or '无'}"
+                f"当前 staging 为 v{loaded.version}"
             )
-        staged = self._staged_store.validate(version)
-        if staged is None:
-            self._staged = None
-            if self._staged_store.staging_dir.exists():
-                self._staged_store.clear()
-            return self._fail_install(f"已下载的 v{version} 更新包无效或已损坏，请重新下载")
-        self._staged = staged
-        return self.install(quit_fn=quit_fn)
+
+        self._staged = None
+        if self._staged_store.staging_dir.exists():
+            self._staged_store.clear()
+        return self._fail_install(f"已下载的 v{version} 更新包无效或已损坏，请重新下载")
 
     def install(self, *, quit_fn=None) -> bool:
         """Copy staged files over the app directory and restart."""
@@ -797,30 +926,24 @@ class UpdateChecker:
 
     # ── staging ──
 
-    def _discard_obsolete_staging(self) -> bool:
-        """Clear staging that is not newer than the running app. True if cleared."""
-        staged = self._staged_store.load()
-        if staged is None:
-            self._staged = None
-            if self._staged_store.staging_dir.exists():
-                logger.info("[Updater] Discarding invalid staged update")
-                self._staged_store.clear()
-            return True
-        if not _is_newer(staged.version, VERSION):
+    def _reconcile_staging(self) -> None:
+        """Sync in-memory Ready state from disk. Never deletes on this path."""
+        self._staged = self._staged_store.load_applicable(newer_than=VERSION)
+        if self._staged is not None:
             logger.info(
-                f"[Updater] Discarding staged v{staged.version}; "
-                f"already running v{VERSION}"
+                f"[Updater] Reconciled applicable staged v{self._staged.version}"
             )
-            self._staged_store.clear()
-            self._staged = None
-            return True
-        return False
+
+    def _sweep_staging(self) -> None:
+        """Deferred best-effort cleanup of obsolete/applied staging trash."""
+        self._staged_store.sweep(newer_than=VERSION)
+        # Re-read in case sweep removed something we thought we held.
+        if self._staged is not None and not self.is_ready_to_install:
+            self._staged = self._staged_store.load_applicable(newer_than=VERSION)
 
     def _sync_staging_for_latest(self, version: str) -> bool:
         """Keep only the staging payload that matches the latest release."""
-        if self._discard_obsolete_staging():
-            return False
-        staged = self._staged_store.load()
+        staged = self._staged_store.load_applicable(newer_than=VERSION)
         if staged is None:
             self._staged = None
             return False
@@ -841,9 +964,7 @@ class UpdateChecker:
         return True
 
     def _restore_staging_after_check_failure(self) -> bool:
-        if self._discard_obsolete_staging():
-            return False
-        staged = self._staged_store.load()
+        staged = self._staged_store.load_applicable(newer_than=VERSION)
         if staged is None:
             self._staged = None
             return False
@@ -862,6 +983,8 @@ class UpdateChecker:
         already-staged package on later checks must use ``prompt=False`` so the
         ready dialog does not keep popping open.
         """
+        if not self.is_ready_to_install:
+            return
         if self._cb_stage_done:
             self._cb_stage_done(prompt)
 
@@ -890,7 +1013,7 @@ class UpdateChecker:
         logger.info(f"[Updater] Staging complete: {staged_dir}")
         expected_version = self._latest.version if self._latest else ""
         staged = self._staged_store.validate(expected_version)
-        if staged is None:
+        if staged is None or not _is_newer(staged.version, VERSION):
             self._staged = None
             self._staged_store.clear()
             msg = "更新包版本校验失败，请重新下载"

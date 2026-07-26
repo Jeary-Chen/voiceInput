@@ -18,6 +18,8 @@ from core.updater import (
     UpdateInfo,
     _CHECK_ERROR,
     _NO_UPDATE,
+    _STAGING_APPLIED_MARKER,
+    _STAGING_DIR_NAME,
     _build_install_script,
     _select_latest_release,
 )
@@ -84,7 +86,7 @@ class UpdateMetadataTests(unittest.TestCase):
 
         self.assertEqual(_select_latest_release(releases, "1.2.4")["tag_name"], "v1.2.5")
 
-    def test_install_script_waits_validates_and_preserves_staging_on_failure(self):
+    def test_install_script_mirrors_managed_trees_and_hands_off_before_start(self):
         script = _build_install_script(
             source=Path("C:/tmp/VoiceInput"),
             app_dir=Path("C:/Program Files/VoiceInput"),
@@ -104,11 +106,32 @@ class UpdateMetadataTests(unittest.TestCase):
         self.assertIn("wait_old_instance elapsed_ms=", script)
         self.assertIn("C:\\Program Files\\VoiceInput\\python", script)
         self.assertIn("C:\\Program Files\\VoiceInput\\src", script)
-        self.assertIn("managed_path_still_exists", script)
-        self.assertIn("managed_paths_removed", script)
-        self.assertIn("cleanup_managed_paths elapsed_ms=", script)
-        self.assertIn("robocopy_copy exit_code=", script)
-        self.assertIn("robocopy_failed exit_code=", script)
+        self.assertIn("Copy-AppTree", script)
+        self.assertIn('"/MIR"', script)
+        self.assertIn('"/XD", "python", "src"', script)
+        self.assertIn("copy_app_tree elapsed_ms=", script)
+        self.assertIn("robocopy_python exit_code=", script)
+        self.assertIn("robocopy_src exit_code=", script)
+        self.assertIn("robocopy_root exit_code=", script)
+        self.assertIn("robocopy_failed target=", script)
+        self.assertIn("Hand-OffStaging", script)
+        self.assertIn("staging_handed_off", script)
+        self.assertIn("Rename-Item", script)
+        self.assertIn("Update-UninstallRegistration", script)
+        self.assertIn("DisplayVersion", script)
+        self.assertIn("VoiceInput version $TargetVersion", script)
+        self.assertIn("uninstall_reg_updated", script)
+        self.assertIn("update_uninstall_reg elapsed_ms=", script)
+        self.assertIn(
+            f"{_STAGING_DIR_NAME}{_STAGING_APPLIED_MARKER}1.4.11-12345",
+            script,
+        )
+        self.assertNotIn("managed_paths_removed", script)
+        self.assertNotIn("/IS", script)
+        self.assertNotIn("/IT", script)
+        # Robocopy exit 0 (nothing copied) must not abort incremental updates.
+        self.assertNotRegex(script, r"\$code -eq 0")
+        self.assertNotRegex(script, r"CopyExitCode -eq 0")
         self.assertIn("verify_version installed=", script)
         self.assertIn("version_mismatch", script)
         self.assertIn("start_process_failed", script)
@@ -117,7 +140,14 @@ class UpdateMetadataTests(unittest.TestCase):
         self.assertIn("new_process_not_running", script)
         self.assertIn("staging_preserved path=", script)
         self.assertIn("install_success version=", script)
-        self.assertIn("cleanup_staging elapsed_ms=", script)
+        self.assertIn("cleanup_applied_staging elapsed_ms=", script)
+        exe = Path("C:/Program Files/VoiceInput/VoiceInput.exe")
+        # Atomic handoff must happen before the new process starts.
+        self.assertLess(script.index("Rename-Item"), script.index(f'Start-Process "{exe}"'))
+        self.assertLess(
+            script.index("staging_handed_off"),
+            script.index(f'Start-Process "{exe}"'),
+        )
         self.assertNotIn("Start-Job", script)
         self.assertNotIn("VoiceInputWin32", script)
         self.assertIn("total elapsed_ms=", script)
@@ -132,6 +162,52 @@ class UpdateMetadataTests(unittest.TestCase):
 
             self.assertIsNone(store.load())
 
+    def test_load_applicable_requires_newer_than_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_staged_update(root, "1.5.6")
+            store = StagedUpdateStore(temp_dir=root)
+
+            self.assertIsNone(store.load_applicable(newer_than="1.5.6"))
+            self.assertIsNone(store.load_applicable(newer_than="1.5.7"))
+            staged = store.load_applicable(newer_than="1.5.5")
+            self.assertIsNotNone(staged)
+            self.assertEqual(staged.version, "1.5.6")
+
+    def test_reconcile_sets_memory_without_deleting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = _write_staged_update(root, "1.5.6")
+            checker = UpdateChecker()
+            checker._staged_store = StagedUpdateStore(temp_dir=root)
+
+            with patch("core.updater.VERSION", "1.5.6"):
+                checker._reconcile_staging()
+
+            self.assertIsNone(checker._staged)
+            self.assertFalse(checker.is_ready_to_install)
+            self.assertTrue(staging.exists())
+
+            with patch("core.updater.VERSION", "1.5.5"):
+                checker._reconcile_staging()
+                self.assertTrue(checker.is_ready_to_install)
+                self.assertEqual(checker.staged_version, "1.5.6")
+            self.assertTrue(staging.exists())
+
+    def test_sweep_removes_obsolete_and_applied_trash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = _write_staged_update(root, "1.5.6")
+            trash = root / f"{_STAGING_DIR_NAME}{_STAGING_APPLIED_MARKER}1.5.6-1"
+            trash.mkdir()
+            (trash / "marker.txt").write_text("x", encoding="utf-8")
+            store = StagedUpdateStore(temp_dir=root)
+
+            store.sweep(newer_than="1.5.6")
+
+            self.assertFalse(staging.exists())
+            self.assertFalse(trash.exists())
+
     def test_check_result_reuses_matching_staging(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -144,11 +220,10 @@ class UpdateMetadataTests(unittest.TestCase):
 
             with patch("core.updater.VERSION", "1.4.16"):
                 checker._on_check_result(_update_info("1.4.17"))
-
-            # Reused staging: ready UI yes, auto-prompt no.
-            self.assertEqual(calls, [("ready", False)])
-            self.assertTrue(checker.is_ready_to_install)
-            self.assertEqual(checker.staged_version, "1.4.17")
+                # Reused staging: ready UI yes, auto-prompt no.
+                self.assertEqual(calls, [("ready", False)])
+                self.assertTrue(checker.is_ready_to_install)
+                self.assertEqual(checker.staged_version, "1.4.17")
             self.assertTrue(staging.exists())
 
     def test_check_result_discards_obsolete_staging_and_reports_latest(self):
@@ -181,12 +256,11 @@ class UpdateMetadataTests(unittest.TestCase):
 
             with patch("core.updater.VERSION", "1.4.16"):
                 checker._on_check_result(_CHECK_ERROR)
+                self.assertEqual(calls, [("ready", False)])
+                self.assertTrue(checker.is_ready_to_install)
+                self.assertEqual(checker.staged_version, "1.4.17")
 
-            self.assertEqual(calls, [("ready", False)])
-            self.assertTrue(checker.is_ready_to_install)
-            self.assertEqual(checker.staged_version, "1.4.17")
-
-    def test_check_failure_discards_staging_already_installed(self):
+    def test_check_failure_ignores_staging_already_installed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             staging = _write_staged_update(root, "1.5.6")
@@ -198,10 +272,12 @@ class UpdateMetadataTests(unittest.TestCase):
 
             with patch("core.updater.VERSION", "1.5.6"):
                 checker._on_check_result(_CHECK_ERROR)
-
-            self.assertEqual(calls, ["failed"])
-            self.assertFalse(checker.is_ready_to_install)
-            self.assertFalse(staging.exists())
+                self.assertEqual(calls, ["failed"])
+                self.assertFalse(checker.is_ready_to_install)
+                # Disk cleanup is deferred to sweep — Ready is already impossible.
+                self.assertTrue(staging.exists())
+                checker._sweep_staging()
+                self.assertFalse(staging.exists())
 
     def test_no_update_clears_stale_staging(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,15 +295,36 @@ class UpdateMetadataTests(unittest.TestCase):
             self.assertFalse(checker.is_ready_to_install)
             self.assertFalse(staging.exists())
 
+    def test_clear_swallows_rmtree_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_staged_update(root, "1.5.6")
+            store = StagedUpdateStore(temp_dir=root)
+            with patch(
+                "core.updater.shutil.rmtree",
+                side_effect=PermissionError(5, "denied"),
+            ):
+                store.clear()  # must not raise
+
+    def test_sweep_survives_clear_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_staged_update(root, "1.5.6")
+            store = StagedUpdateStore(temp_dir=root)
+            with patch.object(store, "clear", side_effect=RuntimeError("boom")):
+                store.sweep(newer_than="1.5.6")  # must not raise
+
     def test_install_ready_rejects_expired_dialog_version(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             staging = _write_staged_update(root, "1.4.17")
             source = staging / "VoiceInput"
             checker = UpdateChecker()
+            checker._staged_store = StagedUpdateStore(temp_dir=root)
             checker._staged = StagedUpdate("1.4.17", staging, source)
 
-            self.assertFalse(checker.install_ready("1.4.18"))
+            with patch("core.updater.VERSION", "1.4.16"):
+                self.assertFalse(checker.install_ready("1.4.18"))
             self.assertIn("1.4.18", checker.last_install_error or "")
 
     def test_install_ready_revalidates_staging_before_install(self):
@@ -239,7 +336,8 @@ class UpdateMetadataTests(unittest.TestCase):
             checker._staged_store = StagedUpdateStore(temp_dir=root)
             checker._staged = StagedUpdate("1.4.17", staging, source)
 
-            self.assertFalse(checker.install_ready("1.4.17"))
+            with patch("core.updater.VERSION", "1.4.16"):
+                self.assertFalse(checker.install_ready("1.4.17"))
             self.assertFalse(staging.exists())
 
 
