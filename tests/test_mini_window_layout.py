@@ -930,6 +930,59 @@ class MiniWindowLayoutTests(unittest.TestCase):
             self.assertEqual(end.y(), window.y())
             self.assertEqual(end.height(), REC_H)
 
+    def test_recording_drag_release_animates_to_top(self):
+        screen = _Screen(QRect(0, 0, 1200, 900))
+        engine = _Engine()
+        engine.state = "recording"
+
+        with patch("ui.mini_window.QApplication.primaryScreen",
+                   return_value=screen):
+            window = MiniRecordingWindow(engine)
+        self.addCleanup(window.close)
+        window._mode = "recording"
+        window._target_size = (REC_W, REC_H)
+        window.setFixedSize(REC_W, REC_H)
+        window.move(560, 4)
+        window.show()
+
+        window.mousePressEvent(_MouseEvent(QPoint(600, 14)))
+        window.mouseMoveEvent(_MouseEvent(QPoint(640, 200)))
+        self.assertEqual(window.y(), 190)
+        self.assertTrue(window._is_dragging())
+
+        window.mouseReleaseEvent(_MouseEvent(QPoint(640, 200)))
+
+        self.assertFalse(window._is_dragging())
+        target = window._geom_anim.endValue()
+        self.assertEqual(target.y(), screen.availableGeometry().y() + 4)
+        self.assertEqual(window._anchor_x, 640)
+
+    def test_lost_grab_button_up_ends_drag_session(self):
+        """If grab is lost, a move with no buttons closes the drag session."""
+        screen = _Screen(QRect(0, 0, 1200, 900))
+
+        with patch("ui.mini_window.QApplication.primaryScreen",
+                   return_value=screen):
+            window = MiniRecordingWindow(_Engine())
+        self.addCleanup(window.close)
+        window._mode = "hover"
+        window._target_size = (HOVER_W, HOVER_H)
+        window.setFixedSize(HOVER_W, HOVER_H)
+        window.move(540, 4)
+        window.show()
+
+        window.mousePressEvent(_MouseEvent(QPoint(600, 14)))
+        window.mouseMoveEvent(_MouseEvent(QPoint(640, 120)))
+        self.assertTrue(window._is_dragging())
+
+        window.mouseMoveEvent(
+            _MouseEvent(QPoint(640, 120), buttons=Qt.MouseButton.NoButton)
+        )
+
+        self.assertFalse(window._is_dragging())
+        target = window._geom_anim.endValue()
+        self.assertEqual(target.y(), screen.availableGeometry().y() + 4)
+
 
 if __name__ == "__main__":
     unittest.main()

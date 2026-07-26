@@ -1781,15 +1781,33 @@ class MiniRecordingWindow(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_global = event.globalPosition().toPoint()
-            self._drag_pos = self._drag_global - self.frameGeometry().topLeft()
-            self._glue_geom_anim_to_drag()
+            self._begin_drag(event.globalPosition().toPoint())
 
     def mouseMoveEvent(self, event):
-        if not (self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton):
+        if not self._is_dragging():
             return
-        self._drag_global = event.globalPosition().toPoint()
-        new_pos = self._drag_global - self._drag_pos
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._end_drag()
+            return
+        self._update_drag(event.globalPosition().toPoint())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._is_dragging():
+            self._end_drag()
+
+    def _begin_drag(self, global_pos):
+        if self._is_dragging():
+            return
+        self._drag_global = global_pos
+        self._drag_pos = global_pos - self.frameGeometry().topLeft()
+        self.grabMouse()
+        self._glue_geom_anim_to_drag()
+
+    def _update_drag(self, global_pos):
+        if not self._is_dragging():
+            return
+        self._drag_global = global_pos
+        new_pos = global_pos - self._drag_pos
         if new_pos == self.pos():
             return
         self.move(new_pos)
@@ -1797,19 +1815,18 @@ class MiniRecordingWindow(QWidget):
         self._glue_geom_anim_to_drag()
         self._reposition_popups()
 
-    def mouseReleaseEvent(self, event):
-        if self._drag_pos is None:
+    def _end_drag(self):
+        if not self._is_dragging():
             return
-        should_persist = self._anchor_x is not None
-        should_snap = (
-            should_persist and self._engine.state != "recording"
-        )
-        if should_persist:
+        persist_x = self._anchor_x is not None
+        if persist_x:
             self._engine.config.mini_window_x = self._anchor_x
             self._engine.config.save(touched=frozenset({"mini_window_x"}))
         self._drag_pos = None
         self._drag_global = None
-        if should_snap:
+        if self.mouseGrabber() is self:
+            self.releaseMouse()
+        if persist_x:
             self._animate_to(
                 self.width(), self.height(), MiniBarAnim.DRAG_SNAP_MS,
                 QEasingCurve.Type.InOutQuart,
