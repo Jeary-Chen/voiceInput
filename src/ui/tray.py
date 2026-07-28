@@ -22,7 +22,11 @@ from core.log import logger, log_event, flush_log
 from core.engine import VoiceEngine
 from core.config_sync import ConfigSync
 from core.faults import FaultKind
-from core.input_devices import InputDeviceSnapshot
+from core.input_devices import (
+    InputDeviceSnapshot,
+    Recordability,
+    finalize_snapshot,
+)
 from core.output_mode import (
     DEFAULT_OUTPUT_MODE,
     OUTPUT_MODE_LABELS,
@@ -144,10 +148,16 @@ def _device_menu_row_specs(
       ("action", key, text, enabled)  可勾选行（系统默认 / 设备）
       ("separator",)                  分隔线
       ("placeholder", text)           禁用占位行
+
+    Labels follow Recordability:
+      known_recordable → normal name
+      known_unrecordable + retry → （正在初始化）
+      known_unrecordable → （不可录）
+      probe_skipped → bare name, disabled (no false init copy)
     """
     devices = snapshot.devices
     if not devices:
-        # 无采集端点：不展示「系统默认」，仅灰色占位（与「正在初始化」同为不可选）。
+        # 无采集端点：不展示「系统默认」，仅灰色占位。
         return [("placeholder", "(无)")]
 
     default_name = snapshot.default_name
@@ -157,14 +167,21 @@ def _device_menu_row_specs(
         ("separator",),
     ]
     for dev in devices:
-        if dev.is_recordable:
+        if dev.recordability is Recordability.KNOWN_RECORDABLE:
             text = dev.display_name
-        elif retry_active:
-            text = f"{dev.display_name}（正在初始化）"
+            enabled = True
+        elif dev.recordability is Recordability.KNOWN_UNRECORDABLE:
+            if retry_active:
+                text = f"{dev.display_name}（正在初始化）"
+            else:
+                text = f"{dev.display_name}（不可录）"
+            enabled = False
         else:
-            text = f"{dev.display_name}（不可录）"
-        specs.append(("action", dev.name, text, dev.is_recordable))
-    if not snapshot.has_recordable_device:
+            # PROBE_SKIPPED without prior merge — never claim "initializing".
+            text = dev.display_name
+            enabled = False
+        specs.append(("action", dev.name, text, enabled))
+    if snapshot.probe_status == "probed" and not snapshot.has_recordable_device:
         specs.append(("separator",))
         specs.append(("placeholder", "(未发现兼容设备)"))
     return specs
@@ -365,11 +382,7 @@ class _RecordableProbeRetry:
 
     @staticmethod
     def needs_retry(snapshot: InputDeviceSnapshot) -> bool:
-        if not snapshot.devices:
-            return False
-        if not snapshot.has_recordable_device:
-            return True
-        return bool(snapshot.default_name and not snapshot.recordable_default_name)
+        return snapshot.needs_recordable_retry
 
 
 class VoiceTray(QSystemTrayIcon):
@@ -831,6 +844,8 @@ class VoiceTray(QSystemTrayIcon):
             self._finish_device_refresh()
             return
 
+        snapshot = finalize_snapshot(snapshot, previous=self._input_snapshot)
+
         self._input_snapshot = snapshot
         self._dev_refresh_ready = True
         self._last_menu_refresh_time = time.monotonic()
@@ -844,6 +859,7 @@ class VoiceTray(QSystemTrayIcon):
             devices=len(snapshot.devices),
             recordable_devices=len(snapshot.recordable_devices),
             has_recordable=snapshot.has_recordable_device,
+            probe_status=snapshot.probe_status,
         )
         defer_audio_apply = self._device_change_in_storm()
         if defer_audio_apply:
@@ -858,6 +874,7 @@ class VoiceTray(QSystemTrayIcon):
             self._sync_system_default_device()
             self._auto_fallback_if_device_gone()
             self._recover_recorder_if_devices_returned()
+        # needs_recordable_retry is False for probe_skipped snapshots.
         self._recordable_retry.schedule_for(snapshot)
         self._rebuild_device_menu()
         self._sync_tray_icon_with_engine()
@@ -1050,8 +1067,9 @@ class VoiceTray(QSystemTrayIcon):
             f"[Tray] Deferred recorder prepare finished "
             f"(gen={generation}, action={action}, ok={ok})"
         )
-        if self._updater is not None:
-            self._updater.schedule_idle_maintenance()
+        updater = getattr(self, "_updater", None)
+        if updater is not None:
+            updater.schedule_idle_maintenance()
         self._sync_device_fault_after_prepare(ok)
         if self._recorder_prepare_pending and self._engine.state != "recording":
             self._recorder_prepare_pending = False
@@ -2151,6 +2169,8 @@ class VoiceTray(QSystemTrayIcon):
             self._config_sync.flush_pending_reload()
         self._sync_tray_icon_with_engine()
         if state == "recording":
+            # Stop init-probe ladder: live capture already owns PortAudio input.
+            self._recordable_retry.reset()
             self._act_record.setText("停止录音")
             self._act_record.setEnabled(True)
             self._act_rec_info.setVisible(True)

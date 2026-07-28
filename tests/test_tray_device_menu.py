@@ -18,15 +18,27 @@ def _snapshot(
     default_name: str = "",
     devices: list[dict] | None = None,
     recordable_default_name: str | None = None,
+    probe_status: str = "probed",
 ):
-    from core.input_devices import InputDevice, InputDeviceSnapshot
+    from core.input_devices import InputDevice, InputDeviceSnapshot, Recordability
 
+    built = []
+    for device in devices or []:
+        row = dict(device)
+        if (
+            "recordability" not in row
+            and probe_status == "probe_skipped"
+            and row.get("index") is None
+        ):
+            row["recordability"] = Recordability.PROBE_SKIPPED
+        built.append(InputDevice(**row))
     return InputDeviceSnapshot(
         default_name=default_name,
         recordable_default_name=(
             default_name if recordable_default_name is None else recordable_default_name
         ),
-        devices=tuple(InputDevice(**device) for device in (devices or [])),
+        devices=tuple(built),
+        probe_status=probe_status,
     )
 
 
@@ -97,13 +109,23 @@ class _FakeRecordableProbeRetry:
         self.stop_calls += 1
 
     def schedule_for(self, snapshot):
+        from ui.tray import _RecordableProbeRetry
+
+        if not _RecordableProbeRetry.needs_retry(snapshot):
+            self.active = False
+            return
         self.scheduled_snapshots.append(snapshot)
         if self.activate_on_schedule:
             self.active = True
 
     def rearm_if_needed(self, snapshot):
+        from ui.tray import _RecordableProbeRetry
+
         self.rearm_snapshots.append(snapshot)
-        return False
+        if self.active or not _RecordableProbeRetry.needs_retry(snapshot):
+            return False
+        self.active = True
+        return True
 
 
 def _bind_recordable_retry_state(
@@ -499,6 +521,7 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
             _dev_menu_dirty=False,
             _input_snapshot=snap,
             _recordable_retry=retry,
+            _engine=SimpleNamespace(state="ready"),
             _rebuild_device_menu=lambda: calls.append("rebuild"),
         )
 
@@ -507,6 +530,111 @@ class TrayDeviceMenuRebuildTests(unittest.TestCase):
         self.assertTrue(retry.active)
         self.assertEqual(timer.starts[-1], _RECORDABLE_RETRY_DELAYS_MS[0])
         self.assertEqual(calls, ["rebuild"])
+
+    def test_device_menu_show_does_not_rearm_on_probe_skipped_snapshot(self):
+        from ui.tray import VoiceTray, _RecordableProbeRetry
+
+        snap = _snapshot(
+            "Bluetooth Mic",
+            [{"name": "Bluetooth Mic", "display_name": "Bluetooth Mic", "index": None}],
+            recordable_default_name="",
+            probe_status="probe_skipped",
+        )
+        retry = _RecordableProbeRetry(lambda: None)
+        retry._active = False
+        calls = []
+        tray = SimpleNamespace(
+            _dev_refresh_ready=True,
+            _dev_menu_dirty=True,
+            _input_snapshot=snap,
+            _recordable_retry=retry,
+            _rebuild_device_menu=lambda: calls.append("rebuild"),
+        )
+
+        VoiceTray._on_device_menu_show(tray)
+
+        self.assertFalse(retry.active)
+        self.assertEqual(calls, ["rebuild"])
+
+    def test_refresh_probe_skipped_keeps_recordability_and_skips_init_retry(self):
+        from ui.tray import VoiceTray, _device_menu_row_specs
+
+        previous = _snapshot(
+            "Headphones (HUAWEI FreeBuds SE 3)",
+            [
+                {
+                    "name": "Headset Mic",
+                    "display_name": "Headphones (HUAWEI FreeBuds SE 3)",
+                    "index": 7,
+                },
+                {
+                    "name": "Internal Mic",
+                    "display_name": "Internal Microphone",
+                    "index": 3,
+                },
+            ],
+            recordable_default_name="Headset Mic",
+        )
+        probe_skipped = _snapshot(
+            "Headphones (HUAWEI FreeBuds SE 3)",
+            [
+                {
+                    "name": "Headset Mic",
+                    "display_name": "Headphones (HUAWEI FreeBuds SE 3)",
+                    "index": None,
+                },
+                {
+                    "name": "Internal Mic",
+                    "display_name": "Internal Microphone",
+                    "index": None,
+                },
+            ],
+            recordable_default_name="",
+            probe_status="probe_skipped",
+        )
+        tray = SimpleNamespace(
+            _dev_refresh_ready=True,
+            _input_snapshot=previous,
+            _last_menu_refresh_time=0.0,
+            _device_change_generation=0,
+            _dev_refresh_running=True,
+            _dev_refresh_repeat=False,
+            _engine=SimpleNamespace(
+                state="recording",
+                recorder=SimpleNamespace(is_ready=True, no_device=False),
+            ),
+            _recorder_prepare_worker=None,
+            _device_change_in_storm=lambda: False,
+            _sync_system_default_device=lambda: None,
+            _auto_fallback_if_device_gone=lambda: None,
+            _recover_recorder_if_devices_returned=lambda: None,
+            _reopen_output_after_device_rescan=lambda: None,
+            _rebuild_device_menu=lambda: None,
+            _sync_tray_icon_with_engine=lambda: None,
+        )
+        _bind_device_helpers(tray)
+        _bind_recordable_retry_state(tray, active=True)
+
+        VoiceTray._on_refresh_result(tray, probe_skipped)
+
+        self.assertTrue(tray._input_snapshot.has_recordable_device)
+        self.assertEqual(tray._input_snapshot.probe_status, "probe_skipped")
+        self.assertEqual(tray._input_snapshot.devices[0].index, 7)
+        self.assertEqual(tray._recordable_retry.scheduled_snapshots, [])
+        self.assertFalse(tray._recordable_retry.active)
+        labels = [
+            spec[2]
+            for spec in _device_menu_row_specs(tray._input_snapshot, False)
+            if spec[0] == "action"
+        ]
+        self.assertIn("Headphones (HUAWEI FreeBuds SE 3)", labels)
+        self.assertFalse(any("正在初始化" in label for label in labels))
+        self.assertFalse(
+            any(
+                spec[0] == "placeholder" and "未发现兼容设备" in spec[1]
+                for spec in _device_menu_row_specs(tray._input_snapshot, False)
+            )
+        )
 
     def test_system_default_change_schedules_async_reopen(self):
         from ui.tray import VoiceTray

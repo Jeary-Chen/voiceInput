@@ -1,6 +1,14 @@
+"""Input-device inventory and recordability model.
+
+Recordability is an explicit three-state value — never inferred solely from
+``index is None``, which previously conflated "probed unopenable" with
+"probe skipped while recording".
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+from typing import Literal
 
 from core.device_names import (
     device_identity_key,
@@ -13,15 +21,48 @@ from core.device_watcher import get_default_capture_device_name, get_full_device
 from core.recorder import VoiceRecorder
 
 
+class Recordability(Enum):
+    """Per-endpoint openability relative to the last PyAudio probe."""
+
+    KNOWN_RECORDABLE = "known_recordable"
+    KNOWN_UNRECORDABLE = "known_unrecordable"
+    PROBE_SKIPPED = "probe_skipped"
+
+
+ProbeStatus = Literal["probed", "probe_skipped"]
+
+
 @dataclass(frozen=True)
 class InputDevice:
     name: str
     display_name: str
     index: int | None
+    recordability: Recordability | None = None
+
+    def __post_init__(self):
+        # Infer from index when callers (tests/helpers) omit the explicit state.
+        recordability = self.recordability
+        if recordability is None:
+            recordability = (
+                Recordability.KNOWN_RECORDABLE
+                if self.index is not None
+                else Recordability.KNOWN_UNRECORDABLE
+            )
+            object.__setattr__(self, "recordability", recordability)
+        if recordability is Recordability.KNOWN_RECORDABLE and self.index is None:
+            raise ValueError("KNOWN_RECORDABLE devices require a PortAudio index")
 
     @property
     def is_recordable(self) -> bool:
-        return self.index is not None
+        return self.recordability is Recordability.KNOWN_RECORDABLE
+
+    @property
+    def is_known_unrecordable(self) -> bool:
+        return self.recordability is Recordability.KNOWN_UNRECORDABLE
+
+    @property
+    def probe_skipped(self) -> bool:
+        return self.recordability is Recordability.PROBE_SKIPPED
 
 
 @dataclass(frozen=True)
@@ -30,10 +71,22 @@ class InputDeviceSnapshot:
     recordable_default_name: str
     devices: tuple[InputDevice, ...]
     recordable_devices: tuple[InputDevice, ...] = ()
+    probe_status: ProbeStatus = "probed"
 
     @property
     def has_recordable_device(self) -> bool:
         return bool(self._recordable_candidates)
+
+    @property
+    def needs_recordable_retry(self) -> bool:
+        """True only after a real probe found endpoints that are not yet openable."""
+        if self.probe_status != "probed":
+            return False
+        if not self.devices:
+            return False
+        if not self.has_recordable_device:
+            return True
+        return bool(self.default_name and not self.recordable_default_name)
 
     def find_by_name(self, name: str) -> InputDevice | None:
         visible = next((device for device in self.devices if device.name == name), None)
@@ -47,12 +100,20 @@ class InputDeviceSnapshot:
     @property
     def _recordable_candidates(self) -> tuple[InputDevice, ...]:
         if self.recordable_devices:
-            return self.recordable_devices
+            return tuple(
+                device for device in self.recordable_devices
+                if device.is_recordable
+            )
         return tuple(device for device in self.devices if device.is_recordable)
 
     @classmethod
     def empty(cls) -> "InputDeviceSnapshot":
-        return cls(default_name="", recordable_default_name="", devices=())
+        return cls(
+            default_name="",
+            recordable_default_name="",
+            devices=(),
+            probe_status="probed",
+        )
 
 
 class _RawDeviceIndex:
@@ -109,11 +170,12 @@ class _FullNameIndex:
 
 
 def get_input_device_snapshot(*, open_probe: bool = True) -> InputDeviceSnapshot:
-    """Build menu/runtime snapshot.
+    """Build a raw inventory snapshot.
 
-    PyAudio decides recordability when ``open_probe`` is true.  During active
-    recording, callers can pass ``open_probe=False`` to avoid creating another
-    PortAudio client while the input callback stream is live.
+    When ``open_probe`` is true, PyAudio decides recordability.
+    When false (live recording), every visible endpoint is ``PROBE_SKIPPED``;
+    call :func:`finalize_snapshot` with the previous snapshot to restore known
+    openability before exposing the result to menus / retry logic.
     """
     system_default_name = get_default_capture_device_name() or ""
     raw_devices = VoiceRecorder.list_devices() if open_probe else []
@@ -121,24 +183,146 @@ def get_input_device_snapshot(*, open_probe: bool = True) -> InputDeviceSnapshot
 
     raw_index = _RawDeviceIndex(raw_devices)
     full_index = _FullNameIndex(full_names)
+    probe_status: ProbeStatus = "probed" if open_probe else "probe_skipped"
+    default_recordability = (
+        Recordability.KNOWN_UNRECORDABLE if open_probe else Recordability.PROBE_SKIPPED
+    )
 
     recordable_devices = tuple(
         InputDevice(
             name=device["name"],
             display_name=full_index.display_name(device["name"]),
             index=device["index"],
+            recordability=Recordability.KNOWN_RECORDABLE,
         )
         for device in raw_devices
     )
-    recordable_default_name = _recordable_default_name(
-        recordable_devices,
-        system_default_name,
+    devices = _merge_visible_devices(
+        raw_index,
+        full_names,
+        full_index,
+        default_recordability=default_recordability,
+    )
+    # Prefer PyAudio recordable rows for default binding (stable open indices);
+    # fall back to visible rows when the probe list is empty.
+    recordable_default_name = (
+        _recordable_default_name(
+            recordable_devices or devices,
+            system_default_name,
+        )
+        if open_probe
+        else ""
     )
     return InputDeviceSnapshot(
         default_name=system_default_name or recordable_default_name,
         recordable_default_name=recordable_default_name,
-        devices=_merge_visible_devices(raw_index, full_names, full_index),
+        devices=devices,
         recordable_devices=recordable_devices,
+        probe_status=probe_status,
+    )
+
+
+def finalize_snapshot(
+    snapshot: InputDeviceSnapshot,
+    *,
+    previous: InputDeviceSnapshot | None,
+) -> InputDeviceSnapshot:
+    """Resolve probe-skipped inventories against the last known openability."""
+    if snapshot.probe_status != "probe_skipped":
+        return snapshot
+    return merge_probe_skipped_snapshot(previous or InputDeviceSnapshot.empty(), snapshot)
+
+
+def merge_probe_skipped_snapshot(
+    previous: InputDeviceSnapshot,
+    current: InputDeviceSnapshot,
+) -> InputDeviceSnapshot:
+    """Carry forward known recordability across a probe-skipped refresh."""
+    if current.probe_status != "probe_skipped":
+        return current
+    if current.has_recordable_device:
+        return current
+    if not previous.devices and not previous.recordable_devices:
+        return current
+
+    prev_by_name: dict[str, InputDevice] = {}
+    for device in (*previous.devices, *previous.recordable_devices):
+        for key in (device.name, device.display_name):
+            if key and key not in prev_by_name:
+                prev_by_name[key] = device
+
+    def _previous_match(name: str, display_name: str) -> InputDevice | None:
+        for key in (name, display_name):
+            if key in prev_by_name:
+                return prev_by_name[key]
+        for device in (*previous.devices, *previous.recordable_devices):
+            if (
+                same_device_name(device.name, name)
+                or same_device_name(device.display_name, name)
+                or same_device_name(device.name, display_name)
+                or same_device_name(device.display_name, display_name)
+            ):
+                return device
+        return None
+
+    merged_devices: list[InputDevice] = []
+    for device in current.devices:
+        if device.is_recordable:
+            merged_devices.append(device)
+            continue
+        prior = _previous_match(device.name, device.display_name)
+        if prior is None:
+            merged_devices.append(device)
+            continue
+        if prior.is_recordable:
+            merged_devices.append(
+                InputDevice(
+                    name=device.name,
+                    display_name=device.display_name,
+                    index=prior.index,
+                    recordability=Recordability.KNOWN_RECORDABLE,
+                )
+            )
+        elif prior.is_known_unrecordable:
+            merged_devices.append(
+                InputDevice(
+                    name=device.name,
+                    display_name=device.display_name,
+                    index=None,
+                    recordability=Recordability.KNOWN_UNRECORDABLE,
+                )
+            )
+        else:
+            merged_devices.append(device)
+
+    if previous.recordable_devices:
+        recordable_devices = tuple(
+            device for device in previous.recordable_devices if device.is_recordable
+        )
+    else:
+        recordable_devices = tuple(
+            device for device in merged_devices if device.is_recordable
+        )
+
+    recordable_default_name = _recordable_default_name(
+        tuple(merged_devices),
+        current.default_name,
+    )
+    if not recordable_default_name and previous.recordable_default_name:
+        if any(
+            same_device_name(device.name, previous.recordable_default_name)
+            or same_device_name(device.display_name, previous.recordable_default_name)
+            for device in recordable_devices
+        ):
+            recordable_default_name = previous.recordable_default_name
+
+    return InputDeviceSnapshot(
+        default_name=current.default_name or previous.default_name,
+        recordable_default_name=recordable_default_name,
+        devices=tuple(merged_devices),
+        recordable_devices=recordable_devices,
+        # Still probe_skipped: consumers must not treat this as a failed probe.
+        probe_status="probe_skipped",
     )
 
 
@@ -163,13 +347,13 @@ def _merge_visible_devices(
     raw_index: _RawDeviceIndex,
     full_names: dict[str, str],
     full_index: _FullNameIndex,
+    *,
+    default_recordability: Recordability,
 ) -> tuple[InputDevice, ...]:
     """One menu row per Windows capture endpoint.
 
     COM friendly names are the row source of truth. PyAudio only supplies
-    openability / index. Truncated and full spellings of the same endpoint are
-    collapsed with :func:`is_pyaudio_name_truncation_pair` — never by loose
-    display-name similarity.
+    openability / index when a probe ran.
     """
     devices: list[InputDevice] = []
     seen: set[str] = set()
@@ -177,13 +361,24 @@ def _merge_visible_devices(
     for trunc, full_name in full_names.items():
         # Prefer full name match first: WASAPI often keeps the untruncated form.
         raw_device = raw_index.lookup(full_name, trunc)
-        devices.append(
-            InputDevice(
-                name=trunc,
-                display_name=full_name,
-                index=raw_device["index"] if raw_device is not None else None,
+        if raw_device is not None:
+            devices.append(
+                InputDevice(
+                    name=trunc,
+                    display_name=full_name,
+                    index=raw_device["index"],
+                    recordability=Recordability.KNOWN_RECORDABLE,
+                )
             )
-        )
+        else:
+            devices.append(
+                InputDevice(
+                    name=trunc,
+                    display_name=full_name,
+                    index=None,
+                    recordability=default_recordability,
+                )
+            )
         _remember_endpoint_names(
             seen,
             trunc,
@@ -202,6 +397,7 @@ def _merge_visible_devices(
                 name=raw_name,
                 display_name=full_index.display_name(raw_name),
                 index=raw_device["index"],
+                recordability=Recordability.KNOWN_RECORDABLE,
             )
         )
         _remember_endpoint_names(seen, raw_name, full_index.display_name(raw_name))

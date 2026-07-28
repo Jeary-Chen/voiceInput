@@ -222,7 +222,7 @@ class InputDeviceSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.recordable_default_name, pyaudio_name)
 
     def test_snapshot_can_skip_pyaudio_open_probe_while_recording(self):
-        from core.input_devices import get_input_device_snapshot
+        from core.input_devices import Recordability, get_input_device_snapshot
 
         with patch("core.input_devices.VoiceRecorder.list_devices") as list_devices:
             with patch(
@@ -237,8 +237,103 @@ class InputDeviceSnapshotTests(unittest.TestCase):
 
         list_devices.assert_not_called()
         self.assertEqual(snapshot.default_name, "Bluetooth Mic")
-        self.assertFalse(snapshot.devices[0].is_recordable)
+        self.assertEqual(snapshot.probe_status, "probe_skipped")
+        self.assertTrue(snapshot.devices[0].probe_skipped)
+        self.assertEqual(
+            snapshot.devices[0].recordability, Recordability.PROBE_SKIPPED
+        )
         self.assertFalse(snapshot.has_recordable_device)
+        self.assertFalse(snapshot.needs_recordable_retry)
+
+    def test_finalize_snapshot_merges_last_known_recordability(self):
+        from core.input_devices import (
+            InputDevice,
+            InputDeviceSnapshot,
+            Recordability,
+            finalize_snapshot,
+        )
+
+        previous = InputDeviceSnapshot(
+            default_name="Headphones (HUAWEI FreeBuds SE 3)",
+            recordable_default_name="Headset Mic",
+            devices=(
+                InputDevice("Headset Mic", "Headphones (HUAWEI FreeBuds SE 3)", 7),
+                InputDevice("Internal Mic", "Internal Microphone", 3),
+            ),
+            recordable_devices=(
+                InputDevice("Headset Mic", "Headphones (HUAWEI FreeBuds SE 3)", 7),
+                InputDevice("Internal Mic", "Internal Microphone", 3),
+            ),
+            probe_status="probed",
+        )
+        current = InputDeviceSnapshot(
+            default_name="Headphones (HUAWEI FreeBuds SE 3)",
+            recordable_default_name="",
+            devices=(
+                InputDevice(
+                    "Headset Mic",
+                    "Headphones (HUAWEI FreeBuds SE 3)",
+                    None,
+                    Recordability.PROBE_SKIPPED,
+                ),
+                InputDevice(
+                    "Internal Mic",
+                    "Internal Microphone",
+                    None,
+                    Recordability.PROBE_SKIPPED,
+                ),
+            ),
+            recordable_devices=(),
+            probe_status="probe_skipped",
+        )
+
+        merged = finalize_snapshot(current, previous=previous)
+
+        self.assertEqual(merged.probe_status, "probe_skipped")
+        self.assertTrue(merged.has_recordable_device)
+        self.assertFalse(merged.needs_recordable_retry)
+        self.assertTrue(merged.devices[0].is_recordable)
+        self.assertEqual(merged.devices[0].index, 7)
+        self.assertEqual(merged.devices[1].index, 3)
+        self.assertEqual(merged.recordable_default_name, "Headset Mic")
+
+    def test_probed_unrecordable_needs_retry_but_probe_skipped_does_not(self):
+        from core.input_devices import (
+            InputDevice,
+            InputDeviceSnapshot,
+            Recordability,
+        )
+
+        probed = InputDeviceSnapshot(
+            default_name="Bluetooth Mic",
+            recordable_default_name="",
+            devices=(
+                InputDevice(
+                    "Bluetooth Mic",
+                    "Bluetooth Mic",
+                    None,
+                    Recordability.KNOWN_UNRECORDABLE,
+                ),
+            ),
+            probe_status="probed",
+        )
+        skipped = InputDeviceSnapshot(
+            default_name="Bluetooth Mic",
+            recordable_default_name="",
+            devices=(
+                InputDevice(
+                    "Bluetooth Mic",
+                    "Bluetooth Mic",
+                    None,
+                    Recordability.PROBE_SKIPPED,
+                ),
+            ),
+            probe_status="probe_skipped",
+        )
+
+        self.assertTrue(probed.needs_recordable_retry)
+        self.assertTrue(probed.devices[0].is_known_unrecordable)
+        self.assertFalse(skipped.needs_recordable_retry)
 
 
 if __name__ == "__main__":
